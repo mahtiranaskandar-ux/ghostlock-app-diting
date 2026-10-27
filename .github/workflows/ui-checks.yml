@@ -1,0 +1,52 @@
+name: UI Checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - document
+    paths:
+      - 'app/src/main/AndroidManifest.xml'
+      - 'app/src/main/kotlin/**'
+      - 'app/src/main/res/values/**'
+      - 'app/src/main/res/values-zh/**'
+      - '.github/workflows/ui-checks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Validate UI changes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Validate XML files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          files = [
+              pathlib.Path("app/src/main/AndroidManifest.xml"),
+              pathlib.Path("app/src/main/res/values/strings.xml"),
+              pathlib.Path("app/src/main/res/values-zh/strings.xml"),
+          ]
+
+          for path in files:
+              ET.parse(path)
+              print(f"XML OK: {path}")
+          PY
+
+      - name: Check latest commit formatting
+        run: |
+          if git rev-parse HEAD^ >/dev/null 2>&1; then
+            git diff HEAD^ HEAD --check
+          else
+            echo "No parent commit available; skipping commit diff check."
+          fi
