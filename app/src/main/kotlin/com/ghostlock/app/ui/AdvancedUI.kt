@@ -253,40 +253,27 @@ internal fun AdvancedScreen(
                             }
                         }
 
-                        var localSelectedIndex by remember { mutableIntStateOf(computedIdx) }
-
-                        // Force the local state to sync only when the external state truly changes
-                        // (e.g. initial load or external update). This prevents the background 
-                        // ViewModel from pulling the UI backwards during rapid clicks.
-                        LaunchedEffect(state.preferredRootManager, state.customKsudPath) {
-                            if (localSelectedIndex != computedIdx) {
-                                localSelectedIndex = computedIdx
-                            }
+                        key(state.preferredRootManager, state.customKsudPath) {
+                            OverlaySpinnerPreference(
+                                title = stringResource(R.string.root_manager_label),
+                                items = managerItems,
+                                selectedIndex = computedIdx,
+                                showValue = true,
+                                onSelectedIndexChange = { index ->
+                                    if (index == managerItems.size - 1) {
+                                        customPathInput = state.customKsudPath ?: ""
+                                        showCustomPathDialog = true
+                                    } else if (index == 0) {
+                                        actions.onRootManagerChanged(null)
+                                        actions.onCustomKsudPathChanged(null)
+                                    } else {
+                                        val pkg = state.installedManagers[index - 1].first
+                                        actions.onRootManagerChanged(pkg)
+                                        actions.onCustomKsudPathChanged(null)
+                                    }
+                                },
+                            )
                         }
-
-                        OverlaySpinnerPreference(
-                            title = stringResource(R.string.root_manager_label),
-                            items = managerItems,
-                            selectedIndex = localSelectedIndex,
-                            showValue = true,
-                            onSelectedIndexChange = { index ->
-                                // 1. Instant UI update (no delay)
-                                localSelectedIndex = index
-                                
-                                // 2. Background save and log
-                                if (index == managerItems.size - 1) {
-                                    customPathInput = state.customKsudPath ?: ""
-                                    showCustomPathDialog = true
-                                } else if (index == 0) {
-                                    actions.onRootManagerChanged(null)
-                                    actions.onCustomKsudPathChanged(null)
-                                } else {
-                                    val pkg = state.installedManagers[index - 1].first
-                                    actions.onRootManagerChanged(pkg)
-                                    actions.onCustomKsudPathChanged(null)
-                                }
-                            },
-                        )
 
                         if (showCustomPathDialog) {
                             OverlayDialog(
