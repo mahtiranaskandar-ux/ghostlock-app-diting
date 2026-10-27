@@ -167,7 +167,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         "com.kowx712.supermanager" to "KowSU",
     )
 
-    fun detectInstalledManagers(): List<Pair<String, String>> {
+    override fun detectInstalledManagers(): List<Pair<String, String>> {
         val result = mutableListOf<Pair<String, String>>()
         val seen = mutableSetOf<String>()
         for ((pkg, label) in knownRootManagers()) {
@@ -190,10 +190,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return result
     }
 
-    fun getPreferredRootManager(): String? =
+    override fun getPreferredRootManager(): String? =
         preferences.getString(PrefPreferredRootManager, null)?.takeIf { it.isNotEmpty() }
 
-    fun setPreferredRootManager(packageName: String?) {
+    override fun setPreferredRootManager(packageName: String?) {
         preferences.edit {
             if (packageName.isNullOrEmpty()) remove(PrefPreferredRootManager)
             else putString(PrefPreferredRootManager, packageName)
