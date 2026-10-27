@@ -78,6 +78,7 @@
     <string name="device_label">设备</string>
     <string name="kernel_label">内核</string>
     <string name="soc_label">芯片</string>
+    <string name="root_manager_label">根管理器</string>
     <string name="kernel_supported">受支持</string>
     <string name="kernel_unsupported">不支持</string>
     <string name="kernel_profile_required">需要加载配置</string>

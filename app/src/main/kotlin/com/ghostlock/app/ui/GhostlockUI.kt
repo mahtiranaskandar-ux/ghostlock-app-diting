@@ -100,6 +100,7 @@ data class GhostlockUiState(
     val deviceName: String = "",
     val kernelRelease: String = "",
     val socName: String = "",
+    val rootManager: String = "",
     val kernelSupported: Boolean = false,
     val shizukuEnabled: Boolean = false,
     val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,
@@ -800,6 +801,7 @@ private fun ControlPanel(
         DeviceInfoCard(
             deviceName = state.deviceName,
             socName = state.socName,
+            rootManager = state.rootManager,
             kernelRelease = state.kernelRelease,
             modifier = Modifier
                 .fillMaxWidth()
@@ -974,6 +976,7 @@ private fun ActivationStatusCard(
 private fun DeviceInfoCard(
     deviceName: String,
     socName: String,
+    rootManager: String,
     kernelRelease: String,
     modifier: Modifier = Modifier,
 ) {
@@ -993,6 +996,10 @@ private fun DeviceInfoCard(
                 DeviceInfoItem(
                     title = stringResource(R.string.soc_label),
                     value = socName,
+                )
+                DeviceInfoItem(
+                    title = stringResource(R.string.root_manager_label),
+                    value = rootManager,
                 )
                 DeviceInfoItem(
                     title = stringResource(R.string.kernel_label),

@@ -156,6 +156,26 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
     }
 
+    private fun detectRootManager(): String {
+        val managers = listOf(
+            "com.rifsxd.ksunext" to "KernelSU Next",
+            "me.weishu.kernelsu.pr" to "KernelSU PR",
+            "me.weishu.kernelsu" to "KernelSU",
+            "com.resukisu.resukisu" to "ReSukiSU",
+            "com.kowx712.supermanager" to "KowSU"
+        )
+
+        for ((packageName, label) in managers) {
+            try {
+                appContext.packageManager.getApplicationInfo(packageName, 0)
+                return label
+            } catch (_: android.content.pm.PackageManager.NameNotFoundException) {
+                // Try the next known manager.
+            }
+        }
+        return "Not detected"
+    }
+
     override suspend fun snapshot(): KernelSnapshot {
         val release = System.getProperty("os.version", "unknown").orEmpty()
         /* PROFILE-SUGGEST-01: recommend_shizuku is a suggestion. It seeds the
@@ -176,6 +196,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             forceAttackTest = forceAttackTest,
             recommendShizuku = recommendShizuku,
             shizukuEnabled = shizukuActive,
+            rootManager = detectRootManager(),
             shizukuStatus = if (shizukuActive) shizukuRunner.status()
             else com.ghostlock.app.domain.model.ShizukuStatus.NOT_REQUIRED,
         )

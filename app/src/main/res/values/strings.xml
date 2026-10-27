@@ -78,6 +78,7 @@
     <string name="device_label">Device</string>
     <string name="kernel_label">Kernel</string>
     <string name="soc_label">SoC</string>
+    <string name="root_manager_label">Root manager</string>
     <string name="kernel_supported">Supported</string>
     <string name="kernel_unsupported">Not supported</string>
     <string name="kernel_profile_required">Profile required</string>
