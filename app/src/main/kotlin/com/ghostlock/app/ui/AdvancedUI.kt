@@ -255,9 +255,13 @@ internal fun AdvancedScreen(
 
                         var localSelectedIndex by remember { mutableIntStateOf(computedIdx) }
 
-                        // Sync the local state with the external state whenever it changes
-                        LaunchedEffect(computedIdx) {
-                            localSelectedIndex = computedIdx
+                        // Force the local state to sync only when the external state truly changes
+                        // (e.g. initial load or external update). This prevents the background 
+                        // ViewModel from pulling the UI backwards during rapid clicks.
+                        LaunchedEffect(state.preferredRootManager, state.customKsudPath) {
+                            if (localSelectedIndex != computedIdx) {
+                                localSelectedIndex = computedIdx
+                            }
                         }
 
                         OverlaySpinnerPreference(
@@ -266,7 +270,10 @@ internal fun AdvancedScreen(
                             selectedIndex = localSelectedIndex,
                             showValue = true,
                             onSelectedIndexChange = { index ->
+                                // 1. Instant UI update (no delay)
                                 localSelectedIndex = index
+                                
+                                // 2. Background save and log
                                 if (index == managerItems.size - 1) {
                                     customPathInput = state.customKsudPath ?: ""
                                     showCustomPathDialog = true
