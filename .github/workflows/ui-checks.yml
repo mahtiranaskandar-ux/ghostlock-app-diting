@@ -1,0 +1,52 @@
+name: UI Checks
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - document
+    paths:
+      - 'app/src/main/AndroidManifest.xml'
+      - 'app/src/main/kotlin/**'
+      - 'app/src/main/res/values/**'
+      - 'app/src/main/res/values-zh/**'
+      - '.github/workflows/ui-checks.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    name: Validate UI changes
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.x'
+
+      - name: Check patch formatting
+        run: git diff HEAD^ HEAD --check
+
+      - name: Validate XML files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import xml.etree.ElementTree as ET
+
+          files = [
+              pathlib.Path("app/src/main/AndroidManifest.xml"),
+              pathlib.Path("app/src/main/res/values/strings.xml"),
+              pathlib.Path("app/src/main/res/values-zh/strings.xml"),
+          ]
+
+          for path in files:
+              ET.parse(path)
+              print(f"XML OK: {path}")
+          PY
