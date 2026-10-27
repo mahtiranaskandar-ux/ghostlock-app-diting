@@ -273,7 +273,7 @@ internal fun AdvancedScreen(
                                         TextField(
                                             value = customPathInput,
                                             onValueChange = { customPathInput = it },
-                                            label = { Text("Path to ksud") },
+                                            label = "Path to ksud",
                                             modifier = Modifier.fillMaxWidth(),
                                         )
                                         Spacer(modifier = Modifier.height(12.dp))
