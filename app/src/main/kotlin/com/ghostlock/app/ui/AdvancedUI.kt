@@ -1,5 +1,7 @@
 package com.ghostlock.app.ui
 
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.expandVertically
@@ -242,7 +244,7 @@ internal fun AdvancedScreen(
                             DropdownItem(icon = null, title = label)
                         } + listOf(DropdownItem(icon = null, title = "Custom Path..."))
 
-                        val selectedIdx = when {
+                        val computedIdx = when {
                             state.customKsudPath != null -> managerItems.size - 1
                             state.preferredRootManager == null -> 0
                             else -> {
@@ -251,28 +253,33 @@ internal fun AdvancedScreen(
                             }
                         }
 
-                        // Force Compose to recreate the spinner when the selected item changes
-                        key(selectedIdx, state.preferredRootManager, state.customKsudPath) {
-                            OverlaySpinnerPreference(
-                                title = stringResource(R.string.root_manager_label),
-                                items = managerItems,
-                                selectedIndex = selectedIdx,
-                                showValue = true,
-                                onSelectedIndexChange = { index ->
-                                    if (index == managerItems.size - 1) {
-                                        customPathInput = state.customKsudPath ?: ""
-                                        showCustomPathDialog = true
-                                    } else if (index == 0) {
-                                        actions.onRootManagerChanged(null)
-                                        actions.onCustomKsudPathChanged(null)
-                                    } else {
-                                        val pkg = state.installedManagers[index - 1].first
-                                        actions.onRootManagerChanged(pkg)
-                                        actions.onCustomKsudPathChanged(null)
-                                    }
-                                },
-                            )
+                        var localSelectedIndex by remember { mutableIntStateOf(computedIdx) }
+
+                        // Sync the local state with the external state whenever it changes
+                        LaunchedEffect(computedIdx) {
+                            localSelectedIndex = computedIdx
                         }
+
+                        OverlaySpinnerPreference(
+                            title = stringResource(R.string.root_manager_label),
+                            items = managerItems,
+                            selectedIndex = localSelectedIndex,
+                            showValue = true,
+                            onSelectedIndexChange = { index ->
+                                localSelectedIndex = index
+                                if (index == managerItems.size - 1) {
+                                    customPathInput = state.customKsudPath ?: ""
+                                    showCustomPathDialog = true
+                                } else if (index == 0) {
+                                    actions.onRootManagerChanged(null)
+                                    actions.onCustomKsudPathChanged(null)
+                                } else {
+                                    val pkg = state.installedManagers[index - 1].first
+                                    actions.onRootManagerChanged(pkg)
+                                    actions.onCustomKsudPathChanged(null)
+                                }
+                            },
+                        )
 
                         if (showCustomPathDialog) {
                             OverlayDialog(
