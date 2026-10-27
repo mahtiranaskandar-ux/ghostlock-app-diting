@@ -23,6 +23,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -244,24 +245,34 @@ internal fun AdvancedScreen(
                         val selectedIdx = when {
                             state.customKsudPath != null -> managerItems.size - 1
                             state.preferredRootManager == null -> 0
-                            else -> state.installedManagers.indexOfFirst { it.first == state.preferredRootManager } + 1
+                            else -> {
+                                val idx = state.installedManagers.indexOfFirst { it.first == state.preferredRootManager }
+                                if (idx >= 0) idx + 1 else 0
+                            }
                         }
 
-                        OverlaySpinnerPreference(
-                            title = stringResource(R.string.root_manager_label),
-                            items = managerItems,
-                            selectedIndex = if (selectedIdx < 1) 0 else selectedIdx,
-                            showValue = true,
-                            onSelectedIndexChange = { index ->
-                                if (index == managerItems.size - 1) {
-                                    customPathInput = state.customKsudPath ?: ""
-                                    showCustomPathDialog = true
-                                } else {
-                                    val pkg = if (index == 0) null else state.installedManagers[index - 1].first
-                                    actions.onRootManagerChanged(pkg)
-                                }
-                            },
-                        )
+                        // Force Compose to recreate the spinner when the selected item changes
+                        key(selectedIdx, state.preferredRootManager, state.customKsudPath) {
+                            OverlaySpinnerPreference(
+                                title = stringResource(R.string.root_manager_label),
+                                items = managerItems,
+                                selectedIndex = selectedIdx,
+                                showValue = true,
+                                onSelectedIndexChange = { index ->
+                                    if (index == managerItems.size - 1) {
+                                        customPathInput = state.customKsudPath ?: ""
+                                        showCustomPathDialog = true
+                                    } else if (index == 0) {
+                                        actions.onRootManagerChanged(null)
+                                        actions.onCustomKsudPathChanged(null)
+                                    } else {
+                                        val pkg = state.installedManagers[index - 1].first
+                                        actions.onRootManagerChanged(pkg)
+                                        actions.onCustomKsudPathChanged(null)
+                                    }
+                                },
+                            )
+                        }
 
                         if (showCustomPathDialog) {
                             OverlayDialog(
