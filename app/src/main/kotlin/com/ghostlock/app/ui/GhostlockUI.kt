@@ -101,6 +101,8 @@ data class GhostlockUiState(
     val kernelRelease: String = "",
     val socName: String = "",
     val rootManager: String = "",
+    val installedManagers: List<Pair<String, String>> = emptyList(),
+    val preferredRootManager: String? = null,
     val kernelSupported: Boolean = false,
     val shizukuEnabled: Boolean = false,
     val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,

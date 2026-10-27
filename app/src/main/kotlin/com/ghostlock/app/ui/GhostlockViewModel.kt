@@ -97,6 +97,7 @@ class GhostlockViewModel(
         repository.setShizukuStatusListener { refreshAccessStatus() }
         viewModelScope.launch {
             refreshSnapshot()
+            refreshRootManagers()
             markInterruptedRunLogs()
             applyRecommendedShizuku()
             maybeSuggestShizukuForW3()
@@ -163,6 +164,23 @@ class GhostlockViewModel(
                  * need to send is one tap away. */
                 dialogExportLog = true,
             )
+        }
+    }
+
+    fun refreshRootManagers() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val managers = runCatching { repository.detectInstalledManagers() }.getOrDefault(emptyList())
+            val preferred = repository.getPreferredRootManager()
+            mutableState.update {
+                it.copy(installedManagers = managers, preferredRootManager = preferred)
+            }
+        }
+    }
+
+    fun onRootManagerChanged(packageName: String?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setPreferredRootManager(packageName)
+            refreshRootManagers()
         }
     }
 

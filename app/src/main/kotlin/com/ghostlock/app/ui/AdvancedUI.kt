@@ -227,6 +227,30 @@ internal fun AdvancedScreen(
                     }
                 }
             }
+            item(key = "rootManager") {
+                Card {
+                    Column {
+                        val managerItems = listOf(
+                            DropdownItem(icon = null, title = "Auto")
+                        ) + state.installedManagers.map { (_, label) ->
+                            DropdownItem(icon = null, title = label)
+                        }
+                        val selectedIdx = if (state.preferredRootManager == null) 0
+                            else state.installedManagers.indexOfFirst { it.first == state.preferredRootManager } + 1
+
+                        OverlaySpinnerPreference(
+                            title = stringResource(R.string.root_manager_label),
+                            items = managerItems,
+                            selectedIndex = if (selectedIdx < 1) 0 else selectedIdx,
+                            showValue = true,
+                            onSelectedIndexChange = { index ->
+                                val pkg = if (index == 0) null else state.installedManagers[index - 1].first
+                                actions.onRootManagerChanged(pkg)
+                            },
+                        )
+                    }
+                }
+            }
             item(key = "about") {
                 Card {
                     ArrowPreference(

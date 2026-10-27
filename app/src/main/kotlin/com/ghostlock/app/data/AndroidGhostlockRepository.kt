@@ -53,6 +53,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
 
+        /* User-selected root manager package. Empty = auto-detect. */
+        const val PrefPreferredRootManager = "preferred_root_manager"
+
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
         fun ksuLogName(runStamp: Long) = "ghostlock-ksu-$runStamp.log"
@@ -153,6 +156,47 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * leaving them unstamped would silently disable a user's own
              * offsets on the very update that carried them over. */
             putString(AndroidProfileConfigController.PrefOverridesBuildSha, BuildConfig.BUILD_IDENTITY)
+        }
+    }
+
+    fun knownRootManagers(): List<Pair<String, String>> = listOf(
+        "com.rifsxd.ksunext" to "KernelSU Next",
+        "me.weishu.kernelsu.pr" to "KernelSU PR",
+        "me.weishu.kernelsu" to "KernelSU",
+        "com.resukisu.resukisu" to "ReSukiSU",
+        "com.kowx712.supermanager" to "KowSU",
+    )
+
+    fun detectInstalledManagers(): List<Pair<String, String>> {
+        val result = mutableListOf<Pair<String, String>>()
+        val seen = mutableSetOf<String>()
+        for ((pkg, label) in knownRootManagers()) {
+            if (seen.contains(pkg)) continue
+            val appInfo = runCatching { appContext.packageManager.getApplicationInfo(pkg, 0) }.getOrNull() ?: continue
+            if (File(appInfo.nativeLibraryDir, "libksud.so").isFile) {
+                result += pkg to label
+                seen += pkg
+            }
+        }
+        val installed = runCatching { appContext.packageManager.getInstalledApplications(0) }.getOrDefault(emptyList())
+        for (appInfo in installed) {
+            val pkg = appInfo.packageName
+            if (pkg in seen) continue
+            if (!File(appInfo.nativeLibraryDir, "libksud.so").isFile) continue
+            val label = runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrDefault(pkg)
+            result += pkg to label
+            seen += pkg
+        }
+        return result
+    }
+
+    fun getPreferredRootManager(): String? =
+        preferences.getString(PrefPreferredRootManager, null)?.takeIf { it.isNotEmpty() }
+
+    fun setPreferredRootManager(packageName: String?) {
+        preferences.edit {
+            if (packageName.isNullOrEmpty()) remove(PrefPreferredRootManager)
+            else putString(PrefPreferredRootManager, packageName)
         }
     }
 
