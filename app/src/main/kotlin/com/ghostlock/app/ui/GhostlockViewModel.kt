@@ -169,9 +169,12 @@ class GhostlockViewModel(
 
     fun refreshRootManagers() {
         viewModelScope.launch(Dispatchers.IO) {
-            val managers = runCatching { repository.detectInstalledManagers() }
-                .getOrDefault(emptyList<Pair<String, String>>())
-            val preferred = repository.getPreferredRootManager()
+            val managers: List<Pair<String, String>> = try {
+                repository.detectInstalledManagers()
+            } catch (e: java.lang.Exception) {
+                emptyList<Pair<String, String>>()
+            }
+            val preferred: String? = repository.getPreferredRootManager()
             mutableState.update {
                 it.copy(installedManagers = managers, preferredRootManager = preferred)
             }
