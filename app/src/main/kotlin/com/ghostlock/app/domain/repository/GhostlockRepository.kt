@@ -32,6 +32,9 @@ interface GhostlockRepository {
 
     /** Pins a manager as the ksud source, or null to fall back to auto-detect. */
     fun setPreferredRootManager(packageName: String?)
+    
+    fun getCustomKsudPath(): String?
+    fun setCustomKsudPath(path: String?)
 
     /**
      * Build identity whose "layers were disabled" start-up notice the user has

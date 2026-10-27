@@ -185,6 +185,9 @@ private fun GhostlockRoute(
             override fun onRootManagerChanged(packageName: String?) =
                 viewModel.onRootManagerChanged(packageName)
 
+            override fun onCustomKsudPathChanged(path: String?) =
+                viewModel.onCustomKsudPathChanged(path)
+
             override fun onShizukuChanged(enabled: Boolean) = viewModel.toggleShizuku(enabled)
             override fun onDialogItemSelected(index: Int) = viewModel.onDialogItemSelected(index)
             override fun onDialogInputChange(value: String) = viewModel.onDialogInputChange(value)

@@ -175,8 +175,9 @@ class GhostlockViewModel(
                 emptyList<Pair<String, String>>()
             }
             val preferred: String? = repository.getPreferredRootManager()
+            val customPath: String? = repository.getCustomKsudPath()
             mutableState.update {
-                it.copy(installedManagers = managers, preferredRootManager = preferred)
+                it.copy(installedManagers = managers, preferredRootManager = preferred, customKsudPath = customPath)
             }
         }
     }
@@ -185,6 +186,16 @@ class GhostlockViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             repository.setPreferredRootManager(packageName)
             refreshRootManagers()
+            val label = packageName ?: "Auto"
+            appendLog("<k> Root manager changed to: $label")
+        }
+    }
+
+    fun onCustomKsudPathChanged(path: String?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setCustomKsudPath(path)
+            refreshRootManagers()
+            appendLog("<k> Custom ksud path set to: ${path ?: "none"}")
         }
     }
 

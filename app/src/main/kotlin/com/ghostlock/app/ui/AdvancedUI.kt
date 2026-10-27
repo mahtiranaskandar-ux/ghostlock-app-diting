@@ -22,7 +22,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
@@ -230,13 +232,20 @@ internal fun AdvancedScreen(
             item(key = "rootManager") {
                 Card {
                     Column {
+                        var showCustomPathDialog by remember { mutableStateOf(false) }
+                        var customPathInput by remember { mutableStateOf("") }
+
                         val managerItems = listOf(
                             DropdownItem(icon = null, title = "Auto")
                         ) + state.installedManagers.map { (_, label) ->
                             DropdownItem(icon = null, title = label)
+                        } + listOf(DropdownItem(icon = null, title = "Custom Path..."))
+
+                        val selectedIdx = when {
+                            state.customKsudPath != null -> managerItems.size - 1
+                            state.preferredRootManager == null -> 0
+                            else -> state.installedManagers.indexOfFirst { it.first == state.preferredRootManager } + 1
                         }
-                        val selectedIdx = if (state.preferredRootManager == null) 0
-                            else state.installedManagers.indexOfFirst { it.first == state.preferredRootManager } + 1
 
                         OverlaySpinnerPreference(
                             title = stringResource(R.string.root_manager_label),
@@ -244,10 +253,50 @@ internal fun AdvancedScreen(
                             selectedIndex = if (selectedIdx < 1) 0 else selectedIdx,
                             showValue = true,
                             onSelectedIndexChange = { index ->
-                                val pkg = if (index == 0) null else state.installedManagers[index - 1].first
-                                actions.onRootManagerChanged(pkg)
+                                if (index == managerItems.size - 1) {
+                                    customPathInput = state.customKsudPath ?: ""
+                                    showCustomPathDialog = true
+                                } else {
+                                    val pkg = if (index == 0) null else state.installedManagers[index - 1].first
+                                    actions.onRootManagerChanged(pkg)
+                                }
                             },
                         )
+
+                        if (showCustomPathDialog) {
+                            OverlayDialog(
+                                show = true,
+                                title = "Custom ksud path",
+                                onDismissRequest = { showCustomPathDialog = false },
+                                content = {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        TextField(
+                                            value = customPathInput,
+                                            onValueChange = { customPathInput = it },
+                                            label = { Text("Path to ksud") },
+                                            modifier = Modifier.fillMaxWidth(),
+                                        )
+                                        Spacer(modifier = Modifier.height(12.dp))
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Save",
+                                            onClick = {
+                                                actions.onCustomKsudPathChanged(customPathInput.takeIf { it.isNotEmpty() })
+                                                showCustomPathDialog = false
+                                            },
+                                        )
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Clear",
+                                            onClick = {
+                                                actions.onCustomKsudPathChanged(null)
+                                                showCustomPathDialog = false
+                                            },
+                                        )
+                                    }
+                                },
+                            )
+                        }
                     }
                 }
             }

@@ -55,6 +55,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
         /* User-selected root manager package. Empty = auto-detect. */
         const val PrefPreferredRootManager = "preferred_root_manager"
+        const val PrefCustomKsudPath = "custom_ksud_path"
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
@@ -192,6 +193,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override fun getPreferredRootManager(): String? =
         preferences.getString(PrefPreferredRootManager, null)?.takeIf { it.isNotEmpty() }
+
+    override fun getCustomKsudPath(): String? =
+        preferences.getString(PrefCustomKsudPath, null)?.takeIf { it.isNotEmpty() }
+
+    override fun setCustomKsudPath(path: String?) {
+        preferences.edit {
+            if (path.isNullOrEmpty()) remove(PrefCustomKsudPath)
+            else putString(PrefCustomKsudPath, path)
+        }
+    }
 
     override fun setPreferredRootManager(packageName: String?) {
         preferences.edit {
@@ -1178,7 +1189,27 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun firstValidProperty(vararg keys: String): String? = keys.asSequence().firstNotNullOfOrNull { validDeviceName(systemProperty(it)) }
 
     private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
-        val packages = listOf(
+        val customPath = getCustomKsudPath()
+        if (!customPath.isNullOrEmpty()) {
+            val source = File(customPath)
+            if (source.isFile) {
+                val output = File(workDir, "ksud")
+                runCatching {
+                    source.inputStream().use { input -> output.outputStream().use { input.copyTo(it) } }
+                    runCatching { Os.chmod(output.absolutePath, 448) }
+                    onLog("<k> ksud copied from custom path: $customPath")
+                    return output
+                }.onFailure { onLog("<k> copy custom ksud failed: ${it.message}") }
+            } else {
+                onLog("<k> custom ksud path not found: $customPath")
+            }
+        }
+
+        val preferred = getPreferredRootManager()
+        val sourceMode = if (preferred != null) "pinned" else "auto-detect"
+        onLog("<k> ksud selection: mode=$sourceMode" + (preferred?.let { " package=$it" } ?: ""))
+
+        val packages = preferred?.let { listOf(it) } ?: listOf(
             "com.rifsxd.ksunext",
             "me.weishu.kernelsu.pr",
             "me.weishu.kernelsu",
