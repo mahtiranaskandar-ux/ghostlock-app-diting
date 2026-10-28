@@ -241,7 +241,7 @@ internal fun AdvancedScreen(
                         var showManagerDialog by remember { mutableStateOf(false) }
 
                         val currentLabel = when {
-                            state.customKsudPath != null -> "Custom Path..."
+                            state.customKsudPath != null -> "Custom Package..."
                             state.preferredRootManager == null -> "Auto"
                             else -> state.installedManagers.firstOrNull { it.first == state.preferredRootManager }?.second ?: "Unknown"
                         }
@@ -296,14 +296,14 @@ internal fun AdvancedScreen(
                         if (showCustomPathDialog) {
                             OverlayDialog(
                                 show = true,
-                                title = "Custom Package or Path",
+                                title = "Custom Package",
                                 onDismissRequest = { showCustomPathDialog = false },
                                 content = {
                                     Column(modifier = Modifier.fillMaxWidth()) {
                                         TextField(
                                             value = customPathInput,
                                             onValueChange = { customPathInput = it },
-                                            label = "Package name (e.g. org.matrix.su) or path",
+                                            label = "Package name (e.g. org.matrix.su)",
                                             modifier = Modifier.fillMaxWidth(),
                                         )
                                         Spacer(modifier = Modifier.height(12.dp))

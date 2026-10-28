@@ -216,6 +216,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun getPreferredRootManager(): String? =
         preferences.getString(PrefPreferredRootManager, null)?.takeIf { it.isNotEmpty() }
 
+    fun resolvePackageLabel(packageName: String): String? {
+        val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull() ?: return null
+        return runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrNull()
+    }
+
     override fun getCustomKsudPath(): String? =
         preferences.getString(PrefCustomKsudPath, null)?.takeIf { it.isNotEmpty() }
 
@@ -1211,47 +1216,31 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun firstValidProperty(vararg keys: String): String? = keys.asSequence().firstNotNullOfOrNull { validDeviceName(systemProperty(it)) }
 
     private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
-        val customInput = getCustomKsudPath()
-        if (!customInput.isNullOrEmpty()) {
-            if (customInput.startsWith("/")) {
-                // Treated as a direct file path
-                val source = File(customInput)
-                if (source.isFile) {
+        val customPackage = getCustomKsudPath()
+        if (!customPackage.isNullOrEmpty()) {
+            // Treated as a package name; extract libksud.so from its APK
+            val appInfo = runCatching { appContext.packageManager.getApplicationInfo(customPackage, 0) }.getOrNull()
+            if (appInfo == null) {
+                onLog("<k> custom package not installed: $customPackage")
+            } else {
+                val label = runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrDefault(customPackage)
+                val apkFile = File(appInfo.sourceDir)
+                if (apkFile.isFile) {
                     val output = File(workDir, "ksud")
                     runCatching {
-                        source.inputStream().use { input -> output.outputStream().use { input.copyTo(it) } }
-                        runCatching { Os.chmod(output.absolutePath, 448) }
-                        onLog("<k> ksud copied from custom path: $customInput")
-                        return output
-                    }.onFailure { onLog("<k> copy custom ksud failed: ${it.message}") }
-                } else {
-                    onLog("<k> custom ksud path not found: $customInput")
-                }
-            } else {
-                // Treated as a package name; extract libksud.so from its APK
-                val appInfo = runCatching { appContext.packageManager.getApplicationInfo(customInput, 0) }.getOrNull()
-                if (appInfo == null) {
-                    onLog("<k> custom package not installed: $customInput")
-                } else {
-                    val label = runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrDefault(customInput)
-                    val apkFile = File(appInfo.sourceDir)
-                    if (apkFile.isFile) {
-                        val output = File(workDir, "ksud")
-                        runCatching {
-                            java.util.zip.ZipFile(apkFile).use { zip ->
-                                val entry = zip.entries().asSequence().firstOrNull { it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so")) }
-                                if (entry != null) {
-                                    zip.getInputStream(entry).use { input -> output.outputStream().use { input.copyTo(it) } }
-                                    runCatching { Os.chmod(output.absolutePath, 448) }
-                                    onLog("<k> ksud copied from custom package $label ($customInput): ${apkFile.absolutePath} -> ${output.absolutePath}")
-                                    return output
-                                }
+                        java.util.zip.ZipFile(apkFile).use { zip ->
+                            val entry = zip.entries().asSequence().firstOrNull { it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so")) }
+                            if (entry != null) {
+                                zip.getInputStream(entry).use { input -> output.outputStream().use { input.copyTo(it) } }
+                                runCatching { Os.chmod(output.absolutePath, 448) }
+                                onLog("<k> ksud copied from custom package $label ($customPackage): ${apkFile.absolutePath} -> ${output.absolutePath}")
+                                return output
                             }
-                        }.onFailure { onLog("<k> copy ksud from $label failed: ${it.message}") }
-                        onLog("<k> no libksud.so found in $label ($customInput)")
-                    } else {
-                        onLog("<k> APK not found for $customInput")
-                    }
+                        }
+                    }.onFailure { onLog("<k> copy ksud from $label failed: ${it.message}") }
+                    onLog("<k> no libksud.so found in $label ($customPackage)")
+                } else {
+                    onLog("<k> APK not found for $customPackage")
                 }
             }
         }

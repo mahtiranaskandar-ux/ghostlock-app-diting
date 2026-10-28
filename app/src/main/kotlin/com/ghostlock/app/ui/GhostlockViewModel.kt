@@ -180,19 +180,8 @@ class GhostlockViewModel(
             // Update rootManager label based on the preferred choice
             val displayRootManager = when {
                 customPath != null -> {
-                    if (customPath.startsWith("/")) {
-                        "Custom Path"
-                    } else {
-                        // customPath is a package name: resolve its label
-                        val appInfo = try {
-                            appContext.packageManager.getApplicationInfo(customPath, 0)
-                        } catch (e: Exception) { null }
-                        if (appInfo != null) {
-                            appContext.packageManager.getApplicationLabel(appInfo).toString()
-                        } else {
-                            "Custom ($customPath)"
-                        }
-                    }
+                    // customPath is always a package name now
+                    repository.resolvePackageLabel(customPath) ?: "Custom ($customPath)"
                 }
                 preferred != null -> {
                     managers.firstOrNull { it.first == preferred }?.second ?: preferred
@@ -226,23 +215,18 @@ class GhostlockViewModel(
         }
     }
 
-    fun onCustomKsudPathChanged(path: String?) {
+    fun onCustomKsudPathChanged(packageName: String?) {
         viewModelScope.launch(Dispatchers.IO) {
-            repository.setCustomKsudPath(path)
+            repository.setCustomKsudPath(packageName)
             refreshRootManagers()
             val label = when {
-                path.isNullOrEmpty() -> "none"
-                path.startsWith("/") -> path
+                packageName.isNullOrEmpty() -> "none"
                 else -> {
-                    val pkg = try { appContext.packageManager.getApplicationInfo(path, 0) } catch (e: Exception) { null }
-                    if (pkg != null) {
-                        appContext.packageManager.getApplicationLabel(pkg).toString() + " ($path)"
-                    } else {
-                        "$path (not installed)"
-                    }
+                    val resolved = repository.resolvePackageLabel(packageName)
+                    if (resolved != null) "$resolved ($packageName)" else "$packageName (not installed)"
                 }
             }
-            appendLog("<k> Custom ksud source set to: $label")
+            appendLog("<k> Custom ksud package set to: $label")
             mutableState.update {
                 it.copy(
                     executionSheetVisible = true,
