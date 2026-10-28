@@ -37,6 +37,8 @@ interface GhostlockRepository {
 
     fun getCustomKsudPath(): String?
     fun setCustomKsudPath(path: String?)
+    fun getCustomSoName(): String?
+    fun setCustomSoName(name: String?)
 
     /**
      * Build identity whose "layers were disabled" start-up notice the user has

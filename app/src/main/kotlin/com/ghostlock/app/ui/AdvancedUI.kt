@@ -237,6 +237,7 @@ internal fun AdvancedScreen(
                     Column {
                         var showCustomPathDialog by remember { mutableStateOf(false) }
                         var customPathInput by remember { mutableStateOf("") }
+                        var customSoInput by remember { mutableStateOf("") }
 
                         var showManagerDialog by remember { mutableStateOf(false) }
 
@@ -284,6 +285,7 @@ internal fun AdvancedScreen(
                                             text = "Custom Package...",
                                             onClick = {
                                                 customPathInput = state.customKsudPath ?: ""
+                                                customSoInput = state.customSoName ?: ""
                                                 showCustomPathDialog = true
                                                 showManagerDialog = false
                                             },
@@ -306,12 +308,20 @@ internal fun AdvancedScreen(
                                             label = "Package name (e.g. org.matrix.su)",
                                             modifier = Modifier.fillMaxWidth(),
                                         )
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        TextField(
+                                            value = customSoInput,
+                                            onValueChange = { customSoInput = it },
+                                            label = "Custom SO name (optional)",
+                                            modifier = Modifier.fillMaxWidth(),
+                                        )
                                         Spacer(modifier = Modifier.height(12.dp))
                                         TextButton(
                                             modifier = Modifier.fillMaxWidth(),
                                             text = "Save",
                                             onClick = {
                                                 actions.onCustomKsudPathChanged(customPathInput.takeIf { it.isNotEmpty() })
+                                                actions.onCustomSoNameChanged(customSoInput.takeIf { it.isNotEmpty() })
                                                 showCustomPathDialog = false
                                             },
                                         )
@@ -320,6 +330,7 @@ internal fun AdvancedScreen(
                                             text = "Clear",
                                             onClick = {
                                                 actions.onCustomKsudPathChanged(null)
+                                                actions.onCustomSoNameChanged(null)
                                                 showCustomPathDialog = false
                                             },
                                         )

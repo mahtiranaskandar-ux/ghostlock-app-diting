@@ -56,6 +56,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         /* User-selected root manager package. Empty = auto-detect. */
         const val PrefPreferredRootManager = "preferred_root_manager"
         const val PrefCustomKsudPath = "custom_ksud_path"
+        const val PrefCustomSoName = "custom_so_name"
 
         /* Known ksud entry names across managers (SukiSU hides it under a random name). */
         val KnownKsudNames = listOf("libksud.so", "libeexgslcpwg.so")
@@ -246,6 +247,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         preferences.edit {
             if (path.isNullOrEmpty()) remove(PrefCustomKsudPath)
             else putString(PrefCustomKsudPath, path)
+        }
+    }
+
+    override fun getCustomSoName(): String? =
+        preferences.getString(PrefCustomSoName, null)?.takeIf { it.isNotEmpty() }
+
+    override fun setCustomSoName(name: String?) {
+        preferences.edit {
+            if (name.isNullOrEmpty()) remove(PrefCustomSoName)
+            else putString(PrefCustomSoName, name)
         }
     }
 
@@ -1247,9 +1258,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     val output = File(workDir, "ksud")
                     runCatching {
                         java.util.zip.ZipFile(apkFile).use { zip ->
-                            val knownNames = listOf("libksud.so", "libeexgslcpwg.so")
+                            val customSo = getCustomSoName()
+                            val namesToTry = if (!customSo.isNullOrEmpty()) listOf(customSo) else KnownKsudNames
                             var entry: java.util.zip.ZipEntry? = null
-                            for (name in knownNames) {
+                            for (name in namesToTry) {
                                 entry = zip.entries().asSequence().firstOrNull {
                                     it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/${Regex.escape(name)}"))
                                 }

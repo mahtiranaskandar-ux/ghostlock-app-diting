@@ -194,6 +194,7 @@ class GhostlockViewModel(
                     installedManagers = managers,
                     preferredRootManager = preferred,
                     customKsudPath = customPath,
+                    customSoName = repository.getCustomSoName(),
                     rootManager = displayRootManager ?: state.rootManager
                 )
             }
@@ -220,6 +221,16 @@ class GhostlockViewModel(
         }
     }
 
+    fun onCustomSoNameChanged(name: String?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setCustomSoName(name)
+            mutableState.update { state ->
+                state.copy(customSoName = name)
+            }
+            appendLog("<k> Custom SO name set to: ${name ?: "none"}")
+        }
+    }
+
     fun onCustomKsudPathChanged(packageName: String?) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.setCustomKsudPath(packageName)
@@ -240,6 +251,7 @@ class GhostlockViewModel(
                 state.copy(
                     preferredRootManager = null,
                     customKsudPath = packageName,
+                    customSoName = repository.getCustomSoName(),
                     rootManager = displayLabel,
                     executionSheetVisible = true,
                     executionSheetDismissible = true,
