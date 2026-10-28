@@ -59,7 +59,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefCustomSoName = "custom_so_name"
 
         /* Known ksud entry names across managers (SukiSU hides it under a random name). */
-        val KnownKsudNames = listOf("libksud.so", "libeexgslcpwg.so")
+        val KnownKsudNames = listOf("libksud.so")
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
@@ -187,7 +187,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (!hasKsud) {
                 hasKsud = runCatching {
                     java.util.zip.ZipFile(appInfo.sourceDir).use { zip ->
-                        val knownNames = listOf("libksud.so", "libeexgslcpwg.so")
+                        val knownNames = listOf("libksud.so")
                         knownNames.any { name ->
                             zip.entries().asSequence().any { entry ->
                                 entry.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/${Regex.escape(name)}"))
