@@ -183,9 +183,27 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (!hasKsud) {
                 hasKsud = runCatching {
                     java.util.zip.ZipFile(appInfo.sourceDir).use { zip ->
-                        zip.entries().asSequence().any { entry ->
+                        var found = zip.entries().asSequence().any { entry ->
                             entry.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so"))
                         }
+                        // Fallback: look for a disguised ksud by content
+                        if (!found) {
+                            val candidates = zip.entries().asSequence().filter {
+                                it.name.matches(Regex("lib/arm64-v8a/.*\\.so"))
+                            }
+                            for (candidate in candidates) {
+                                val sample = zip.getInputStream(candidate).use { input ->
+                                    val buffer = ByteArray(64 * 1024)
+                                    val read = input.read(buffer)
+                                    if (read > 0) String(buffer, 0, read, Charsets.ISO_8859_1) else ""
+                                }
+                                if (sample.contains("KernelSU userspace") || sample.contains("late-load command triggered")) {
+                                    found = true
+                                    break
+                                }
+                            }
+                        }
+                        found
                     }
                 }.getOrDefault(false)
             }
@@ -1236,16 +1254,34 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     val output = File(workDir, "ksud")
                     runCatching {
                         java.util.zip.ZipFile(apkFile).use { zip ->
-                            val entry = zip.entries().asSequence().firstOrNull { it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so")) }
+                            var entry = zip.entries().asSequence().firstOrNull {
+                                it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so"))
+                            }
+                            if (entry == null) {
+                                val candidates = zip.entries().asSequence().filter {
+                                    it.name.matches(Regex("lib/arm64-v8a/.*\\.so"))
+                                }
+                                for (candidate in candidates) {
+                                    val sample = zip.getInputStream(candidate).use { input ->
+                                        val buffer = ByteArray(64 * 1024)
+                                        val read = input.read(buffer)
+                                        if (read > 0) String(buffer, 0, read, Charsets.ISO_8859_1) else ""
+                                    }
+                                    if (sample.contains("KernelSU userspace") || sample.contains("late-load command triggered")) {
+                                        entry = candidate
+                                        break
+                                    }
+                                }
+                            }
                             if (entry != null) {
                                 zip.getInputStream(entry).use { input -> output.outputStream().use { input.copyTo(it) } }
                                 runCatching { Os.chmod(output.absolutePath, 448) }
-                                onLog("<k> ksud copied from custom package $label ($customPackage): ${apkFile.absolutePath} -> ${output.absolutePath}")
+                                onLog("<k> ksud copied from custom package $label ($customPackage) [entry=${entry.name}]: ${apkFile.absolutePath} -> ${output.absolutePath}")
                                 return output
                             }
                         }
                     }.onFailure { onLog("<k> copy ksud from $label failed: ${it.message}") }
-                    onLog("<k> no libksud.so found in $label ($customPackage)")
+                    onLog("<k> no ksud (standard or disguised) found in $label ($customPackage)")
                 } else {
                     onLog("<k> APK not found for $customPackage")
                 }
