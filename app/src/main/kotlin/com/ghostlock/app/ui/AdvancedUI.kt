@@ -275,6 +275,13 @@ internal fun AdvancedScreen(
                             )
                         }
 
+                        // DEBUG: show current state value directly from ViewModel
+                        Text(
+                            text = "DEBUG_STATE: ${state.preferredRootManager ?: "null"}",
+                            style = MiuixTheme.textStyles.body2,
+                            modifier = Modifier.padding(top = 4.dp, start = 16.dp),
+                        )
+
                         if (showCustomPathDialog) {
                             OverlayDialog(
                                 show = true,
