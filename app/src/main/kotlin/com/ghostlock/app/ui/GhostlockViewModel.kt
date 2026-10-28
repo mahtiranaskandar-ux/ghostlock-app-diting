@@ -203,6 +203,12 @@ class GhostlockViewModel(
             refreshRootManagers()
             val label = packageName ?: "Auto"
             appendLog("<k> Root manager changed to: $label")
+            mutableState.update {
+                it.copy(
+                    executionSheetVisible = true,
+                    executionSheetDismissible = true,
+                )
+            }
         }
     }
 
@@ -211,6 +217,12 @@ class GhostlockViewModel(
             repository.setCustomKsudPath(path)
             refreshRootManagers()
             appendLog("<k> Custom ksud path set to: ${path ?: "none"}")
+            mutableState.update {
+                it.copy(
+                    executionSheetVisible = true,
+                    executionSheetDismissible = true,
+                )
+            }
         }
     }
 
