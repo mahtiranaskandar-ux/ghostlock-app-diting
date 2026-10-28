@@ -192,10 +192,21 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                                 it.name.matches(Regex("lib/arm64-v8a/.*\\.so")) && it.size > 1_000_000
                             }
                             for (candidate in candidates) {
-                                val sample = zip.getInputStream(candidate).use { input ->
-                                    input.readBytes().toString(Charsets.ISO_8859_1)
+                                val foundInFile = zip.getInputStream(candidate).use { input ->
+                                    val buffer = ByteArray(1024 * 1024)
+                                    var result = false
+                                    while (true) {
+                                        val read = input.read(buffer)
+                                        if (read <= 0) break
+                                        val chunk = String(buffer, 0, read, Charsets.ISO_8859_1)
+                                        if (chunk.contains("KernelSU userspace") || chunk.contains("late-load command triggered")) {
+                                            result = true
+                                            break
+                                        }
+                                    }
+                                    result
                                 }
-                                if (sample.contains("KernelSU userspace") || sample.contains("late-load command triggered")) {
+                                if (foundInFile) {
                                     found = true
                                     break
                                 }
@@ -1260,10 +1271,21 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                                     it.name.matches(Regex("lib/arm64-v8a/.*\\.so")) && it.size > 1_000_000
                                 }
                                 for (candidate in candidates) {
-                                    val sample = zip.getInputStream(candidate).use { input ->
-                                        input.readBytes().toString(Charsets.ISO_8859_1)
+                                    val foundInFile = zip.getInputStream(candidate).use { input ->
+                                        val buffer = ByteArray(1024 * 1024)
+                                        var result = false
+                                        while (true) {
+                                            val read = input.read(buffer)
+                                            if (read <= 0) break
+                                            val chunk = String(buffer, 0, read, Charsets.ISO_8859_1)
+                                            if (chunk.contains("KernelSU userspace") || chunk.contains("late-load command triggered")) {
+                                                result = true
+                                                break
+                                            }
+                                        }
+                                        result
                                     }
-                                    if (sample.contains("KernelSU userspace") || sample.contains("late-load command triggered")) {
+                                    if (foundInFile) {
                                         entry = candidate
                                         break
                                     }
