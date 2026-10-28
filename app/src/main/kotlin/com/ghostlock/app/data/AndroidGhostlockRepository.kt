@@ -217,8 +217,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         preferences.getString(PrefPreferredRootManager, null)?.takeIf { it.isNotEmpty() }
 
     override fun resolvePackageLabel(packageName: String): String? {
-        val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull() ?: return null
-        return runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrNull()
+        // First try getApplicationInfo (fast)
+        val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull()
+        if (appInfo != null) {
+            return runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrNull()
+        }
+        // Fallback: scan all installed applications (works when visibility is restricted)
+        val installed = runCatching { appContext.packageManager.getInstalledApplications(0) }.getOrDefault(emptyList())
+        val found = installed.firstOrNull { it.packageName == packageName } ?: return null
+        return runCatching { appContext.packageManager.getApplicationLabel(found).toString() }.getOrNull()
     }
 
     override fun getCustomKsudPath(): String? =
