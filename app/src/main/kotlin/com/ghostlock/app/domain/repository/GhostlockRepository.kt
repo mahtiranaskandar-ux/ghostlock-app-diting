@@ -21,6 +21,26 @@ interface GhostlockRepository {
     fun setForceAttackTest(enabled: Boolean)
 
     /**
+     * Managers installed on the device that ship a libksud.so. The known
+     * managers come first with their display labels; any other package is
+     * appended with its application label.
+     */
+    fun detectInstalledManagers(): List<Pair<String, String>>
+
+    /** Package the user pinned as the ksud source, or null for auto-detect. */
+    fun getPreferredRootManager(): String?
+
+    /** Pins a manager as the ksud source, or null to fall back to auto-detect. */
+    fun setPreferredRootManager(packageName: String?)
+
+    fun resolvePackageLabel(packageName: String): String?
+
+    fun getCustomKsudPath(): String?
+    fun setCustomKsudPath(path: String?)
+    fun getCustomSoName(): String?
+    fun setCustomSoName(name: String?)
+
+    /**
      * Build identity whose "layers were disabled" start-up notice the user has
      * already seen; null when none. The notice fires once per build, because a
      * new build is what disables the layers and the user has to be told once,

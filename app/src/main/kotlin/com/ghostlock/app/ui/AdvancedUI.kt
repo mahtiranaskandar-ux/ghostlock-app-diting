@@ -1,5 +1,7 @@
 package com.ghostlock.app.ui
 
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.expandVertically
@@ -22,7 +24,10 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
@@ -222,6 +227,115 @@ internal fun AdvancedScreen(
                                 modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 12.dp),
                                 style = MiuixTheme.textStyles.body2,
                                 color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                            )
+                        }
+                    }
+                }
+            }
+            item(key = "rootManager") {
+                Card {
+                    Column {
+                        var showCustomPathDialog by remember { mutableStateOf(false) }
+                        var customPathInput by remember { mutableStateOf("") }
+                        var customSoInput by remember { mutableStateOf("") }
+
+                        var showManagerDialog by remember { mutableStateOf(false) }
+
+                        val currentLabel = when {
+                            state.customKsudPath != null -> "Custom Package..."
+                            state.preferredRootManager == null -> "Auto"
+                            else -> state.installedManagers.firstOrNull { it.first == state.preferredRootManager }?.second ?: "Unknown"
+                        }
+
+                        ArrowPreference(
+                            title = stringResource(R.string.root_manager_label),
+                            summary = currentLabel,
+                            onClick = { showManagerDialog = true },
+                        )
+
+                        if (showManagerDialog) {
+                            OverlayDialog(
+                                show = true,
+                                title = stringResource(R.string.root_manager_label),
+                                onDismissRequest = { showManagerDialog = false },
+                                content = {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Auto",
+                                            onClick = {
+                                                actions.onRootManagerChanged(null)
+                                                actions.onCustomKsudPathChanged(null)
+                                                showManagerDialog = false
+                                            },
+                                        )
+                                        state.installedManagers.forEach { (pkg, label) ->
+                                            TextButton(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                text = label,
+                                                onClick = {
+                                                    actions.onRootManagerChanged(pkg)
+                                                    actions.onCustomKsudPathChanged(null)
+                                                    showManagerDialog = false
+                                                },
+                                            )
+                                        }
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Custom Package...",
+                                            onClick = {
+                                                customPathInput = state.customKsudPath ?: ""
+                                                customSoInput = state.customSoName ?: ""
+                                                showCustomPathDialog = true
+                                                showManagerDialog = false
+                                            },
+                                        )
+                                    }
+                                },
+                            )
+                        }
+
+                        if (showCustomPathDialog) {
+                            OverlayDialog(
+                                show = true,
+                                title = "Custom Package",
+                                onDismissRequest = { showCustomPathDialog = false },
+                                content = {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        TextField(
+                                            value = customPathInput,
+                                            onValueChange = { customPathInput = it },
+                                            label = "Package name (e.g. org.matrix.su)",
+                                            modifier = Modifier.fillMaxWidth(),
+                                        )
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        TextField(
+                                            value = customSoInput,
+                                            onValueChange = { customSoInput = it },
+                                            label = "Custom SO name (optional)",
+                                            modifier = Modifier.fillMaxWidth(),
+                                        )
+                                        Spacer(modifier = Modifier.height(12.dp))
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Save",
+                                            onClick = {
+                                                actions.onCustomKsudPathChanged(customPathInput.takeIf { it.isNotEmpty() })
+                                                actions.onCustomSoNameChanged(customSoInput.takeIf { it.isNotEmpty() })
+                                                showCustomPathDialog = false
+                                            },
+                                        )
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Clear",
+                                            onClick = {
+                                                actions.onCustomKsudPathChanged(null)
+                                                actions.onCustomSoNameChanged(null)
+                                                showCustomPathDialog = false
+                                            },
+                                        )
+                                    }
+                                },
                             )
                         }
                     }

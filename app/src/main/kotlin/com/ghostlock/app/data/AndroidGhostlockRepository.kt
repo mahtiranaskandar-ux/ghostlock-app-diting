@@ -53,6 +53,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         const val PrefDebugProfileOverrides = "debug_profile_overrides"
 
+        /* User-selected root manager package. Empty = auto-detect. */
+        const val PrefPreferredRootManager = "preferred_root_manager"
+        const val PrefCustomKsudPath = "custom_ksud_path"
+        const val PrefCustomSoName = "custom_so_name"
+
+        /* Known ksud entry names across managers (SukiSU hides it under a random name). */
+        val KnownKsudNames = listOf("libksud.so")
+
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
         fun ksuLogName(runStamp: Long) = "ghostlock-ksu-$runStamp.log"
@@ -153,6 +161,111 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * leaving them unstamped would silently disable a user's own
              * offsets on the very update that carried them over. */
             putString(AndroidProfileConfigController.PrefOverridesBuildSha, BuildConfig.BUILD_IDENTITY)
+        }
+    }
+
+    private fun knownRootManagers(): List<Pair<String, String>> = listOf(
+        "com.rifsxd.ksunext" to "KernelSU Next",
+        "me.weishu.kernelsu.pr" to "KernelSU PR",
+        "me.weishu.kernelsu" to "KernelSU",
+        "com.resukisu.resukisu" to "ReSukiSU",
+        "com.kowx712.supermanager" to "KowSU",
+    )
+
+    override fun detectInstalledManagers(): List<Pair<String, String>> {
+        val result = mutableListOf<Pair<String, String>>()
+        val seen = mutableSetOf<String>()
+
+        fun checkPackage(pkg: String, label: String) {
+            if (seen.contains(pkg)) return
+            val appInfo = runCatching { appContext.packageManager.getApplicationInfo(pkg, 0) }.getOrNull() ?: return
+
+            // First try nativeLibraryDir (works with root or for own apps)
+            var hasKsud = File(appInfo.nativeLibraryDir, "libksud.so").isFile
+
+            // If not found, inspect the APK directly (works without root)
+            if (!hasKsud) {
+                hasKsud = runCatching {
+                    java.util.zip.ZipFile(appInfo.sourceDir).use { zip ->
+                        val knownNames = listOf("libksud.so")
+                        knownNames.any { name ->
+                            zip.entries().asSequence().any { entry ->
+                                entry.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/${Regex.escape(name)}"))
+                            }
+                        }
+                    }
+                }.getOrDefault(false)
+            }
+
+            if (hasKsud) {
+                result += pkg to label
+                seen += pkg
+            }
+        }
+
+        // 1. Check known managers (fast path)
+        for ((pkg, fallbackLabel) in knownRootManagers()) {
+            // Use the system's real label (e.g. BakaSU) if available, otherwise use the fallback
+            val actualLabel = resolvePackageLabel(pkg) ?: fallbackLabel
+            checkPackage(pkg, actualLabel)
+        }
+
+        // 2. Check all installed apps (dynamic detection)
+        val installed = runCatching { appContext.packageManager.getInstalledApplications(0) }.getOrDefault(emptyList())
+        for (appInfo in installed) {
+            // Skip system apps (root managers are always user-installed)
+            if ((appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) continue
+            // Skip our own app
+            if (appInfo.packageName == appContext.packageName) continue
+
+            val pkg = appInfo.packageName
+            if (pkg in seen) continue
+            val label = runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrDefault(pkg)
+            checkPackage(pkg, label)
+        }
+
+        return result
+    }
+
+    override fun getPreferredRootManager(): String? =
+        preferences.getString(PrefPreferredRootManager, null)?.takeIf { it.isNotEmpty() }
+
+    override fun resolvePackageLabel(packageName: String): String? {
+        // First try getApplicationInfo (fast)
+        val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull()
+        if (appInfo != null) {
+            return runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrNull()
+        }
+        // Fallback: scan all installed applications (works when visibility is restricted)
+        val installed = runCatching { appContext.packageManager.getInstalledApplications(0) }.getOrDefault(emptyList())
+        val found = installed.firstOrNull { it.packageName == packageName } ?: return null
+        return runCatching { appContext.packageManager.getApplicationLabel(found).toString() }.getOrNull()
+    }
+
+    override fun getCustomKsudPath(): String? =
+        preferences.getString(PrefCustomKsudPath, null)?.takeIf { it.isNotEmpty() }
+
+    override fun setCustomKsudPath(path: String?) {
+        preferences.edit {
+            if (path.isNullOrEmpty()) remove(PrefCustomKsudPath)
+            else putString(PrefCustomKsudPath, path)
+        }
+    }
+
+    override fun getCustomSoName(): String? =
+        preferences.getString(PrefCustomSoName, null)?.takeIf { it.isNotEmpty() }
+
+    override fun setCustomSoName(name: String?) {
+        preferences.edit {
+            if (name.isNullOrEmpty()) remove(PrefCustomSoName)
+            else putString(PrefCustomSoName, name)
+        }
+    }
+
+    override fun setPreferredRootManager(packageName: String?) {
+        preferences.edit {
+            if (packageName.isNullOrEmpty()) remove(PrefPreferredRootManager)
+            else putString(PrefPreferredRootManager, packageName)
         }
     }
 
@@ -1134,27 +1247,68 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun firstValidProperty(vararg keys: String): String? = keys.asSequence().firstNotNullOfOrNull { validDeviceName(systemProperty(it)) }
 
     private fun prepareKsud(workDir: File, onLog: (String) -> Unit): File? {
-        val packages = listOf(
-            "com.rifsxd.ksunext",
-            "me.weishu.kernelsu.pr",
-            "me.weishu.kernelsu",
-            "com.resukisu.resukisu",
-            "com.kowx712.supermanager",
-        )
+        val customPackage = getCustomKsudPath()
+        if (!customPackage.isNullOrEmpty()) {
+            // Treated as a package name; extract libksud.so from its APK
+            val appInfo = runCatching { appContext.packageManager.getApplicationInfo(customPackage, 0) }.getOrNull()
+            if (appInfo == null) {
+                onLog("<k> custom package not installed: $customPackage")
+            } else {
+                val label = runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrDefault(customPackage)
+                val apkFile = File(appInfo.sourceDir)
+                if (apkFile.isFile) {
+                    val output = File(workDir, "ksud")
+                    runCatching {
+                        java.util.zip.ZipFile(apkFile).use { zip ->
+                            val customSo = getCustomSoName()
+                            val namesToTry = if (!customSo.isNullOrEmpty()) listOf(customSo) else KnownKsudNames
+                            var entry: java.util.zip.ZipEntry? = null
+                            for (name in namesToTry) {
+                                entry = zip.entries().asSequence().firstOrNull {
+                                    it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/${Regex.escape(name)}"))
+                                }
+                                if (entry != null) break
+                            }
+                            if (entry != null) {
+                                zip.getInputStream(entry).use { input -> output.outputStream().use { input.copyTo(it) } }
+                                runCatching { Os.chmod(output.absolutePath, 448) }
+                                onLog("<k> ksud copied from custom package $label ($customPackage) [entry=${entry.name}]: ${apkFile.absolutePath} -> ${output.absolutePath}")
+                                return output
+                            }
+                        }
+                    }.onFailure { onLog("<k> copy ksud from $label failed: ${it.message}") }
+                    onLog("<k> no ksud (standard or disguised) found in $label ($customPackage)")
+                } else {
+                    onLog("<k> APK not found for $customPackage")
+                }
+            }
+        }
+
+        val preferred = getPreferredRootManager()
+        val sourceMode = if (preferred != null) "pinned" else "auto-detect"
+        onLog("<k> ksud selection: mode=$sourceMode" + (preferred?.let { " package=$it" } ?: ""))
+
+        val packages = preferred?.let { listOf(it) } ?: emptyList()
         var installed = false
         for (packageName in packages) {
             val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull() ?: continue
             installed = true
-            val source = File(appInfo.nativeLibraryDir, "libksud.so")
-            if (!source.isFile) continue
             val output = File(workDir, "ksud")
             runCatching {
-                source.inputStream().use { input -> output.outputStream().use { input.copyTo(it) } }
-                runCatching { Os.chmod(output.absolutePath, 448) }
-                return output
-            }.onFailure { onLog("<k> copy ksud failed: ${it.message}") }
+                java.util.zip.ZipFile(File(appInfo.sourceDir)).use { zip ->
+                    for (name in KnownKsudNames) {
+                        val entry = zip.entries().asSequence().firstOrNull {
+                            it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/${Regex.escape(name)}"))
+                        } ?: continue
+                        zip.getInputStream(entry).use { input -> output.outputStream().use { input.copyTo(it) } }
+                        runCatching { Os.chmod(output.absolutePath, 448) }
+                        onLog("<k> ksud copied from $packageName [entry=${entry.name}]")
+                        return output
+                    }
+                }
+            }.onFailure { onLog("<k> copy ksud from $packageName failed: ${it.message}") }
         }
-        if (!installed) onLog("<k> KernelSU/ReSukiSU/KowSU app not installed")
+        if (!installed) onLog("<k> no manager package selected")
         return null
     }
 

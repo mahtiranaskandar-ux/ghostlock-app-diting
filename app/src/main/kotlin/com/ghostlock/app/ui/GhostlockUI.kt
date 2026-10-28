@@ -101,6 +101,10 @@ data class GhostlockUiState(
     val kernelRelease: String = "",
     val socName: String = "",
     val rootManager: String = "",
+    val installedManagers: List<Pair<String, String>> = emptyList(),
+    val preferredRootManager: String? = null,
+    val customKsudPath: String? = null,
+    val customSoName: String? = null,
     val kernelSupported: Boolean = false,
     val shizukuEnabled: Boolean = false,
     val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,
@@ -225,6 +229,11 @@ interface GhostlockActions {
     fun onCpuPairSelected(index: Int)
     fun onSafeModeChanged(enabled: Boolean)
     fun onForceAttackTestChanged(enabled: Boolean)
+
+    fun onRootManagerChanged(packageName: String?)
+    fun onCustomKsudPathChanged(path: String?)
+    fun onCustomSoNameChanged(name: String?)
+
     fun onShizukuChanged(enabled: Boolean)
     fun onDialogItemSelected(index: Int)
     fun onDialogInputChange(value: String)
