@@ -171,23 +171,45 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun detectInstalledManagers(): List<Pair<String, String>> {
         val result = mutableListOf<Pair<String, String>>()
         val seen = mutableSetOf<String>()
-        for ((pkg, label) in knownRootManagers()) {
-            if (seen.contains(pkg)) continue
-            val appInfo = runCatching { appContext.packageManager.getApplicationInfo(pkg, 0) }.getOrNull() ?: continue
-            if (File(appInfo.nativeLibraryDir, "libksud.so").isFile) {
+
+        fun checkPackage(pkg: String, label: String) {
+            if (seen.contains(pkg)) return
+            val appInfo = runCatching { appContext.packageManager.getApplicationInfo(pkg, 0) }.getOrNull() ?: return
+            
+            // First try nativeLibraryDir (works with root or for own apps)
+            var hasKsud = File(appInfo.nativeLibraryDir, "libksud.so").isFile
+            
+            // If not found, inspect the APK directly (works without root)
+            if (!hasKsud) {
+                hasKsud = runCatching {
+                    java.util.zip.ZipFile(appInfo.sourceDir).use { zip ->
+                        zip.entries().asSequence().any { entry ->
+                            entry.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so"))
+                        }
+                    }
+                }.getOrDefault(false)
+            }
+            
+            if (hasKsud) {
                 result += pkg to label
                 seen += pkg
             }
         }
+
+        // 1. Check known managers (fast path)
+        for ((pkg, label) in knownRootManagers()) {
+            checkPackage(pkg, label)
+        }
+
+        // 2. Check all installed apps (dynamic detection)
         val installed = runCatching { appContext.packageManager.getInstalledApplications(0) }.getOrDefault(emptyList())
         for (appInfo in installed) {
             val pkg = appInfo.packageName
             if (pkg in seen) continue
-            if (!File(appInfo.nativeLibraryDir, "libksud.so").isFile) continue
             val label = runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrDefault(pkg)
-            result += pkg to label
-            seen += pkg
+            checkPackage(pkg, label)
         }
+
         return result
     }
 
