@@ -183,36 +183,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (!hasKsud) {
                 hasKsud = runCatching {
                     java.util.zip.ZipFile(appInfo.sourceDir).use { zip ->
-                        var found = zip.entries().asSequence().any { entry ->
-                            entry.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so"))
-                        }
-                        // Fallback: look for a disguised ksud by content
-                        if (!found) {
-                            val candidates = zip.entries().asSequence().filter {
-                                it.name.matches(Regex("lib/arm64-v8a/.*\\.so")) && it.size > 1_000_000
-                            }
-                            for (candidate in candidates) {
-                                val foundInFile = zip.getInputStream(candidate).use { input ->
-                                    val buffer = ByteArray(1024 * 1024)
-                                    var result = false
-                                    while (true) {
-                                        val read = input.read(buffer)
-                                        if (read <= 0) break
-                                        val chunk = String(buffer, 0, read, Charsets.ISO_8859_1)
-                                        if (chunk.contains("KernelSU userspace") || chunk.contains("late-load command triggered")) {
-                                            result = true
-                                            break
-                                        }
-                                    }
-                                    result
-                                }
-                                if (foundInFile) {
-                                    found = true
-                                    break
-                                }
+                        val knownNames = listOf("libksud.so", "libeexgslcpwg.so")
+                        knownNames.any { name ->
+                            zip.entries().asSequence().any { entry ->
+                                entry.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/${Regex.escape(name)}"))
                             }
                         }
-                        found
                     }
                 }.getOrDefault(false)
             }
@@ -1263,33 +1239,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     val output = File(workDir, "ksud")
                     runCatching {
                         java.util.zip.ZipFile(apkFile).use { zip ->
-                            var entry = zip.entries().asSequence().firstOrNull {
-                                it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/libksud\\.so"))
-                            }
-                            if (entry == null) {
-                                val candidates = zip.entries().asSequence().filter {
-                                    it.name.matches(Regex("lib/arm64-v8a/.*\\.so")) && it.size > 1_000_000
+                            val knownNames = listOf("libksud.so", "libeexgslcpwg.so")
+                            var entry: java.util.zip.ZipEntry? = null
+                            for (name in knownNames) {
+                                entry = zip.entries().asSequence().firstOrNull {
+                                    it.name.matches(Regex("lib/(arm64-v8a|armeabi-v7a|x86|x86_64)/${Regex.escape(name)}"))
                                 }
-                                for (candidate in candidates) {
-                                    val foundInFile = zip.getInputStream(candidate).use { input ->
-                                        val buffer = ByteArray(1024 * 1024)
-                                        var result = false
-                                        while (true) {
-                                            val read = input.read(buffer)
-                                            if (read <= 0) break
-                                            val chunk = String(buffer, 0, read, Charsets.ISO_8859_1)
-                                            if (chunk.contains("KernelSU userspace") || chunk.contains("late-load command triggered")) {
-                                                result = true
-                                                break
-                                            }
-                                        }
-                                        result
-                                    }
-                                    if (foundInFile) {
-                                        entry = candidate
-                                        break
-                                    }
-                                }
+                                if (entry != null) break
                             }
                             if (entry != null) {
                                 zip.getInputStream(entry).use { input -> output.outputStream().use { input.copyTo(it) } }
