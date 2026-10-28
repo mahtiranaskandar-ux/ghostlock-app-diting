@@ -238,49 +238,60 @@ internal fun AdvancedScreen(
                         var showCustomPathDialog by remember { mutableStateOf(false) }
                         var customPathInput by remember { mutableStateOf("") }
 
-                        val managerItems = listOf(
-                            DropdownItem(icon = null, title = "Auto")
-                        ) + state.installedManagers.map { (_, label) ->
-                            DropdownItem(icon = null, title = label)
-                        } + listOf(DropdownItem(icon = null, title = "Custom Path..."))
+                        var showManagerDialog by remember { mutableStateOf(false) }
 
-                        val computedIdx = when {
-                            state.customKsudPath != null -> managerItems.size - 1
-                            state.preferredRootManager == null -> 0
-                            else -> {
-                                val idx = state.installedManagers.indexOfFirst { it.first == state.preferredRootManager }
-                                if (idx >= 0) idx + 1 else 0
-                            }
+                        val currentLabel = when {
+                            state.customKsudPath != null -> "Custom Path..."
+                            state.preferredRootManager == null -> "Auto"
+                            else -> state.installedManagers.firstOrNull { it.first == state.preferredRootManager }?.second ?: "Unknown"
                         }
 
-                        key(state.preferredRootManager, state.customKsudPath) {
-                            OverlaySpinnerPreference(
+                        ArrowPreference(
+                            title = stringResource(R.string.root_manager_label),
+                            summary = currentLabel,
+                            onClick = { showManagerDialog = true },
+                        )
+
+                        if (showManagerDialog) {
+                            OverlayDialog(
+                                show = true,
                                 title = stringResource(R.string.root_manager_label),
-                                items = managerItems,
-                                selectedIndex = computedIdx,
-                                showValue = true,
-                                onSelectedIndexChange = { index ->
-                                    if (index == managerItems.size - 1) {
-                                        customPathInput = state.customKsudPath ?: ""
-                                        showCustomPathDialog = true
-                                    } else if (index == 0) {
-                                        actions.onRootManagerChanged(null)
-                                        actions.onCustomKsudPathChanged(null)
-                                    } else {
-                                        val pkg = state.installedManagers[index - 1].first
-                                        actions.onRootManagerChanged(pkg)
-                                        actions.onCustomKsudPathChanged(null)
+                                onDismissRequest = { showManagerDialog = false },
+                                content = {
+                                    Column(modifier = Modifier.fillMaxWidth()) {
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Auto",
+                                            onClick = {
+                                                actions.onRootManagerChanged(null)
+                                                actions.onCustomKsudPathChanged(null)
+                                                showManagerDialog = false
+                                            },
+                                        )
+                                        state.installedManagers.forEach { (pkg, label) ->
+                                            TextButton(
+                                                modifier = Modifier.fillMaxWidth(),
+                                                text = label,
+                                                onClick = {
+                                                    actions.onRootManagerChanged(pkg)
+                                                    actions.onCustomKsudPathChanged(null)
+                                                    showManagerDialog = false
+                                                },
+                                            )
+                                        }
+                                        TextButton(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            text = "Custom Path...",
+                                            onClick = {
+                                                customPathInput = state.customKsudPath ?: ""
+                                                showCustomPathDialog = true
+                                                showManagerDialog = false
+                                            },
+                                        )
                                     }
                                 },
                             )
                         }
-
-                        // DEBUG: show current state value directly from ViewModel
-                        Text(
-                            text = "DEBUG_STATE: ${state.preferredRootManager ?: "null"}",
-                            style = MiuixTheme.textStyles.body2,
-                            modifier = Modifier.padding(top = 4.dp, start = 16.dp),
-                        )
 
                         if (showCustomPathDialog) {
                             OverlayDialog(
