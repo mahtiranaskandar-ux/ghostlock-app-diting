@@ -176,8 +176,23 @@ class GhostlockViewModel(
             }
             val preferred: String? = repository.getPreferredRootManager()
             val customPath: String? = repository.getCustomKsudPath()
-            mutableState.update {
-                it.copy(installedManagers = managers, preferredRootManager = preferred, customKsudPath = customPath)
+
+            // Update rootManager label based on the preferred choice
+            val displayRootManager = when {
+                customPath != null -> "Custom Path"
+                preferred != null -> {
+                    managers.firstOrNull { it.first == preferred }?.second ?: preferred
+                }
+                else -> null
+            }
+
+            mutableState.update { state ->
+                state.copy(
+                    installedManagers = managers,
+                    preferredRootManager = preferred,
+                    customKsudPath = customPath,
+                    rootManager = displayRootManager ?: state.rootManager
+                )
             }
         }
     }
