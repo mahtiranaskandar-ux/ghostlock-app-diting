@@ -163,6 +163,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
     }
 
+    private fun knownRootManagers(): List<Pair<String, String>> = listOf(
+        "com.rifsxd.ksunext" to "KernelSU Next",
+        "me.weishu.kernelsu.pr" to "KernelSU PR",
+        "me.weishu.kernelsu" to "KernelSU",
+        "com.resukisu.resukisu" to "ReSukiSU",
+        "com.kowx712.supermanager" to "KowSU",
+    )
+
     override fun detectInstalledManagers(): List<Pair<String, String>> {
         val result = mutableListOf<Pair<String, String>>()
         val seen = mutableSetOf<String>()
@@ -194,7 +202,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             }
         }
 
-        // Check all installed apps (dynamic detection)
+        // 1. Check known managers (fast path)
+        for ((pkg, label) in knownRootManagers()) {
+            checkPackage(pkg, label)
+        }
+
+        // 2. Check all installed apps (dynamic detection)
         val installed = runCatching { appContext.packageManager.getInstalledApplications(0) }.getOrDefault(emptyList())
         for (appInfo in installed) {
             val pkg = appInfo.packageName
