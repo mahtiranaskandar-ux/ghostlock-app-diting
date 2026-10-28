@@ -189,13 +189,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         // Fallback: look for a disguised ksud by content
                         if (!found) {
                             val candidates = zip.entries().asSequence().filter {
-                                it.name.matches(Regex("lib/arm64-v8a/.*\\.so"))
+                                it.name.matches(Regex("lib/arm64-v8a/.*\\.so")) && it.size > 1_000_000
                             }
                             for (candidate in candidates) {
                                 val sample = zip.getInputStream(candidate).use { input ->
-                                    val buffer = ByteArray(64 * 1024)
-                                    val read = input.read(buffer)
-                                    if (read > 0) String(buffer, 0, read, Charsets.ISO_8859_1) else ""
+                                    input.readBytes().toString(Charsets.ISO_8859_1)
                                 }
                                 if (sample.contains("KernelSU userspace") || sample.contains("late-load command triggered")) {
                                     found = true
@@ -1259,13 +1257,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                             }
                             if (entry == null) {
                                 val candidates = zip.entries().asSequence().filter {
-                                    it.name.matches(Regex("lib/arm64-v8a/.*\\.so"))
+                                    it.name.matches(Regex("lib/arm64-v8a/.*\\.so")) && it.size > 1_000_000
                                 }
                                 for (candidate in candidates) {
                                     val sample = zip.getInputStream(candidate).use { input ->
-                                        val buffer = ByteArray(64 * 1024)
-                                        val read = input.read(buffer)
-                                        if (read > 0) String(buffer, 0, read, Charsets.ISO_8859_1) else ""
+                                        input.readBytes().toString(Charsets.ISO_8859_1)
                                     }
                                     if (sample.contains("KernelSU userspace") || sample.contains("late-load command triggered")) {
                                         entry = candidate
