@@ -97,6 +97,7 @@ class GhostlockViewModel(
         repository.setShizukuStatusListener { refreshAccessStatus() }
         viewModelScope.launch {
             refreshSnapshot()
+            refreshRootManagers()
             markInterruptedRunLogs()
             applyRecommendedShizuku()
             maybeSuggestShizukuForW3()
@@ -163,6 +164,75 @@ class GhostlockViewModel(
                  * need to send is one tap away. */
                 dialogExportLog = true,
             )
+        }
+    }
+
+    fun refreshRootManagers() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val managers: List<Pair<String, String>> = try {
+                repository.detectInstalledManagers()
+            } catch (e: java.lang.Exception) {
+                emptyList<Pair<String, String>>()
+            }
+            val preferred: String? = repository.getPreferredRootManager()
+            val customPath: String? = repository.getCustomKsudPath()
+
+            // Update rootManager label based on the preferred choice
+            val displayRootManager = when {
+                customPath != null -> {
+                    // customPath is always a package name now
+                    repository.resolvePackageLabel(customPath) ?: "Custom ($customPath)"
+                }
+                preferred != null -> {
+                    managers.firstOrNull { it.first == preferred }?.second ?: preferred
+                }
+                else -> null
+            }
+
+            mutableState.update { state ->
+                state.copy(
+                    installedManagers = managers,
+                    preferredRootManager = preferred,
+                    customKsudPath = customPath,
+                    rootManager = displayRootManager ?: state.rootManager
+                )
+            }
+        }
+    }
+
+    fun onRootManagerChanged(packageName: String?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setPreferredRootManager(packageName)
+            refreshRootManagers()
+            val label = packageName ?: "Auto"
+            appendLog("<k> Root manager changed to: $label")
+            mutableState.update {
+                it.copy(
+                    executionSheetVisible = true,
+                    executionSheetDismissible = true,
+                )
+            }
+        }
+    }
+
+    fun onCustomKsudPathChanged(packageName: String?) {
+        viewModelScope.launch(Dispatchers.IO) {
+            repository.setCustomKsudPath(packageName)
+            refreshRootManagers()
+            val label = when {
+                packageName.isNullOrEmpty() -> "none"
+                else -> {
+                    val resolved = repository.resolvePackageLabel(packageName)
+                    if (resolved != null) "$resolved ($packageName)" else "$packageName (not installed)"
+                }
+            }
+            appendLog("<k> Custom ksud package set to: $label")
+            mutableState.update {
+                it.copy(
+                    executionSheetVisible = true,
+                    executionSheetDismissible = true,
+                )
+            }
         }
     }
 
