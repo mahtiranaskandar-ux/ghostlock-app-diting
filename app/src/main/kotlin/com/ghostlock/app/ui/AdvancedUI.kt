@@ -281,7 +281,7 @@ internal fun AdvancedScreen(
                                         }
                                         TextButton(
                                             modifier = Modifier.fillMaxWidth(),
-                                            text = "Custom Path...",
+                                            text = "Custom Package...",
                                             onClick = {
                                                 customPathInput = state.customKsudPath ?: ""
                                                 showCustomPathDialog = true
@@ -296,14 +296,14 @@ internal fun AdvancedScreen(
                         if (showCustomPathDialog) {
                             OverlayDialog(
                                 show = true,
-                                title = "Custom ksud path",
+                                title = "Custom Package or Path",
                                 onDismissRequest = { showCustomPathDialog = false },
                                 content = {
                                     Column(modifier = Modifier.fillMaxWidth()) {
                                         TextField(
                                             value = customPathInput,
                                             onValueChange = { customPathInput = it },
-                                            label = "Path to ksud",
+                                            label = "Package name (e.g. org.matrix.su) or path",
                                             modifier = Modifier.fillMaxWidth(),
                                         )
                                         Spacer(modifier = Modifier.height(12.dp))

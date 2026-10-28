@@ -216,7 +216,19 @@ class GhostlockViewModel(
         viewModelScope.launch(Dispatchers.IO) {
             repository.setCustomKsudPath(path)
             refreshRootManagers()
-            appendLog("<k> Custom ksud path set to: ${path ?: "none"}")
+            val label = when {
+                path.isNullOrEmpty() -> "none"
+                path.startsWith("/") -> path
+                else -> {
+                    val pkg = try { appContext.packageManager.getApplicationInfo(path, 0) } catch (e: Exception) { null }
+                    if (pkg != null) {
+                        appContext.packageManager.getApplicationLabel(pkg).toString() + " ($path)"
+                    } else {
+                        "$path (not installed)"
+                    }
+                }
+            }
+            appendLog("<k> Custom ksud source set to: $label")
             mutableState.update {
                 it.copy(
                     executionSheetVisible = true,
