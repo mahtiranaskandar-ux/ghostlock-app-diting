@@ -210,6 +210,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         // 2. Check all installed apps (dynamic detection)
         val installed = runCatching { appContext.packageManager.getInstalledApplications(0) }.getOrDefault(emptyList())
         for (appInfo in installed) {
+            // Skip system apps (root managers are always user-installed)
+            if ((appInfo.flags and android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0) continue
+            // Skip our own app
+            if (appInfo.packageName == appContext.packageName) continue
+
             val pkg = appInfo.packageName
             if (pkg in seen) continue
             val label = runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrDefault(pkg)

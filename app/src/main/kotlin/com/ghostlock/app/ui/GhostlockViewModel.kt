@@ -203,36 +203,49 @@ class GhostlockViewModel(
     fun onRootManagerChanged(packageName: String?) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.setPreferredRootManager(packageName)
-            refreshRootManagers()
-            val label = packageName ?: "Auto"
-            appendLog("<k> Root manager changed to: $label")
-            mutableState.update {
-                it.copy(
+            // Do not call refreshRootManagers() (it scans all APKs and causes a delay).
+            val label = if (packageName == null) "Auto"
+                else repository.resolvePackageLabel(packageName) ?: packageName
+
+            mutableState.update { state ->
+                state.copy(
+                    preferredRootManager = packageName,
+                    customKsudPath = null,
+                    rootManager = label,
                     executionSheetVisible = true,
                     executionSheetDismissible = true,
                 )
             }
+            appendLog("<k> Root manager changed to: $label")
         }
     }
 
     fun onCustomKsudPathChanged(packageName: String?) {
         viewModelScope.launch(Dispatchers.IO) {
             repository.setCustomKsudPath(packageName)
-            refreshRootManagers()
-            val label = when {
-                packageName.isNullOrEmpty() -> "none"
-                else -> {
-                    val resolved = repository.resolvePackageLabel(packageName)
-                    if (resolved != null) "$resolved ($packageName)" else "$packageName (not installed)"
-                }
+            // Do not call refreshRootManagers() (it scans all APKs and causes a delay).
+            val resolved = if (packageName.isNullOrEmpty()) null else repository.resolvePackageLabel(packageName)
+            val displayLabel = when {
+                packageName.isNullOrEmpty() -> "Auto"
+                resolved != null -> resolved
+                else -> "Custom ($packageName)"
             }
-            appendLog("<k> Custom ksud package set to: $label")
-            mutableState.update {
-                it.copy(
+            val logLabel = when {
+                packageName.isNullOrEmpty() -> "none"
+                resolved != null -> "$resolved ($packageName)"
+                else -> "$packageName (not installed)"
+            }
+
+            mutableState.update { state ->
+                state.copy(
+                    preferredRootManager = null,
+                    customKsudPath = packageName,
+                    rootManager = displayLabel,
                     executionSheetVisible = true,
                     executionSheetDismissible = true,
                 )
             }
+            appendLog("<k> Custom ksud package set to: $logLabel")
         }
     }
 
