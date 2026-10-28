@@ -179,7 +179,21 @@ class GhostlockViewModel(
 
             // Update rootManager label based on the preferred choice
             val displayRootManager = when {
-                customPath != null -> "Custom Path"
+                customPath != null -> {
+                    if (customPath.startsWith("/")) {
+                        "Custom Path"
+                    } else {
+                        // customPath is a package name: resolve its label
+                        val appInfo = try {
+                            appContext.packageManager.getApplicationInfo(customPath, 0)
+                        } catch (e: Exception) { null }
+                        if (appInfo != null) {
+                            appContext.packageManager.getApplicationLabel(appInfo).toString()
+                        } else {
+                            "Custom ($customPath)"
+                        }
+                    }
+                }
                 preferred != null -> {
                     managers.firstOrNull { it.first == preferred }?.second ?: preferred
                 }
