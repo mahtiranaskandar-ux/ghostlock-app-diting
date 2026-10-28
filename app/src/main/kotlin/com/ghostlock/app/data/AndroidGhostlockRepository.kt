@@ -216,7 +216,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun getPreferredRootManager(): String? =
         preferences.getString(PrefPreferredRootManager, null)?.takeIf { it.isNotEmpty() }
 
-    fun resolvePackageLabel(packageName: String): String? {
+    override fun resolvePackageLabel(packageName: String): String? {
         val appInfo = runCatching { appContext.packageManager.getApplicationInfo(packageName, 0) }.getOrNull() ?: return null
         return runCatching { appContext.packageManager.getApplicationLabel(appInfo).toString() }.getOrNull()
     }
