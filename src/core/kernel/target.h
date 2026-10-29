@@ -36,7 +36,7 @@ namespace ghostlock::kernel {
     inline constexpr unsigned long long INIT_TASK_OFF = 0x0211e280ULL;
     inline constexpr unsigned long long INIT_CRED_OFF = 0x02130748ULL;
     inline constexpr unsigned long long ROOT_TASK_GROUP_OFF = 0x02317580ULL;
-    inline constexpr unsigned long long SELINUX_ENFORCING_OFF = 0x02358ee0ULL;
+    inline constexpr unsigned long long SELINUX_ENFORCING_OFF = 0x02A42B98ULL;
     inline constexpr unsigned long long SELINUX_BLOB_SIZES_OFF = 0x0167b5d0ULL;
     inline constexpr unsigned long long SECURITY_HOOK_HEADS_OFF = 0x00000000ULL;
 
