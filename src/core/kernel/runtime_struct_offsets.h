@@ -26,78 +26,76 @@ namespace ghostlock::profile {
     }
 
     inline uintptr_t init_task() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.init_task; },
             ghostlock::kernel::INIT_TASK_OFF);
     }
 
     inline uintptr_t init_cred() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.init_cred; },
             ghostlock::kernel::INIT_CRED_OFF);
     }
 
     inline uintptr_t empty_zero_page() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.empty_zero_page; }, 0);
     }
 
     inline uintptr_t root_task_group() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.root_task_group; },
             ghostlock::kernel::ROOT_TASK_GROUP_OFF);
     }
 
     inline uintptr_t selinux_enforcing() {
-        return symbol_image(
-            [](const kernel_offsets &v) { return v.offsets.selinux_enforcing; },
-            ghostlock::kernel::SELINUX_ENFORCING_OFF);
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL;
     }
 
     inline uintptr_t selinux_blob_sizes() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.selinux_blob_sizes; },
             ghostlock::kernel::SELINUX_BLOB_SIZES_OFF);
     }
 
     inline uintptr_t security_hook_heads() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.security_hook_heads; },
             ghostlock::kernel::SECURITY_HOOK_HEADS_OFF);
     }
 
     inline uintptr_t slide_nfulnl_logger_image() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.slide_nfulnl_logger; },
             ghostlock::kernel::SLIDE_NFULNL_LOGGER_OFF);
     }
 
     inline uintptr_t slide_loggers_0_1_image() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.slide_loggers_0_1; },
             ghostlock::kernel::SLIDE_LOGGERS_0_1_OFF);
     }
 
     inline uintptr_t slide_random_boot_id_data_image() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.slide_boot_id; },
             ghostlock::kernel::SLIDE_RANDOM_BOOT_ID_DATA_OFF);
     }
 
     inline uintptr_t slide_init_task_image() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.init_task; },
             ghostlock::kernel::INIT_TASK_OFF);
     }
 
     inline uintptr_t slide_root_task_group_image() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.root_task_group; },
             ghostlock::kernel::ROOT_TASK_GROUP_OFF);
     }
 
     inline uintptr_t slide_sysctl_bootid_image() {
-        return symbol_image(
+        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL; //
             [](const kernel_offsets &v) { return v.offsets.slide_boot_id; },
             ghostlock::kernel::SLIDE_SYSCTL_BOOTID_OFF);
     }
