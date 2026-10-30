@@ -1166,6 +1166,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     cpuPairLabels += "${pair[0]},${pair[1]} · ${formatFreq(freq)}"
                 }
             }
+        if (CpuPair(4, 7) !in cpuPairs) {
+            cpuPairs += CpuPair(4, 7)
+            val freq = readMaxFreq(4)
+            cpuPairLabels += "4,7" + if (freq > 0) " · ${formatFreq(freq)}" else ""
+        }
         if (CpuPair(0, 3) !in cpuPairs) {
             cpuPairs += CpuPair(0, 3)
             val freq = readMaxFreq(0)
