@@ -49,7 +49,9 @@ namespace ghostlock::profile {
     }
 
     inline uintptr_t selinux_enforcing() {
-        return ghostlock::kernel::KIMAGE_TEXT_BASE + 0x02A42B98ULL;
+        return symbol_image(
+            [](const kernel_offsets &v) { return v.offsets.selinux_enforcing; },
+            ghostlock::kernel::SELINUX_ENFORCING_OFF);
     }
 
     inline uintptr_t selinux_blob_sizes() {
