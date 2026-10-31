@@ -29,7 +29,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import modifier
+import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalUriHandler
@@ -262,7 +262,7 @@ internal fun AdvancedScreen(
                                 prefs.edit().apply { if (v != null) putLong("custom_route_wait_ms", v) else remove("custom_route_wait_ms") }.apply()
                             },
                             label = "route_wait_ms",
-                            modifier = modifier.fillMaxWidth().padding(bottom = 8.dp),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
                             singleLine = true
                         )
                         
@@ -274,7 +274,7 @@ internal fun AdvancedScreen(
                                 prefs.edit().apply { if (v != null) putLong("custom_enter_delay_us", v) else remove("custom_enter_delay_us") }.apply()
                             },
                             label = "enter_delay_us",
-                            modifier = modifier.fillMaxWidth().padding(bottom = 8.dp),
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
                             singleLine = true
                         )
                         
@@ -286,7 +286,7 @@ internal fun AdvancedScreen(
                                 prefs.edit().apply { if (v != null) putLong("custom_setup_settle_us", v) else remove("custom_setup_settle_us") }.apply()
                             },
                             label = "setup_settle_us",
-                            modifier = modifier.fillMaxWidth(),
+                            modifier = Modifier.fillMaxWidth(),
                             singleLine = true
                         )
                     }
