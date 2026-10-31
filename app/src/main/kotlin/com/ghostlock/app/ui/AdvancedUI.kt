@@ -241,6 +241,7 @@ internal fun AdvancedScreen(
                 var routeWait by remember { mutableStateOf(if (prefs.contains("custom_route_wait_ms")) prefs.getLong("custom_route_wait_ms", 0).toString() else "") }
                 var enterDelay by remember { mutableStateOf(if (prefs.contains("custom_enter_delay_us")) prefs.getLong("custom_enter_delay_us", 0).toString() else "") }
                 var setupSettle by remember { mutableStateOf(if (prefs.contains("custom_setup_settle_us")) prefs.getLong("custom_setup_settle_us", 0).toString() else "") }
+                var collisions by remember { mutableStateOf(if (prefs.contains("custom_collisions")) prefs.getLong("custom_collisions", 0).toString() else "") }
 
                 Card {
                     Column(modifier = Modifier.padding(16.dp)) {
@@ -268,7 +269,7 @@ internal fun AdvancedScreen(
                         
                         TextField(
                             value = enterDelay,
-                            onValueChange = { 
+                            onValueChange = {
                                 enterDelay = it
                                 val v = it.toLongOrNull()
                                 prefs.edit().apply { if (v != null) putLong("custom_enter_delay_us", v) else remove("custom_enter_delay_us") }.apply()
@@ -277,15 +278,27 @@ internal fun AdvancedScreen(
                             modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
                             singleLine = true
                         )
-                        
+
                         TextField(
                             value = setupSettle,
-                            onValueChange = { 
+                            onValueChange = {
                                 setupSettle = it
                                 val v = it.toLongOrNull()
                                 prefs.edit().apply { if (v != null) putLong("custom_setup_settle_us", v) else remove("custom_setup_settle_us") }.apply()
                             },
                             label = "setup_settle_us",
+                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
+                            singleLine = true
+                        )
+
+                        TextField(
+                            value = collisions,
+                            onValueChange = {
+                                collisions = it
+                                val v = it.toLongOrNull()
+                                prefs.edit().apply { if (v != null) putLong("custom_collisions", v) else remove("custom_collisions") }.apply()
+                            },
+                            label = "collisions",
                             modifier = Modifier.fillMaxWidth(),
                             singleLine = true
                         )

@@ -60,6 +60,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefCustomRouteWait = "custom_route_wait_ms"
         const val PrefCustomEnterDelay = "custom_enter_delay_us"
         const val PrefCustomSetupSettle = "custom_setup_settle_us"
+        const val PrefCustomCollisions = "custom_collisions"
 
 
         /* Known ksud entry names across managers (SukiSU hides it under a random name). */
@@ -562,9 +563,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val routeWait = prefs.getLong(PrefCustomRouteWait, -1L)
         val enterDelay = prefs.getLong(PrefCustomEnterDelay, -1L)
         val setupSettle = prefs.getLong(PrefCustomSetupSettle, -1L)
+        val collisions = prefs.getLong(PrefCustomCollisions, -1L)
         val release = System.getProperty("os.version", "").orEmpty()
 
-        if (routeWait == -1L && enterDelay == -1L && setupSettle == -1L) {
+        if (routeWait == -1L && enterDelay == -1L && setupSettle == -1L && collisions == -1L) {
             profileController.replaceOverrides(release, valueMapOf())
             return
         }
@@ -580,6 +582,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (enterDelay != -1L) appendLine("      enter_delay_us = $enterDelay")
             appendLine("    }")
             appendLine("  }")
+            if (collisions != -1L) {
+                appendLine("  kernelsnitch {")
+                appendLine("    collisions = $collisions")
+                appendLine("  }")
+            }
             appendLine("}")
         }
 
@@ -589,11 +596,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
     }
 
-    fun setCustomTuning(routeWait: Long?, enterDelay: Long?, setupSettle: Long?) {
+    fun setCustomTuning(routeWait: Long?, enterDelay: Long?, setupSettle: Long?, collisions: Long?) {
         preferences.edit {
             if (routeWait != null) putLong(PrefCustomRouteWait, routeWait) else remove(PrefCustomRouteWait)
             if (enterDelay != null) putLong(PrefCustomEnterDelay, enterDelay) else remove(PrefCustomEnterDelay)
             if (setupSettle != null) putLong(PrefCustomSetupSettle, setupSettle) else remove(PrefCustomSetupSettle)
+            if (collisions != null) putLong(PrefCustomCollisions, collisions) else remove(PrefCustomCollisions)
         }
         applyCustomTuning()
     }
