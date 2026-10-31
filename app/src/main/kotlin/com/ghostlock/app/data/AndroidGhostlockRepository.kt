@@ -57,6 +57,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefPreferredRootManager = "preferred_root_manager"
         const val PrefCustomKsudPath = "custom_ksud_path"
         const val PrefCustomSoName = "custom_so_name"
+        const val PrefCustomRouteWait = "custom_route_wait_ms"
+        const val PrefCustomEnterDelay = "custom_enter_delay_us"
+        const val PrefCustomSetupSettle = "custom_setup_settle_us"
+
 
         /* Known ksud entry names across managers (SukiSU hides it under a random name). */
         val KnownKsudNames = listOf("libksud.so")
@@ -553,6 +557,47 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
     }
 
+    private fun applyCustomTuning() {
+        val prefs = preferences
+        val routeWait = prefs.getLong(PrefCustomRouteWait, -1L)
+        val enterDelay = prefs.getLong(PrefCustomEnterDelay, -1L)
+        val setupSettle = prefs.getLong(PrefCustomSetupSettle, -1L)
+        val release = System.getProperty("os.version", "").orEmpty()
+
+        if (routeWait == -1L && enterDelay == -1L && setupSettle == -1L) {
+            profileController.replaceOverrides(release, valueMapOf())
+            return
+        }
+
+        val hocon = buildString {
+            appendLine("execution {")
+            appendLine("  race {")
+            if (routeWait != -1L) appendLine("    route_wait_ms = $routeWait")
+            if (setupSettle != -1L) appendLine("    setup_settle_us = $setupSettle")
+            appendLine("  }")
+            appendLine("  routes {")
+            appendLine("    select_stack {")
+            if (enterDelay != -1L) appendLine("      enter_delay_us = $enterDelay")
+            appendLine("    }")
+            appendLine("  }")
+            appendLine("}")
+        }
+
+        val overrides = HoconSupport.parseValue(hocon).asValueMap()
+        if (overrides != null) {
+            profileController.replaceOverrides(release, overrides)
+        }
+    }
+
+    fun setCustomTuning(routeWait: Long?, enterDelay: Long?, setupSettle: Long?) {
+        preferences.edit {
+            if (routeWait != null) putLong(PrefCustomRouteWait, routeWait) else remove(PrefCustomRouteWait)
+            if (enterDelay != null) putLong(PrefCustomEnterDelay, enterDelay) else remove(PrefCustomEnterDelay)
+            if (setupSettle != null) putLong(PrefCustomSetupSettle, setupSettle) else remove(PrefCustomSetupSettle)
+        }
+        applyCustomTuning()
+    }
+
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
         withDebugAttackLog("direct", onLog) { archivedLog, debugDir, writeSidecar ->
             runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, writeSidecar)
@@ -562,6 +607,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return withDebugAttackLog("shizuku", onLog) { archivedLog, debugDir, writeSidecar ->
             archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
+            applyCustomTuning()
             val config = profileController.load(release, pair)
             val profileBlob = profileController.nativeDocument(config)
             archivedLog(
@@ -801,6 +847,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val nativeLog = File(workDir, NativeLogFileName)
             nativeLog.writeText("")
             val release = System.getProperty("os.version", "").orEmpty()
+            applyCustomTuning()
             val config = profileController.load(release, pair)
             onLog(
                 "<k> profile: hasProfile=${config.hasProfile} " +

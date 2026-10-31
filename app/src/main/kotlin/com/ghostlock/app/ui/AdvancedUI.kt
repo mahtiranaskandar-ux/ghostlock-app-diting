@@ -29,7 +29,7 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
+import modifier
 import androidx.compose.ui.draw.rotate
 import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.platform.LocalUriHandler
@@ -232,6 +232,67 @@ internal fun AdvancedScreen(
                     }
                 }
             }
+
+            // --- Custom Tuning Overrides ---
+            item(key = "custom_tuning") {
+                val context = androidx.compose.ui.platform.LocalContext.current
+                val prefs = context.getSharedPreferences("ghostlock_prefs", android.content.Context.MODE_PRIVATE)
+                
+                var routeWait by remember { mutableStateOf(if (prefs.contains("custom_route_wait_ms")) prefs.getLong("custom_route_wait_ms", 0).toString() else "") }
+                var enterDelay by remember { mutableStateOf(if (prefs.contains("custom_enter_delay_us")) prefs.getLong("custom_enter_delay_us", 0).toString() else "") }
+                var setupSettle by remember { mutableStateOf(if (prefs.contains("custom_setup_settle_us")) prefs.getLong("custom_setup_settle_us", 0).toString() else "") }
+
+                Card {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "Custom Tuning (Overrides)",
+                            style = top.yukonga.miuix.kmp.theme.MiuixTheme.textStyles.title3
+                        )
+                        Text(
+                            text = "Leave empty to use the profile default.",
+                            style = top.yukonga.miuix.kmp.theme.MiuixTheme.textStyles.body2,
+                            modifier = Modifier.padding(bottom = 12.dp)
+                        )
+
+                        TextField(
+                            value = routeWait,
+                            onValueChange = { 
+                                routeWait = it
+                                val v = it.toLongOrNull()
+                                prefs.edit().apply { if (v != null) putLong("custom_route_wait_ms", v) else remove("custom_route_wait_ms") }.apply()
+                            },
+                            label = "route_wait_ms",
+                            modifier = modifier.fillMaxWidth().padding(bottom = 8.dp),
+                            singleLine = true
+                        )
+                        
+                        TextField(
+                            value = enterDelay,
+                            onValueChange = { 
+                                enterDelay = it
+                                val v = it.toLongOrNull()
+                                prefs.edit().apply { if (v != null) putLong("custom_enter_delay_us", v) else remove("custom_enter_delay_us") }.apply()
+                            },
+                            label = "enter_delay_us",
+                            modifier = modifier.fillMaxWidth().padding(bottom = 8.dp),
+                            singleLine = true
+                        )
+                        
+                        TextField(
+                            value = setupSettle,
+                            onValueChange = { 
+                                setupSettle = it
+                                val v = it.toLongOrNull()
+                                prefs.edit().apply { if (v != null) putLong("custom_setup_settle_us", v) else remove("custom_setup_settle_us") }.apply()
+                            },
+                            label = "setup_settle_us",
+                            modifier = modifier.fillMaxWidth(),
+                            singleLine = true
+                        )
+                    }
+                }
+            }
+
             item(key = "rootManager") {
                 Card {
                     Column {
