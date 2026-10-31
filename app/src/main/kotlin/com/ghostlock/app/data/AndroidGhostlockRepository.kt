@@ -582,12 +582,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (enterDelay != -1L) appendLine("      enter_delay_us = $enterDelay")
             appendLine("    }")
             appendLine("  }")
-            if (collisions != -1L) {
-                appendLine("  kernelsnitch {")
-                appendLine("    collisions = $collisions")
-                appendLine("  }")
-            }
             appendLine("}")
+            if (collisions != -1L) {
+                appendLine("kernelsnitch {")
+                appendLine("  collisions = $collisions")
+                appendLine("}")
+            }
         }
 
         val overrides = HoconSupport.parseValue(hocon).asValueMap()

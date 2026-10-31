@@ -257,6 +257,7 @@ interface GhostlockActions {
     fun onCloseAbout()
     fun onDebugKernelLogChanged(enabled: Boolean)
     fun onOpenParameters()
+    fun logCustomTuning(message: String)
     fun onCloseParameters()
     fun onOpenLoadConfig()
     fun onCloseLoadConfig()

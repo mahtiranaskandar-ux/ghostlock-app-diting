@@ -237,7 +237,6 @@ internal fun AdvancedScreen(
             item(key = "custom_tuning") {
                 val context = androidx.compose.ui.platform.LocalContext.current
                 val prefs = context.getSharedPreferences("ghostlock_prefs", android.content.Context.MODE_PRIVATE)
-                
                 var routeWait by remember { mutableStateOf(if (prefs.contains("custom_route_wait_ms")) prefs.getLong("custom_route_wait_ms", 0).toString() else "") }
                 var enterDelay by remember { mutableStateOf(if (prefs.contains("custom_enter_delay_us")) prefs.getLong("custom_enter_delay_us", 0).toString() else "") }
                 var setupSettle by remember { mutableStateOf(if (prefs.contains("custom_setup_settle_us")) prefs.getLong("custom_setup_settle_us", 0).toString() else "") }
@@ -255,52 +254,83 @@ internal fun AdvancedScreen(
                             modifier = Modifier.padding(bottom = 12.dp)
                         )
 
-                        TextField(
-                            value = routeWait,
-                            onValueChange = { 
-                                routeWait = it
-                                val v = it.toLongOrNull()
+                        // RouteWait
+                        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            TextField(value = routeWait, onValueChange = { routeWait = it }, label = "route_wait_ms", modifier = Modifier.weight(1f), singleLine = true)
+                            TextButton(onClick = {
+                                val v = routeWait.toLongOrNull()
                                 prefs.edit().apply { if (v != null) putLong("custom_route_wait_ms", v) else remove("custom_route_wait_ms") }.apply()
-                            },
-                            label = "route_wait_ms",
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                            singleLine = true
-                        )
-                        
-                        TextField(
-                            value = enterDelay,
-                            onValueChange = {
-                                enterDelay = it
-                                val v = it.toLongOrNull()
+                                actions.logCustomTuning("route_wait_ms saved: $v")
+                            }, text = "Save")
+                            TextButton(onClick = {
+                                routeWait = ""
+                                prefs.edit().remove("custom_route_wait_ms").apply()
+                                actions.logCustomTuning("route_wait_ms reset to default")
+                            }, text = "X")
+                        }
+
+                        // EnterDelay
+                        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            TextField(value = enterDelay, onValueChange = { enterDelay = it }, label = "enter_delay_us", modifier = Modifier.weight(1f), singleLine = true)
+                            TextButton(onClick = {
+                                val v = enterDelay.toLongOrNull()
                                 prefs.edit().apply { if (v != null) putLong("custom_enter_delay_us", v) else remove("custom_enter_delay_us") }.apply()
-                            },
-                            label = "enter_delay_us",
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                            singleLine = true
-                        )
+                                actions.logCustomTuning("enter_delay_us saved: $v")
+                            }, text = "Save")
+                            TextButton(onClick = {
+                                enterDelay = ""
+                                prefs.edit().remove("custom_enter_delay_us").apply()
+                                actions.logCustomTuning("enter_delay_us reset to default")
+                            }, text = "X")
+                        }
 
-                        TextField(
-                            value = setupSettle,
-                            onValueChange = {
-                                setupSettle = it
-                                val v = it.toLongOrNull()
+                        // SetupSettle
+                        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            TextField(value = setupSettle, onValueChange = { setupSettle = it }, label = "setup_settle_us", modifier = Modifier.weight(1f), singleLine = true)
+                            TextButton(onClick = {
+                                val v = setupSettle.toLongOrNull()
                                 prefs.edit().apply { if (v != null) putLong("custom_setup_settle_us", v) else remove("custom_setup_settle_us") }.apply()
-                            },
-                            label = "setup_settle_us",
-                            modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp),
-                            singleLine = true
-                        )
+                                actions.logCustomTuning("setup_settle_us saved: $v")
+                            }, text = "Save")
+                            TextButton(onClick = {
+                                setupSettle = ""
+                                prefs.edit().remove("custom_setup_settle_us").apply()
+                                actions.logCustomTuning("setup_settle_us reset to default")
+                            }, text = "X")
+                        }
 
-                        TextField(
-                            value = collisions,
-                            onValueChange = {
-                                collisions = it
-                                val v = it.toLongOrNull()
+                        // Collisions
+                        Row(modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp), verticalAlignment = androidx.compose.ui.Alignment.CenterVertically) {
+                            TextField(value = collisions, onValueChange = { collisions = it }, label = "collisions", modifier = Modifier.weight(1f), singleLine = true)
+                            TextButton(onClick = {
+                                val v = collisions.toLongOrNull()
                                 prefs.edit().apply { if (v != null) putLong("custom_collisions", v) else remove("custom_collisions") }.apply()
+                                actions.logCustomTuning("collisions saved: $v")
+                            }, text = "Save")
+                            TextButton(onClick = {
+                                collisions = ""
+                                prefs.edit().remove("custom_collisions").apply()
+                                actions.logCustomTuning("collisions reset to default")
+                            }, text = "X")
+                        }
+
+                        // Reset All
+                        TextButton(
+                            onClick = {
+                                prefs.edit().apply {
+                                    remove("custom_route_wait_ms")
+                                    remove("custom_enter_delay_us")
+                                    remove("custom_setup_settle_us")
+                                    remove("custom_collisions")
+                                }.apply()
+                                routeWait = ""
+                                enterDelay = ""
+                                setupSettle = ""
+                                collisions = ""
+                                actions.logCustomTuning("All custom tunings reset to profile defaults.")
                             },
-                            label = "collisions",
-                            modifier = Modifier.fillMaxWidth(),
-                            singleLine = true
+                            modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                            text = "Reset All to Profile Defaults"
                         )
                     }
                 }

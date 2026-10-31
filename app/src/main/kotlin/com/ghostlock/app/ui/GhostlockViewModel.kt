@@ -1653,6 +1653,10 @@ class GhostlockViewModel(
         }
     }
 
+    fun logCustomTuning(message: String) {
+        appendLog("<k> $message")
+    }
+
     private fun appendLog(line: String) {
         /* The final result lines are Kotlin-side; tag them so they read as <k>. */
         val tagged = if (line.startsWith("result:")) "<k> $line" else line

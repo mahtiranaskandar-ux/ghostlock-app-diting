@@ -221,6 +221,9 @@ private fun GhostlockRoute(
             override fun onDebugKernelLogChanged(enabled: Boolean) =
                 viewModel.onDebugKernelLogChanged(enabled)
 
+            override fun logCustomTuning(message: String) {
+                viewModel.logCustomTuning(message)
+            }
             override fun onOpenParameters() = viewModel.onOpenParameters()
             override fun onCloseParameters() = viewModel.onCloseParameters()
             override fun onOpenLoadConfig() = viewModel.onOpenLoadConfig()
