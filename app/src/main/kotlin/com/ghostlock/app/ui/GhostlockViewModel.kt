@@ -1658,12 +1658,17 @@ class GhostlockViewModel(
     }
 
     fun onTestRouteOnly(routeWait: Long) {
+        if (!beginOperation()) return
         viewModelScope.launch(Dispatchers.IO) {
-            appendLog("<k> Starting Route-Only test with route_wait_ms=$routeWait")
-            val code = repository.testRouteOnly(routeWait) { line ->
-                appendLog(line)
+            try {
+                appendLog("<k> Starting Route-Only test with route_wait_ms=$routeWait")
+                val code = repository.testRouteOnly(routeWait) { line ->
+                    appendLog(line)
+                }
+                appendLog("<k> Route-Only test finished with code=$code")
+            } finally {
+                endOperation()
             }
-            appendLog("<k> Route-Only test finished with code=$code")
         }
     }
 
