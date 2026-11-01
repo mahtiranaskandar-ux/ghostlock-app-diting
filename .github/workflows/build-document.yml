@@ -5,7 +5,7 @@ on:
     paths-ignore:
       - "**.md"
     branches:
-      - document
+      - test2
   workflow_dispatch:
 
 concurrency:
