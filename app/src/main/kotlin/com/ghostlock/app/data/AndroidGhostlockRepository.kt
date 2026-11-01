@@ -606,7 +606,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         applyCustomTuning()
     }
 
-        suspend fun testRouteOnly(routeWait: Long, onLog: (String) -> Unit): Int {
+    override suspend fun testRouteOnly(routeWait: Long, onLog: (String) -> Unit): Int {
         val release = System.getProperty("os.version", "").orEmpty()
         
         // Build a temporary HOCON string with the test values

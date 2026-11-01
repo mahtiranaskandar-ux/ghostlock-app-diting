@@ -150,6 +150,7 @@ interface GhostlockRepository {
      */
     suspend fun markInterruptedRunLogs(): Int
 
+    suspend fun testRouteOnly(routeWait: Long, onLog: (String) -> Unit): Int
     suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int
 
     suspend fun runExploitWithShizuku(pair: CpuPair, onLog: (String) -> Unit): Int
