@@ -606,6 +606,39 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         applyCustomTuning()
     }
 
+        suspend fun testRouteOnly(routeWait: Long, onLog: (String) -> Unit): Int {
+        val release = System.getProperty("os.version", "").orEmpty()
+        
+        // Build a temporary HOCON string with the test values
+        val testHocon = buildString {
+            appendLine("execution {")
+            appendLine("  race {")
+            appendLine("    route_wait_ms = $routeWait")
+            appendLine("  }")
+            appendLine("  stages {")
+            appendLine("    w1_attempts = 0")
+            appendLine("    w2_attempts = 0")
+            appendLine("    w3_attempts = 0")
+            appendLine("  }")
+            appendLine("}")
+            appendLine("offset {")
+            appendLine("  selinux_enforcing = 41618016") // Dummy address (init_cred)
+            appendLine("}")
+        }
+        
+        val testOverrides = HoconSupport.parseValue(testHocon).asValueMap()
+        if (testOverrides != null) {
+            profileController.replaceOverrides(release, testOverrides)
+        } else {
+            onLog("<k> Failed to build test overrides")
+            return -1
+        }
+        
+        // Run the exploit (which will now only execute the route)
+        onLog("<k> Starting Route-Only test with route_wait_ms=$routeWait")
+        return runExploitWithShizuku(CpuPair(4, 5), onLog) // Use runExploitWithShizuku or runExploit
+    }
+
     override suspend fun runExploit(pair: CpuPair, onLog: (String) -> Unit): Int =
         withDebugAttackLog("direct", onLog) { archivedLog, debugDir, writeSidecar ->
             runExploitBinary(pair, "libghostlock.so", archivedLog, debugDir, writeSidecar)

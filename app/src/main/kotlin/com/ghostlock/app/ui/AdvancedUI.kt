@@ -267,6 +267,10 @@ internal fun AdvancedScreen(
                                 prefs.edit().remove("custom_route_wait_ms").apply()
                                 actions.logCustomTuning("route_wait_ms reset to default")
                             }, text = "X")
+                            TextButton(onClick = {
+                                val v = routeWait.toLongOrNull() ?: 30L
+                                actions.onTestRouteOnly(v)
+                            }, text = "Test")
                         }
 
                         // EnterDelay

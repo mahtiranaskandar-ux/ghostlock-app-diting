@@ -221,7 +221,10 @@ private fun GhostlockRoute(
             override fun onDebugKernelLogChanged(enabled: Boolean) =
                 viewModel.onDebugKernelLogChanged(enabled)
 
-            override fun logCustomTuning(message: String) {
+            override fun onTestRouteOnly(routeWait: Long) {
+        viewModel.onTestRouteOnly(routeWait)
+    }
+    override fun logCustomTuning(message: String) {
                 viewModel.logCustomTuning(message)
             }
             override fun onOpenParameters() = viewModel.onOpenParameters()

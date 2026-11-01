@@ -1657,6 +1657,16 @@ class GhostlockViewModel(
         appendLog("<k> $message")
     }
 
+    fun onTestRouteOnly(routeWait: Long) {
+        viewModelScope.launch(Dispatchers.IO) {
+            appendLog("<k> Starting Route-Only test with route_wait_ms=$routeWait")
+            val code = repository.testRouteOnly(routeWait) { line ->
+                appendLog(line)
+            }
+            appendLog("<k> Route-Only test finished with code=$code")
+        }
+    }
+
     private fun appendLog(line: String) {
         /* The final result lines are Kotlin-side; tag them so they read as <k>. */
         val tagged = if (line.startsWith("result:")) "<k> $line" else line

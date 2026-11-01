@@ -258,6 +258,7 @@ interface GhostlockActions {
     fun onDebugKernelLogChanged(enabled: Boolean)
     fun onOpenParameters()
     fun logCustomTuning(message: String)
+    fun onTestRouteOnly(routeWait: Long)
     fun onCloseParameters()
     fun onOpenLoadConfig()
     fun onCloseLoadConfig()
