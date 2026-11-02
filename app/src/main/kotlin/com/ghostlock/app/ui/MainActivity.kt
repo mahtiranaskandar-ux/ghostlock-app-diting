@@ -22,11 +22,17 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.ghostlock.app.GhostlockApplication
 import com.ghostlock.app.R
+import com.ghostlock.app.domain.model.VrKoMode
 
 class MainActivity : ComponentActivity() {
     private val viewModel by viewModels<GhostlockViewModel> {
         viewModelFactory {
-            initializer { GhostlockViewModel((application as GhostlockApplication).createRepository()) }
+            initializer {
+                GhostlockViewModel(
+                    (application as GhostlockApplication).createRepository(),
+                    application,
+                )
+            }
         }
     }
 
@@ -36,14 +42,6 @@ class MainActivity : ComponentActivity() {
         pendingDocumentRequest = null
         if (uri != null && request != null) viewModel.onDocumentResult(request, uri.toString())
     }
-    private val documentsPicker =
-        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris: List<Uri> ->
-            val request = pendingDocumentRequest
-            pendingDocumentRequest = null
-            if (uris.isNotEmpty() && request != null) {
-                viewModel.onDocumentsResult(request, uris.map(Uri::toString))
-            }
-        }
 
     /* The run log leaves the device as a zip the user names and places. */
     private val runLogDocumentCreator =
@@ -78,21 +76,9 @@ class MainActivity : ComponentActivity() {
         when (effect) {
             is GhostlockEffect.PickDocument -> {
                 pendingDocumentRequest = effect.request
-                val mimeTypes = when (effect.request) {
-                    DocumentRequest.ImportOffsetsHocon ->
-                        arrayOf("text/plain", "application/octet-stream")
-
-                    DocumentRequest.ImportOffsetsJson ->
-                        arrayOf("application/json", "text/plain", "application/octet-stream")
-
-                    else -> arrayOf("*/*")
-                }
-                when (effect.request) {
-                    DocumentRequest.ImportOffsetsHocon, DocumentRequest.ImportOffsetsJson ->
-                        documentsPicker.launch(mimeTypes)
-
-                    else -> documentPicker.launch(mimeTypes)
-                }
+                /* A profile document may carry any extension/MIME, so the
+                 * picker stays unfiltered; the app validates the entry. */
+                documentPicker.launch(arrayOf("*/*"))
             }
 
             is GhostlockEffect.CreateRunLogDocument ->
@@ -170,13 +156,9 @@ private fun GhostlockRoute(
             override fun onStatusClick() = viewModel.onStatusClick()
             override fun onCloseExecutionSheet() = viewModel.onCloseExecutionSheet()
             override fun onCopyLogs() = viewModel.copyLogs()
-            override fun onImportOffsetsHocon() = viewModel.importOffsetsHocon()
-            override fun onImportOffsetsJson() = viewModel.importOffsetsJson()
-            override fun onDocumentsResult(request: DocumentRequest, uris: List<String>) =
-                viewModel.onDocumentsResult(request, uris)
-
             override fun onParseOta() = viewModel.promptParseUrl()
             override fun onParseImage() = viewModel.parseOffsets()
+            override fun onGenerateProfile() = viewModel.promptParseSource()
             override fun onCpuPairSelected(index: Int) = viewModel.selectCpuPair(index)
             override fun onSafeModeChanged(enabled: Boolean) = viewModel.toggleSafeMode(enabled)
             override fun onForceAttackTestChanged(enabled: Boolean) =
@@ -190,6 +172,12 @@ private fun GhostlockRoute(
 
             override fun onCustomSoNameChanged(name: String?) =
                 viewModel.onCustomSoNameChanged(name)
+
+            override fun onVrKoTagClearChanged(mode: VrKoMode) =
+                viewModel.setVrKoTagClear(mode)
+
+            override fun onVrKoSelinuxBlockChanged(mode: VrKoMode) =
+                viewModel.setVrKoSelinuxBlock(mode)
 
             override fun onShizukuChanged(enabled: Boolean) = viewModel.toggleShizuku(enabled)
             override fun onDialogItemSelected(index: Int) = viewModel.onDialogItemSelected(index)
@@ -211,9 +199,17 @@ private fun GhostlockRoute(
             override fun onRevertProfileEdits() = viewModel.onRevertProfileEdits()
             override fun onOpenAdvanced() = viewModel.onOpenAdvanced()
             override fun onCloseAdvanced() = viewModel.onCloseAdvanced()
+            override fun onOpenVrKo() = viewModel.onOpenVrKo()
+            override fun onCloseVrKo() = viewModel.onCloseVrKo()
+            override fun onOpenMeasurements() = viewModel.onOpenMeasurements()
+            override fun onCloseMeasurements() = viewModel.onCloseMeasurements()
             override fun onShowAbout() = viewModel.onShowAbout()
             override fun onCloseAbout() = viewModel.onCloseAbout()
             override fun onDialogExportLog() = viewModel.onDialogExportLog()
+            override fun onStrideOptionSelected(value: Int) = viewModel.onStrideOptionSelected(value)
+            override fun onStrideUse() = viewModel.onStrideUse()
+            override fun onStrideSkip() = viewModel.onStrideSkip()
+            override fun onStridePickerDismiss() = viewModel.onStridePickerDismiss()
             override fun onExportRunLog() = viewModel.onExportRunLog()
             override fun onRunLogSelected(stamp: String) = viewModel.onRunLogSelected(stamp)
             override fun onRunLogPickerDismiss() = viewModel.onRunLogPickerDismiss()
@@ -225,19 +221,22 @@ private fun GhostlockRoute(
             override fun onCloseParameters() = viewModel.onCloseParameters()
             override fun onOpenLoadConfig() = viewModel.onOpenLoadConfig()
             override fun onCloseLoadConfig() = viewModel.onCloseLoadConfig()
-            override fun onOpenUserProfileDetail(name: String) =
-                viewModel.onOpenUserProfileDetail(name)
+            override fun onSelectProfileFile() = viewModel.onSelectProfileFile()
+            override fun onClearExternalProfile() = viewModel.onClearExternalProfile()
+            override fun onOpenMergePreview() = viewModel.onOpenMergePreview()
+            override fun onCloseMergePreview() = viewModel.onCloseMergePreview()
+            override fun onExportMergedProfile() = viewModel.onExportMergedProfile()
+            override fun onOpenProfileDiff() = viewModel.onOpenProfileDiff()
+            override fun onCloseProfileDiff() = viewModel.onCloseProfileDiff()
+            override fun onRebaseToBundle() = viewModel.onRebaseToBundle()
+            override fun onOpenLegacyCleanup() = viewModel.onOpenLegacyCleanup()
+            override fun onCloseLegacyCleanup() = viewModel.onCloseLegacyCleanup()
+            override fun onLegacyExport(name: String, applyOverride: Boolean) =
+                viewModel.onLegacyExport(name, applyOverride)
 
-            override fun onCloseUserProfileDetail() = viewModel.onCloseUserProfileDetail()
-            override fun onLoadUserProfile(name: String) = viewModel.onLoadUserProfile(name)
-            override fun onUnloadUserProfile() = viewModel.onUnloadUserProfile()
-            override fun onEditUserProfile(name: String) = viewModel.onEditUserProfile(name)
-            override fun onUserProfileRename(name: String) = viewModel.onUserProfileRename(name)
-            override fun onUserProfileExport(name: String) = viewModel.onUserProfileExport(name)
-            override fun onConvertUserProfile(name: String) = viewModel.onConvertUserProfile(name)
-            override fun onUserProfileDelete(name: String) = viewModel.onUserProfileDelete(name)
-            override fun onUserProfileDeleteConfirm() = viewModel.onUserProfileDeleteConfirm()
-            override fun onUserProfileDeleteDismiss() = viewModel.onUserProfileDeleteDismiss()
+            override fun onLegacyCleanupRequest() = viewModel.onLegacyCleanupRequest()
+            override fun onLegacyCleanupConfirm() = viewModel.onLegacyCleanupConfirm()
+            override fun onLegacyCleanupDismiss() = viewModel.onLegacyCleanupDismiss()
             override fun onOpenBuiltinProfiles() = viewModel.onOpenBuiltinProfiles()
             override fun onCloseBuiltinProfiles() = viewModel.onCloseBuiltinProfiles()
             override fun onSelectBuiltinProfile(release: String?) =

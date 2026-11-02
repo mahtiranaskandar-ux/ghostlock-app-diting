@@ -21,7 +21,7 @@ namespace {
      * block. Asserted with the same value in the Kotlin test
      * (profile-core `NativeProfileDigestTest`), which is what makes the two
      * implementations a checked contract rather than two hopeful copies. */
-    constexpr uint64_t kGoldenSchemaDigest = 0xcc8fc4e3d6a4eadfull;
+    constexpr uint64_t kGoldenSchemaDigest = 0xe620f6d4022894a3ull;
 
     void put_u16(std::string &out, uint16_t value) {
         out.push_back(static_cast<char>(value & 0xff));
@@ -109,7 +109,6 @@ int32_t main(void) {
     values.offsets.slide_boot_id = 0x2336600;
     values.misc.compact_waiter = 1;
     values.misc.kernelsnitch_collisions = 4;
-    values.misc.mm_struct_sz = 0x400;
     values.execution.w1_attempts = 15;
     values.execution.race_route_done_timeout_ms = 300000;
     values.execution.handoff_enforce_poll_interval_ms = 100;
@@ -131,12 +130,49 @@ int32_t main(void) {
     assert(parsed.offsets.slide_boot_id == 0x2336600);
     assert(parsed.misc.compact_waiter.value_or(0) == 1);
     assert(parsed.misc.kernelsnitch_collisions.value_or(0) == 4);
-    assert(parsed.misc.mm_struct_sz.value_or(0) == 0x400);
     assert(parsed.execution.w1_attempts == 15);
     assert(parsed.execution.race_route_done_timeout_ms == 300000);
     assert(parsed.execution.handoff_enforce_poll_interval_ms == 100);
     assert(parsed.geometry.mcast_waiter_off.value_or(-1) == 96);
     assert(parsed.geometry.mcast_buffer_size.value_or(0) == 512);
+
+    /* ---- Stage-3 layout keys: optional, additive, presence-sensitive. ---- */
+    {
+        profile::kernel_offsets v = {};
+        v.uname_r = "stage3-layout-test";
+        v.route = profile::kRouteSelectStack;
+        v.credential.usage_size = 8;
+        v.credential.uid_offset = 8;
+        v.credential.security_offset = 128;
+        v.misc.rt_mutex_size = 32;
+        v.waiter.compact = 0;
+        v.waiter.wake_state = 0x40;
+        assert(round_trip(v, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.credential.usage_size.value_or(0) == 8);
+        assert(parsed.credential.uid_offset.value_or(0) == 8);
+        assert(parsed.credential.security_offset.value_or(0) == 128);
+        assert(parsed.misc.rt_mutex_size.value_or(0) == 32);
+        assert(parsed.waiter.compact.value_or(1) == 0);
+        assert(parsed.waiter.wake_state.value_or(0) == 0x40);
+        const profile::TargetProfile p = profile::TargetProfile::from(&parsed);
+        assert(p.cred_usage_size().value_or(0) == 8);
+        assert(p.cred_uid_offset().value_or(0) == 8);
+        assert(p.cred_security_offset().value_or(0) == 128);
+        assert(p.rt_mutex_size().value_or(0) == 32);
+        assert(!p.has_compact_waiter());
+        assert(!p.compact_waiter_has_wake_state());
+    }
+    {
+        profile::kernel_offsets v = {};
+        v.uname_r = "stage3-compact-test";
+        v.route = profile::kRouteSelectStack;
+        v.waiter.compact = 1;
+        v.waiter.wake_state = 0x40;
+        assert(round_trip(v, &parsed, release, sizeof(release)) == 0);
+        const profile::TargetProfile p = profile::TargetProfile::from(&parsed);
+        assert(p.has_compact_waiter());
+        assert(p.compact_waiter_has_wake_state());
+    }
 
     /* ---- Strict values and presence. ---- */
     {
@@ -146,13 +182,11 @@ int32_t main(void) {
         /* A provided 0 is preserved and present (not "unset"). */
         strict.geometry.pselect_waiter_shift = 0;
         strict.misc.kernel_phys_load = 0;
-        strict.misc.mm_struct_sz = 0;
         assert(round_trip(strict, &parsed, release, sizeof(release)) == 0);
         assert(parsed.geometry.pselect_waiter_shift.has_value() &&
                *parsed.geometry.pselect_waiter_shift == 0);
         assert(parsed.misc.kernel_phys_load.has_value() &&
                *parsed.misc.kernel_phys_load == 0);
-        assert(parsed.misc.mm_struct_sz.has_value() && *parsed.misc.mm_struct_sz == 0);
 
         /* The same for the multicast route's own section. */
         profile::kernel_offsets mstrict = {};
@@ -195,6 +229,47 @@ int32_t main(void) {
         assert(!parsed.geometry.select_lock_anchor_bytes.has_value());
         assert(!parsed.geometry.select_lock_anchor_stride.has_value());
 
+        /* The compat carrier's switch and geometry round-trip; absence is what
+         * keeps the 64-bit route on every other profile. */
+        profile::kernel_offsets compat = {};
+        compat.uname_r = "compat";
+        compat.route = ghostlock::profile::kRouteSelectStack;
+        compat.geometry.select_compat_carrier = 1;
+        compat.geometry.select_waiter_home = 0x1b0;
+        compat.geometry.select_select_dst_depth = 0x1e0;
+        assert(round_trip(compat, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_compat_carrier.value_or(0) == 1);
+        assert(parsed.geometry.select_waiter_home.value_or(0) == 0x1b0);
+        assert(parsed.geometry.select_select_dst_depth.value_or(0) == 0x1e0);
+        const profile::TargetProfile compat_profile = profile::TargetProfile::from(&parsed);
+        assert(compat_profile.select_stack_layout().compat_carrier.value_or(0) == 1);
+        assert(compat_profile.select_stack_layout().waiter_home.value_or(0) == 0x1b0);
+        assert(compat_profile.select_stack_layout().select_dst_depth.value_or(0) == 0x1e0);
+
+        profile::kernel_offsets compat_absent = {};
+        compat_absent.uname_r = "compat-absent";
+        compat_absent.route = ghostlock::profile::kRouteSelectStack;
+        assert(round_trip(compat_absent, &parsed, release, sizeof(release)) == 0);
+        assert(!parsed.geometry.select_compat_carrier.has_value());
+        assert(!profile::TargetProfile::from(&parsed).select_stack_layout().compat_carrier.has_value());
+
+        /* The multicast route states the same anchor trio through its own
+         * section; native keeps one shared storage for every route. The values
+         * here are a synthetic transport vector, not a device's approved
+         * anchor -- a real one is per-build profile data. */
+        profile::kernel_offsets mcast_anchored = {};
+        mcast_anchored.uname_r = "mcast-anchored";
+        mcast_anchored.route = ghostlock::profile::kRouteMulticastWaiter;
+        mcast_anchored.geometry.mcast_waiter_off = 48;
+        mcast_anchored.geometry.select_lock_anchor_image = 0x400000;
+        mcast_anchored.geometry.select_lock_anchor_bytes = 0x600;
+        mcast_anchored.geometry.select_lock_anchor_stride = 0x20;
+        assert(round_trip(mcast_anchored, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.mcast_waiter_off.value_or(0) == 48);
+        assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x400000);
+        assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x600);
+        assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
+
         /* An absent optional stays absent after the round trip. */
         profile::kernel_offsets absent = {};
         absent.uname_r = "absent";
@@ -202,7 +277,7 @@ int32_t main(void) {
         absent.geometry.mcast_buffer_size = 264;
         assert(round_trip(absent, &parsed, release, sizeof(release)) == 0);
         assert(!parsed.geometry.mcast_waiter_off.has_value());
-        assert(!parsed.misc.mm_struct_sz.has_value());
+        assert(!parsed.misc.compact_waiter.has_value());
         assert(parsed.geometry.mcast_buffer_size.value_or(0) == 264);
     }
 
@@ -274,6 +349,17 @@ int32_t main(void) {
         assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x1000);
         assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
 
+        /* The compat carrier's three select-section keys decode by wire name. */
+        doc = build_doc(ghostlock::profile::kRouteSelectStack, "compat",
+                        {{"route.select_stack",
+                          {{"compat_carrier", 1},
+                           {"waiter_home", 0x1b0},
+                           {"select_dst_depth", 0x1e0}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_compat_carrier.value_or(0) == 1);
+        assert(parsed.geometry.select_waiter_home.value_or(0) == 0x1b0);
+        assert(parsed.geometry.select_select_dst_depth.value_or(0) == 0x1e0);
+
         /* The sigreturn route's own section: both copy-window offsets are
          * decoded, and the anchor keys are stated through this route's section
          * (a profile never merges another route's section, so an anchored
@@ -295,10 +381,32 @@ int32_t main(void) {
         assert(!parsed.geometry.sig_waiter_off_sve.has_value());
         assert(!parsed.geometry.sig_waiter_off_plain.has_value());
 
+        /* The multicast route's own section carries the anchor trio by wire
+         * name (a profile never merges another route's section). */
+        doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "mcast-anchor",
+                        {{"route.multicast_waiter",
+                          {{"lock_anchor_image", 0x400000},
+                           {"lock_anchor_bytes", 0x600},
+                           {"lock_anchor_stride", 0x20}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(parsed.geometry.select_lock_anchor_image.value_or(0) == 0x400000);
+        assert(parsed.geometry.select_lock_anchor_bytes.value_or(0) == 0x600);
+        assert(parsed.geometry.select_lock_anchor_stride.value_or(0) == 0x20);
+
+        /* The select route's key of the same name is a different section and
+         * must not be picked up by a multicast document. */
+        doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "mcast-foreign",
+                        {{"route.select_stack", {{"lock_anchor_image", 0x400000}}}});
+        assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
+        assert(!parsed.geometry.select_lock_anchor_image.has_value());
+
         /* An empty document body is valid (everything stays default/absent). */
         doc = build_doc(ghostlock::profile::kRouteMulticastWaiter, "empty", {});
         assert(parse_doc(doc, &parsed, release, sizeof(release)) == 0);
         assert(!parsed.geometry.mcast_waiter_off.has_value());
+        assert(!parsed.geometry.select_lock_anchor_image.has_value());
+        assert(!parsed.geometry.select_lock_anchor_bytes.has_value());
+        assert(!parsed.geometry.select_lock_anchor_stride.has_value());
     }
 
     /* ---- White box: truncations and lying counts. ---- */

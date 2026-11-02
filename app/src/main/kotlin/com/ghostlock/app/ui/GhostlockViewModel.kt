@@ -1,23 +1,42 @@
 package com.ghostlock.app.ui
 
+import android.app.Application
 import android.net.Uri
+import android.os.Build
 import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.ghostlock.app.R
+import com.ghostlock.app.data.MeasuredProfileStore
+import com.ghostlock.app.data.OptionDecision
+import com.ghostlock.app.data.OptionPlan
+import com.ghostlock.app.data.OptionSuperset
+import com.ghostlock.app.data.RoutePlans
+import com.ghostlock.app.data.ScratchInAnchor
+import com.ghostlock.app.data.decision
 import com.ghostlock.app.domain.model.CpuPair
+import com.ghostlock.app.domain.model.ExternalProfileInfo
 import com.ghostlock.app.domain.model.KernelSnapshot
+import com.ghostlock.app.domain.model.LegacyProfileState
 import com.ghostlock.app.domain.model.LogTone
-import com.ghostlock.app.domain.model.OffsetImportResult
+import com.ghostlock.app.domain.model.MeasuredKernelInfo
+import com.ghostlock.app.domain.model.MeasurementMergeRow
 import com.ghostlock.app.domain.model.ParseResult
+import com.ghostlock.app.domain.model.PhysImage
+import com.ghostlock.app.domain.model.PhysPromptState
 import com.ghostlock.app.domain.model.ProfileConfig
+import com.ghostlock.app.domain.model.nextPhysImage
+import com.ghostlock.app.domain.model.sourceSuppliesLoad
+import com.ghostlock.app.domain.model.ProfileDiffRow
 import com.ghostlock.app.domain.model.RunLogEntry
 import com.ghostlock.app.domain.model.ProfileFieldNode
+import com.ghostlock.app.domain.model.RouteVerdict
 import com.ghostlock.app.domain.model.ShizukuStatus
+import com.ghostlock.app.domain.model.StrideProbe
+import com.ghostlock.app.domain.model.VrKoMode
 import com.ghostlock.app.domain.repository.GhostlockRepository
 import com.ghostlock.app.domain.repository.ProfileConfigController
 import com.ghostlock.app.domain.usecase.FormatLogUseCase
-import com.ghostlock.app.domain.usecase.ImportOffsetsUseCase
 import com.ghostlock.app.domain.usecase.LoadKernelSnapshotUseCase
 import com.ghostlock.app.domain.usecase.ParseSourceUseCase
 import com.ghostlock.app.domain.usecase.ReadDocumentUseCase
@@ -49,16 +68,26 @@ sealed interface GhostlockEffect {
 
 private const val OverwriteSummaryLimit = 12
 
-enum class DocumentRequest { ImportOffsetsHocon, ImportOffsetsJson, BootImage, XblImage, PayloadImage, UefiImage, VendorBootImage }
+enum class DocumentRequest {
+    SelectProfile, BootImage, XblImage, PayloadImage, UefiImage, VendorBootImage, DtboImage,
+}
 
-/** Options offered by [promptBootAttach], in display order. VENDOR_BOOT is
- * only ever added to that list for MediaTek devices */
-private enum class AttachOption { NONE, XBL, UEFI, XBL_UEFI, VENDOR_BOOT }
+/** The parse pass in flight: the input plus the images attached so far. */
+private data class ParseRequest(
+    val input: String,
+    val xblPath: String? = null,
+    val uefiPath: String? = null,
+    val vendorBootPath: String? = null,
+    val dtboPath: String? = null,
+    val overwrite: Boolean = false,
+    val route: String? = null,
+)
 
-private enum class ParseDialogStage { Mode, Attach }
+private enum class ParseDialogStage { Mode, PhysImage, Route, Plan, Lock, Source }
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
+    private val application: Application,
 ) : ViewModel() {
     private val effectChannel = Channel<GhostlockEffect>(Channel.BUFFERED)
     private val mutableState = MutableStateFlow(GhostlockUiState())
@@ -66,7 +95,6 @@ class GhostlockViewModel(
     private var running = false
     private val loadKernelSnapshot = LoadKernelSnapshotUseCase(repository)
     private val selectCpuPairUseCase = SelectCpuPairUseCase(repository)
-    private val importOffsetsUseCase = ImportOffsetsUseCase(repository)
     private val parseSourceUseCase = ParseSourceUseCase(repository)
     private val readDocumentUseCase = ReadDocumentUseCase(repository)
     private val runExploitUseCase = RunExploitUseCase(repository)
@@ -77,16 +105,48 @@ class GhostlockViewModel(
     val effects = effectChannel.receiveAsFlow()
 
     private var kernelSnapshot: KernelSnapshot? = null
-    private var pendingParseWithXbl = false
-    private var pendingParseWithUefi = false
-    private var pendingParseWithVendorBoot = false
-    private var pendingBootPath: String? = null
-    private var pendingXblPath: String? = null
-    private var pendingUefiPath: String? = null
-    private var pendingVendorBootPath: String? = null
-    private var pendingAttachOptions: List<AttachOption> = emptyList()
+    private var pendingParse: ParseRequest? = null
+    /** The platform's recommended images already offered this session. */
+    private var physVendorBootOffered = false
+    private var physXblOffered = false
+    private var physUefiOffered = false
+    private var physDtboOffered = false
+    /** The phys prompt on screen and the parsed result waiting behind it. */
+    private var pendingPhysImage: PhysImage? = null
+    private var pendingPhysAfter: ParseResult.Parsed? = null
     private var parseDialogStage = ParseDialogStage.Mode
     private var pendingConfirmation: PendingConfirmation? = null
+    /** The pass that reported Ambiguous, re-run with the picked route. */
+    private var pendingRouteParse: ParseRequest? = null
+    private var pendingRouteChoices: List<RouteVerdict> = emptyList()
+    /** The option superset from the ambiguous pass, when the extractor wrote one. */
+    private var pendingRouteOptions: OptionSuperset? = null
+    private var pendingLockParse: ParseResult.Parsed? = null
+    /** The page-free option offer on screen. */
+    private var pendingPlanParse: ParseResult.Parsed? = null
+    private var pendingPlanChoices: List<OptionPlan> = emptyList()
+    private var pendingPlanPageOffered = false
+    private var pendingPlanRoute = ""
+
+    /** The generated document and its stride evidence, held while the picker is up. */
+    private var pendingStrideParse: ParseResult.Parsed? = null
+    private var pendingStrideProbe: StrideProbe? = null
+    /** In-memory generated document; never stored until the user exports it. */
+    private var pendingStrideDocument: String? = null
+    private var pendingStrideName: String? = null
+    private var pendingStrideRelease: String? = null
+
+    /** The document text and behaviour waiting for the user's export destination. */
+    private data class PendingProfileWrite(
+        val text: String,
+        val suggestedName: String,
+        /** Offer to select the written document for the next run. */
+        val selectAfterWrite: Boolean,
+    )
+
+    private var pendingProfileWrite: PendingProfileWrite? = null
+    /** URI of a just-written profile awaiting the "use it?" confirmation. */
+    private var pendingSelectUri: String? = null
 
     /** The layer notice is decided once per process, from the first resolution. */
     private var layerNoticeChecked = false
@@ -101,6 +161,7 @@ class GhostlockViewModel(
             markInterruptedRunLogs()
             applyRecommendedShizuku()
             maybeSuggestShizukuForW3()
+            refreshLegacyState()
         }
     }
 
@@ -271,6 +332,7 @@ class GhostlockViewModel(
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
             applyExecutionConfig(profileController.load(snapshot.kernelRelease, pair), preserveEditing)
+            refreshMergeRows()
         }
     }
 
@@ -286,12 +348,32 @@ class GhostlockViewModel(
                 profileRoute = config.route,
                 profileFallback = config.fallbackTo,
                 activeBuiltinProfile = profileController.activeBuiltinRelease(),
-                activeUserProfile = profileController.activeUserProfile(),
+                externalProfile = profileController.activeExternalProfile(),
+                activeUserProfile = config.layers
+                    ?.takeIf { it.externalApplied }
+                    ?.external,
                 profileLayers = config.layers,
                 customCpuPair = customCpuPairOf(config),
             )
         }
         if (!preserveEditing) maybeRaiseLayerNotice(config)
+    }
+
+    /** Recomputes the facts the home merge would change; cheap, runs on IO. */
+    private suspend fun refreshMergeRows() {
+        val rows = runCatching { repository.measurementMergeDiff() }.getOrDefault(emptyList())
+        mutableState.update { it.copy(mergeRows = rows) }
+    }
+
+    private suspend fun refreshLegacyState() {
+        val legacy = runCatching { repository.legacyState() }.getOrNull() ?: LegacyProfileState()
+        mutableState.update {
+            it.copy(
+                legacyPresent = legacy.present,
+                legacyProfiles = legacy.profiles,
+                legacyOverridePresent = legacy.overridePresent,
+            )
+        }
     }
 
     /**
@@ -359,7 +441,9 @@ class GhostlockViewModel(
         mutableState.update {
             it.copy(
                 advancedScreenVisible = true,
+                vrKoVisible = false,
                 aboutVisible = false,
+                measurementsVisible = false,
                 parametersVisible = false,
                 loadConfigVisible = false,
                 builtinScreenVisible = false,
@@ -382,7 +466,9 @@ class GhostlockViewModel(
         mutableState.update {
             it.copy(
                 advancedScreenVisible = false,
+                vrKoVisible = false,
                 aboutVisible = false,
+                measurementsVisible = false,
                 parametersVisible = false,
                 loadConfigVisible = false,
                 builtinScreenVisible = false,
@@ -390,6 +476,40 @@ class GhostlockViewModel(
                 advancedOverrideVisible = false,
             )
         }
+    }
+
+    /** Opens the vr.ko anti-root countermeasure options screen from the home entry. */
+    fun onOpenVrKo() {
+        mutableState.update {
+            it.copy(
+                vrKoVisible = true,
+                advancedScreenVisible = false,
+                aboutVisible = false,
+                measurementsVisible = false,
+                parametersVisible = false,
+                loadConfigVisible = false,
+                builtinScreenVisible = false,
+                profileOverrideVisible = false,
+                advancedOverrideVisible = false,
+            )
+        }
+    }
+
+    fun onCloseVrKo() {
+        mutableState.update { it.copy(vrKoVisible = false) }
+    }
+
+    /** Opens the read-only measured-facts screen and refreshes its store. */
+    fun onOpenMeasurements() {
+        mutableState.update { it.copy(measurementsVisible = true) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val kernels = runCatching { repository.measurements() }.getOrDefault(emptyList())
+            mutableState.update { it.copy(measuredKernels = kernels) }
+        }
+    }
+
+    fun onCloseMeasurements() {
+        mutableState.update { it.copy(measurementsVisible = false) }
     }
 
     fun onOpenParameters() {
@@ -418,52 +538,33 @@ class GhostlockViewModel(
         }
     }
 
-    /** Opens the configuration-loading screen and refreshes the stored list. */
+    /** Opens the configuration-loading screen (source selection). */
     fun onOpenLoadConfig() {
         mutableState.update {
             it.copy(
                 loadConfigVisible = true,
                 builtinScreenVisible = false,
-                userProfileDetail = null,
                 profileOverrideVisible = false,
                 advancedOverrideVisible = false,
             )
         }
-        viewModelScope.launch(Dispatchers.IO) { refreshUserProfiles() }
+        viewModelScope.launch(Dispatchers.IO) { refreshLegacyState() }
     }
 
     fun onCloseLoadConfig() {
-        mutableState.update {
-            it.copy(loadConfigVisible = false, builtinScreenVisible = false, userProfileDetail = null)
-        }
+        mutableState.update { it.copy(loadConfigVisible = false, builtinScreenVisible = false) }
     }
 
-    fun onOpenUserProfileDetail(name: String) {
-        mutableState.update { it.copy(userProfileDetail = name, builtinScreenVisible = false) }
+    /** Picks an SD-card profile document; selecting it wins over the bundle. */
+    fun onSelectProfileFile() {
+        send(GhostlockEffect.PickDocument(DocumentRequest.SelectProfile))
     }
 
-    fun onCloseUserProfileDetail() {
-        mutableState.update { it.copy(userProfileDetail = null) }
-    }
-
-    /** Loads a stored document into the imported layer. */
-    fun onLoadUserProfile(name: String) = selectUserProfile(name)
-
-    /** Unloads the imported layer, back to built-in plus overrides. */
-    fun onUnloadUserProfile() = selectUserProfile(null)
-
-    /**
-     * Loads the document and opens the shared parameter-override editor, so
-     * "modify" reuses the exact same UI as the parameter overrides.
-     */
-
-    private fun selectUserProfile(name: String?) {
+    private fun selectExternalProfile(uri: String) {
         val snapshot = kernelSnapshot ?: return
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            val config = runCatching {
-                profileController.selectUserProfile(name, snapshot.kernelRelease, pair)
-            }.getOrNull()
+            val config = runCatching { repository.selectExternalProfile(uri) }.getOrNull()
             if (config == null) {
                 send(GhostlockEffect.Toast(R.string.user_profile_load_failed))
                 return@launch
@@ -471,119 +572,149 @@ class GhostlockViewModel(
             applyExecutionConfig(config, preserveEditing = false)
             applyAdvancedConfig(config, preserveEditing = false)
             refreshSnapshot()
-            send(
-                GhostlockEffect.Toast(
-                    if (name != null) R.string.user_profile_loaded
-                    else R.string.user_profile_unloaded,
-                ),
-            )
+            refreshMergeRows()
+            send(GhostlockEffect.Toast(R.string.user_profile_loaded))
         }
     }
 
-    private suspend fun refreshUserProfiles() {
-        val profiles = runCatching { repository.userProfiles() }.getOrDefault(emptyList())
-        mutableState.update { it.copy(userProfiles = profiles) }
-    }
-
-    /** Renames a stored document through the shared text-input dialog. */
-    fun onUserProfileRename(name: String) {
-        mutableState.update {
-            it.copy(
-                userProfileRenameTarget = name,
-                dialogVisible = true,
-                dialogType = DialogType.INPUT,
-                dialogTitleRes = R.string.user_profile_rename,
-                dialogMessageRes = R.string.user_profile_rename_hint,
-                dialogInput = name,
-                dialogConfirmLabelRes = R.string.user_profile_rename_confirm,
-            )
-        }
-    }
-
-    private fun renameUserProfile(name: String, newName: String) {
+    fun onClearExternalProfile() {
         viewModelScope.launch(Dispatchers.IO) {
-            val renamed = runCatching { repository.renameUserProfile(name, newName) }.getOrNull()
-            refreshUserProfiles()
-            if (renamed != null) {
-                mutableState.update { state ->
-                    state.copy(
-                        activeUserProfile = if (state.activeUserProfile == name) {
-                            renamed
-                        } else {
-                            state.activeUserProfile
-                        },
-                        userProfileDetail = if (state.userProfileDetail == name) {
-                            renamed
-                        } else {
-                            state.userProfileDetail
-                        },
-                    )
-                }
+            val config = runCatching { repository.clearExternalProfile() }.getOrNull()
+            if (config == null) {
+                send(GhostlockEffect.Toast(R.string.user_profile_load_failed))
+                return@launch
             }
-            send(
-                GhostlockEffect.Toast(
-                    if (renamed != null) R.string.user_profile_renamed
-                    else R.string.user_profile_rename_failed,
-                ),
-            )
+            applyExecutionConfig(config, preserveEditing = false)
+            applyAdvancedConfig(config, preserveEditing = false)
+            refreshSnapshot()
+            refreshMergeRows()
+            send(GhostlockEffect.Toast(R.string.user_profile_unloaded))
         }
     }
 
-    /** Renders the stored document as HOCON and shares it. */
-    fun onUserProfileExport(name: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            runCatching { repository.exportUserProfile(name) }
-                .onSuccess { uri -> send(GhostlockEffect.Share(uri)) }
-                .onFailure {
-                    android.util.Log.e("GhostLock", "export user profile failed", it)
-                    send(GhostlockEffect.Toast(R.string.export_failed))
-                }
-        }
-    }
+    /* ---- measured-db merge ---- */
 
-    /** Converts a legacy document into a current-layout copy in the store. */
-    fun onConvertUserProfile(name: String) {
+    fun onOpenMergePreview() {
         viewModelScope.launch(Dispatchers.IO) {
-            val converted = runCatching { repository.convertUserProfile(name) }.getOrNull()
-            refreshUserProfiles()
-            send(
-                GhostlockEffect.Toast(
-                    if (converted != null) R.string.user_profile_converted
-                    else R.string.user_profile_convert_failed,
-                ),
-            )
-        }
-    }
-
-    fun onUserProfileDelete(name: String) {
-        mutableState.update { it.copy(userProfileDeleteTarget = name) }
-    }
-
-    fun onUserProfileDeleteConfirm() {
-        val name = state.value.userProfileDeleteTarget ?: return
-        mutableState.update { it.copy(userProfileDeleteTarget = null) }
-        viewModelScope.launch(Dispatchers.IO) {
-            val ok = runCatching { repository.deleteUserProfile(name) }.getOrDefault(false)
-            refreshUserProfiles()
-            if (ok) {
-                mutableState.update { current ->
-                    current.copy(
-                        activeUserProfile = current.activeUserProfile?.takeIf { it != name },
-                        userProfileDetail = current.userProfileDetail?.takeIf { it != name },
-                    )
-                }
-                refreshSnapshot()
+            refreshMergeRows()
+            if (state.value.mergeRows.isEmpty()) {
+                send(GhostlockEffect.Toast(R.string.merge_nothing))
+                return@launch
             }
+            mutableState.update { it.copy(mergePreviewVisible = true) }
+        }
+    }
+
+    fun onCloseMergePreview() {
+        mutableState.update { it.copy(mergePreviewVisible = false) }
+    }
+
+    fun onExportMergedProfile() {
+        val snapshot = kernelSnapshot ?: return
+        val text = repository.mergedProfileDocument()
+        if (text == null) {
+            send(GhostlockEffect.Toast(R.string.export_failed))
+            return
+        }
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                suggestedName = exportDocumentName(snapshot.kernelRelease),
+                selectAfterWrite = true,
+            ),
+        )
+    }
+
+    /* ---- editor diff/rebase ---- */
+
+    fun onOpenProfileDiff() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val rows = runCatching { repository.editSessionDiff() }.getOrDefault(emptyList())
+            mutableState.update { it.copy(profileDiffRows = rows, profileDiffVisible = true) }
+        }
+    }
+
+    fun onCloseProfileDiff() {
+        mutableState.update { it.copy(profileDiffVisible = false) }
+    }
+
+    fun onRebaseToBundle() {
+        val snapshot = kernelSnapshot ?: return
+        viewModelScope.launch(Dispatchers.IO) {
+            val config = runCatching { repository.rebaseEditSession() }.getOrNull()
+            if (config == null) {
+                send(GhostlockEffect.Toast(R.string.execution_save_failed))
+                return@launch
+            }
+            applyExecutionConfig(config, preserveEditing = false)
+            applyAdvancedConfig(config, preserveEditing = false)
+            val rows = runCatching { repository.editSessionDiff() }.getOrDefault(emptyList())
+            mutableState.update {
+                it.copy(
+                    editTargetName = repository.editSessionTarget()
+                        ?: snapshot.kernelRelease,
+                    profileDiffRows = rows,
+                )
+            }
+            send(GhostlockEffect.Toast(R.string.profile_rebased))
+        }
+    }
+
+    /* ---- legacy app-data cleanup ---- */
+
+    fun onOpenLegacyCleanup() {
+        mutableState.update { it.copy(legacyVisible = true) }
+        viewModelScope.launch(Dispatchers.IO) { refreshLegacyState() }
+    }
+
+    fun onCloseLegacyCleanup() {
+        mutableState.update { it.copy(legacyVisible = false, legacyCleanupConfirm = false) }
+    }
+
+    fun onLegacyExport(name: String, applyOverride: Boolean) {
+        val text = repository.legacyProfileDocument(name, applyOverride)
+        if (text == null) {
+            send(GhostlockEffect.Toast(R.string.export_failed))
+            return
+        }
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                /* A distinct name: the same release may already be exported as
+                 * the active profile, and the cleanup export must not replace it. */
+                suggestedName = "${name.substringBeforeLast('.').ifEmpty { "profile" }}" +
+                    "-legacy.conf",
+                selectAfterWrite = false,
+            ),
+        )
+    }
+
+    fun onLegacyCleanupRequest() {
+        mutableState.update { it.copy(legacyCleanupConfirm = true) }
+    }
+
+    fun onLegacyCleanupDismiss() {
+        mutableState.update { it.copy(legacyCleanupConfirm = false) }
+    }
+
+    fun onLegacyCleanupConfirm() {
+        mutableState.update { it.copy(legacyCleanupConfirm = false) }
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = runCatching { repository.finishLegacyCleanup() }.getOrDefault(false)
+            refreshLegacyState()
+            if (ok) mutableState.update { it.copy(legacyVisible = false) }
             send(
                 GhostlockEffect.Toast(
-                    if (ok) R.string.user_profile_deleted else R.string.user_profile_delete_failed,
+                    if (ok) R.string.legacy_cleanup_done else R.string.legacy_cleanup_failed,
                 ),
             )
         }
     }
 
-    fun onUserProfileDeleteDismiss() {
-        mutableState.update { it.copy(userProfileDeleteTarget = null) }
+    /** Queues a document and opens the system destination dialog for it. */
+    private fun requestProfileWrite(write: PendingProfileWrite) {
+        pendingProfileWrite = write
+        send(GhostlockEffect.CreateProfileDocument(write.suggestedName))
     }
 
     fun onShowAbout() {
@@ -641,30 +772,64 @@ class GhostlockViewModel(
         mutableState.update { it.copy(debugKernelLogEnabled = enabled) }
     }
 
-    /** Saves the merged profile through the system document dialog. */
+    /** Exports the active profile through the system document dialog. */
     fun onExportProfile() {
-        val release = kernelSnapshot?.kernelRelease ?: return
-        send(GhostlockEffect.CreateProfileDocument(exportDocumentName(release)))
+        val snapshot = kernelSnapshot ?: return
+        val text = repository.liveProfileDocument()
+        if (text == null) {
+            send(GhostlockEffect.Toast(R.string.export_failed))
+            return
+        }
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                suggestedName = exportDocumentName(snapshot.kernelRelease),
+                selectAfterWrite = false,
+            ),
+        )
     }
 
     fun onExportProfileDocumentPicked(documentUri: String?) {
-        if (documentUri.isNullOrBlank()) return
-        val snapshot = kernelSnapshot ?: return
-        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
+        val write = pendingProfileWrite
+        pendingProfileWrite = null
+        if (write == null) return
+        if (documentUri.isNullOrBlank()) {
+            /* A cancelled export loses the document by design: the editor says
+             * so before opening the picker (measured-db-plan §4). */
+            send(GhostlockEffect.Toast(R.string.export_cancelled))
+            return
+        }
         viewModelScope.launch(Dispatchers.IO) {
-            val ok = profileController.export(snapshot.kernelRelease, pair, documentUri)
-            send(
-                GhostlockEffect.Toast(
-                    if (ok) R.string.override_export_done else R.string.export_failed,
-                ),
-            )
+            val ok = repository.writeProfileDocument(documentUri, write.text)
+            if (!ok) {
+                send(GhostlockEffect.Toast(R.string.export_failed))
+                return@launch
+            }
+            if (!write.selectAfterWrite) {
+                send(GhostlockEffect.Toast(R.string.override_export_done))
+                return@launch
+            }
+            pendingSelectUri = documentUri
+            mutableState.update {
+                it.copy(
+                    dialogVisible = true,
+                    dialogType = DialogType.CONFIRM,
+                    dialogTitleRes = R.string.profile_exported_title,
+                    dialogMessageRes = R.string.profile_use_question,
+                    dialogMessage = "",
+                    dialogConfirmLabelRes = R.string.profile_use_confirm,
+                    dialogDocUrl = null,
+                    dialogExportLog = false,
+                    dialogLayerNotice = null,
+                )
+            }
         }
     }
 
     private fun exportDocumentName(release: String): String =
         "${release.replace(Regex("[^A-Za-z0-9._-]"), "_")}.conf"
 
-    /* ---- editing session: draft edits plus an isolated controller ---- */
+    /* ---- editing session: in-memory, export is the only save ---- */
 
     private fun currentPair(): CpuPair? {
         val snapshot = kernelSnapshot ?: return null
@@ -673,25 +838,8 @@ class GhostlockViewModel(
 
     /** Opens the editor for the profile the attack controller currently loads. */
     fun onOpenProfileOverrides() {
-        openEditSession(profileController.activeUserProfile(), fromDetail = false)
-    }
-
-    /**
-     * Opens the editor for the stored document [name] without loading it into
-     * the attack controller: a private session controller resolves the edits.
-     */
-    fun onEditUserProfile(name: String) {
-        val profile = state.value.userProfiles.firstOrNull { it.name == name }
-        if (profile?.version == 1) {
-            send(GhostlockEffect.Toast(R.string.user_profile_legacy_hint))
-            return
-        }
-        openEditSession(name, fromDetail = true)
-    }
-
-    private fun openEditSession(name: String?, fromDetail: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
-            val config = runCatching { repository.beginEditSession(name) }.getOrNull()
+            val config = runCatching { repository.beginEditSession() }.getOrNull()
             if (config == null) {
                 send(GhostlockEffect.Toast(R.string.user_profile_load_failed))
                 return@launch
@@ -703,9 +851,8 @@ class GhostlockViewModel(
                     builtinScreenVisible = false,
                     advancedOverrideVisible = false,
                     profileOverrideVisible = true,
-                    editTargetName = name,
-                    userProfileDetail = if (fromDetail) it.userProfileDetail else null,
-                    loadConfigVisible = if (fromDetail) it.loadConfigVisible else false,
+                    editTargetName = repository.editSessionTarget(),
+                    loadConfigVisible = false,
                 )
             }
         }
@@ -743,8 +890,8 @@ class GhostlockViewModel(
         session.updateRoute(release, pair, mutableState.value.profileRoute)
         session.updateFallback(release, pair, mutableState.value.profileFallback)
         /* General edits share the execution.* tree paths. The advanced rebuild
-         * replaces the whole override entry, so the drafts must be merged in or
-         * the general edits would be dropped. */
+         * replaces the whole edit map, so the drafts must be merged in or the
+         * general edits would be dropped. */
         val drafts = mutableState.value.profileOverrideEditing +
                 mutableState.value.executionEditing
         val advanced = drafts.mapNotNull { (path, text) ->
@@ -754,84 +901,40 @@ class GhostlockViewModel(
     }
 
     /**
-     * Commits the draft: a loaded profile gets the overrides written back to
-     * the live controller, an unloaded one is stored as a new profile.
+     * Exports the edited session. There is no other save: the document on the
+     * SD card is the profile, and an unexported edit is lost.
      */
-    fun onSaveProfileEdits() {
-        val pair = currentPair() ?: return
-        viewModelScope.launch(Dispatchers.IO) {
-            val config = commitDraftToSession()
-            if (config == null) {
-                send(GhostlockEffect.Toast(R.string.execution_save_failed))
-                return@launch
-            }
-            if (repository.editSessionIsLive()) {
-                val committed = runCatching { repository.commitEditSession() }
-                    .getOrDefault(false)
-                if (!committed) {
-                    send(GhostlockEffect.Toast(R.string.execution_save_failed))
-                    return@launch
-                }
-                val live = runCatching { profileController.load(config.release, pair) }.getOrNull()
-                if (live != null) {
-                    applyExecutionConfig(live, preserveEditing = false)
-                    applyAdvancedConfig(live, preserveEditing = false)
-                }
-                send(GhostlockEffect.Toast(R.string.profile_saved))
-            } else if (repository.editSessionTarget() != null) {
-                /* Editing a stored document that is not loaded: Save updates
-                 * that document in place, Save as creates a copy. */
-                val saved = runCatching { repository.saveEditSessionInPlace() }
-                    .getOrDefault(false)
-                refreshUserProfiles()
-                send(
-                    GhostlockEffect.Toast(
-                        if (saved) R.string.profile_saved else R.string.execution_save_failed,
-                    ),
-                )
-            } else {
-                val name = repository.saveEditSessionAsNew()
-                refreshUserProfiles()
-                send(
-                    GhostlockEffect.Toast(
-                        if (name != null) R.string.profile_saved_as_new
-                        else R.string.execution_save_failed,
-                    ),
-                )
-            }
-        }
-    }
-
-    /** Stores the session result as a new saved profile. */
-    fun onSaveProfileAs() {
+    private fun exportEditSession(selectAfterWrite: Boolean) {
         viewModelScope.launch(Dispatchers.IO) {
             if (commitDraftToSession() == null) {
                 send(GhostlockEffect.Toast(R.string.execution_save_failed))
                 return@launch
             }
-            val name = repository.saveEditSessionAsNew()
-            refreshUserProfiles()
-            send(
-                GhostlockEffect.Toast(
-                    if (name != null) R.string.profile_saved_as_new
-                    else R.string.execution_save_failed,
+            val snapshot = kernelSnapshot ?: return@launch
+            val text = repository.editSessionDocument()
+            if (text == null) {
+                send(GhostlockEffect.Toast(R.string.export_failed))
+                return@launch
+            }
+            val stem = repository.editSessionTarget()
+                ?.substringBeforeLast('.')
+                ?.takeIf { it.isNotEmpty() }
+                ?: snapshot.kernelRelease.replace(Regex("[^A-Za-z0-9._-]"), "_")
+            requestProfileWrite(
+                PendingProfileWrite(
+                    text = text,
+                    suggestedName = "$stem.conf",
+                    selectAfterWrite = selectAfterWrite,
                 ),
             )
         }
     }
 
-    /** Renders the session result as HOCON and shares it. */
-    fun onExportProfileEdits() {
-        viewModelScope.launch(Dispatchers.IO) {
-            if (commitDraftToSession() == null) {
-                send(GhostlockEffect.Toast(R.string.export_failed))
-                return@launch
-            }
-            runCatching { repository.exportEditSession() }
-                .onSuccess { uri -> send(GhostlockEffect.Share(uri)) }
-                .onFailure { send(GhostlockEffect.Toast(R.string.export_failed)) }
-        }
-    }
+    fun onSaveProfileEdits() = exportEditSession(selectAfterWrite = true)
+
+    fun onSaveProfileAs() = exportEditSession(selectAfterWrite = true)
+
+    fun onExportProfileEdits() = exportEditSession(selectAfterWrite = true)
 
     /** Opens the builtin picker; overrides stay keyed to the device kernel. */
     fun onOpenBuiltinProfiles() {
@@ -872,9 +975,8 @@ class GhostlockViewModel(
         val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
             /* The controller keeps a single active source: picking a builtin
-             * unloads whatever user document was loaded before. */
+             * also clears the external selection (last explicit choice wins). */
             val config = runCatching {
-                profileController.selectUserProfile(null, snapshot.kernelRelease, pair)
                 profileController.selectBuiltin(release, snapshot.kernelRelease, pair)
             }.getOrNull()
             if (config == null) {
@@ -884,6 +986,7 @@ class GhostlockViewModel(
             applyExecutionConfig(config, preserveEditing = false)
             applyAdvancedConfig(config, preserveEditing = false)
             refreshSnapshot()
+            refreshMergeRows()
             send(GhostlockEffect.Toast(R.string.load_builtin_done))
         }
     }
@@ -962,7 +1065,8 @@ class GhostlockViewModel(
                 profileRoute = config.route,
                 profileFallback = config.fallbackTo,
                 activeBuiltinProfile = profileController.activeBuiltinRelease(),
-                activeUserProfile = profileController.activeUserProfile(),
+                externalProfile = profileController.activeExternalProfile(),
+                activeUserProfile = config.layers?.takeIf { it.externalApplied }?.external,
                 profileLayers = config.layers,
             )
         }
@@ -1000,6 +1104,16 @@ class GhostlockViewModel(
     fun toggleForceAttackTest(enabled: Boolean) {
         repository.setForceAttackTest(enabled)
         mutableState.update { it.copy(forceAttackTestEnabled = enabled) }
+    }
+
+    fun setVrKoTagClear(mode: VrKoMode) {
+        repository.setVrKoTagClear(mode)
+        mutableState.update { it.copy(vrKoTagClear = mode) }
+    }
+
+    fun setVrKoSelinuxBlock(mode: VrKoMode) {
+        repository.setVrKoSelinuxBlock(mode)
+        mutableState.update { it.copy(vrKoSelinuxBlock = mode) }
     }
 
     fun toggleShizuku(enabled: Boolean) {
@@ -1084,13 +1198,8 @@ class GhostlockViewModel(
         send(GhostlockEffect.Toast(R.string.copied))
     }
 
-    fun importOffsetsHocon() =
-        send(GhostlockEffect.PickDocument(DocumentRequest.ImportOffsetsHocon))
-
-    fun importOffsetsJson() =
-        send(GhostlockEffect.PickDocument(DocumentRequest.ImportOffsetsJson))
-
     fun parseOffsets() {
+        resetParseSession()
         parseDialogStage = ParseDialogStage.Mode
         mutableState.update {
             it.copy(
@@ -1106,27 +1215,40 @@ class GhostlockViewModel(
         }
     }
 
-    /** boot.img was chosen: let the user attach xbl_config / uefi (optional),
-     * or, on a MediaTek device, a vendor_boot.img instead */
-    private fun promptBootAttach() {
-        parseDialogStage = ParseDialogStage.Attach
-        val options = buildList {
-            add(AttachOption.NONE to R.string.parse_attach_none)
-            add(AttachOption.XBL to R.string.parse_attach_xbl)
-            add(AttachOption.UEFI to R.string.parse_attach_uefi)
-            add(AttachOption.XBL_UEFI to R.string.parse_attach_xbl_uefi)
-            if (isMediaTek()) add(AttachOption.VENDOR_BOOT to R.string.parse_attach_vendor_boot)
-        }
-        pendingAttachOptions = options.map { it.first }
+    /**
+     * The home entry: one sheet with the two profile sources. The OTA path
+     * keeps its URL input; the on-device path accepts boot.img, a raw Image,
+     * payload.bin or an OTA zip in one picker (the extractor detects the
+     * format from the bytes).
+     */
+    fun promptParseSource() {
+        resetParseSession()
+        parseDialogStage = ParseDialogStage.Source
         mutableState.update {
             it.copy(
                 dialogVisible = true,
                 dialogType = DialogType.LIST,
-                dialogTitleRes = R.string.parse_boot_attach_title,
+                dialogTitleRes = R.string.parse_source_title,
                 dialogItems = emptyList(),
-                dialogItemResIds = options.map { it.second },
+                dialogItemResIds = listOf(
+                    R.string.action_parse_ota,
+                    R.string.action_parse,
+                ),
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
             )
         }
+    }
+
+    private fun resetParseSession() {
+        pendingParse = null
+        pendingLockParse = null
+        physVendorBootOffered = false
+        physXblOffered = false
+        physUefiOffered = false
+        physDtboOffered = false
+        pendingPhysImage = null
+        pendingPhysAfter = null
     }
 
     fun promptParseUrl() {
@@ -1144,26 +1266,13 @@ class GhostlockViewModel(
 
     fun onDocumentResult(request: DocumentRequest, uri: String) {
         when (request) {
+            DocumentRequest.SelectProfile -> selectExternalProfile(uri)
             DocumentRequest.BootImage -> stageBoot(uri)
             DocumentRequest.XblImage -> stageXbl(uri)
             DocumentRequest.UefiImage -> stageUefi(uri)
             DocumentRequest.VendorBootImage -> stageVendorBoot(uri)
+            DocumentRequest.DtboImage -> stageDtbo(uri)
             DocumentRequest.PayloadImage -> stagePayload(uri)
-            DocumentRequest.ImportOffsetsHocon, DocumentRequest.ImportOffsetsJson -> Unit
-        }
-    }
-
-    /** Multi-picked documents (a profile plus any include dependencies). */
-    fun onDocumentsResult(request: DocumentRequest, uris: List<String>) {
-        when (request) {
-            DocumentRequest.ImportOffsetsHocon, DocumentRequest.ImportOffsetsJson ->
-                importDocuments(uris)
-
-            DocumentRequest.BootImage -> uris.firstOrNull()?.let(::stageBoot)
-            DocumentRequest.XblImage -> uris.firstOrNull()?.let(::stageXbl)
-            DocumentRequest.UefiImage -> uris.firstOrNull()?.let(::stageUefi)
-            DocumentRequest.VendorBootImage -> uris.firstOrNull()?.let(::stageVendorBoot)
-            DocumentRequest.PayloadImage -> uris.firstOrNull()?.let(::stagePayload)
         }
     }
 
@@ -1172,35 +1281,244 @@ class GhostlockViewModel(
         when (parseDialogStage) {
             ParseDialogStage.Mode -> when (index) {
                 0 -> pickPayload()
-                1 -> promptBootAttach()
+                1 -> pickBoot()
             }
 
-            ParseDialogStage.Attach -> when (pendingAttachOptions.getOrNull(index)) {
-                AttachOption.NONE -> pickBoot(withXbl = false, withUefi = false, withVendorBoot = false)
-                AttachOption.XBL -> pickBoot(withXbl = true, withUefi = false, withVendorBoot = false)
-                AttachOption.UEFI -> pickBoot(withXbl = false, withUefi = true, withVendorBoot = false)
-                AttachOption.XBL_UEFI -> pickBoot(withXbl = true, withUefi = true, withVendorBoot = false)
-                AttachOption.VENDOR_BOOT -> pickBoot(withXbl = false, withUefi = false, withVendorBoot = true)
-                null -> Unit
+            ParseDialogStage.Source -> {
+                parseDialogStage = ParseDialogStage.Mode
+                when (index) {
+                    0 -> promptParseUrl()
+                    1 -> parseOffsets()
+                }
+            }
+
+            ParseDialogStage.PhysImage -> {
+                val image = pendingPhysImage
+                if (image == null || index > 1) {
+                    // no-op; keep the dialog state intact
+                } else if (index == 0) {
+                    when (image) {
+                        PhysImage.VENDOR_BOOT -> send(GhostlockEffect.PickDocument(DocumentRequest.VendorBootImage))
+                        PhysImage.XBL -> send(GhostlockEffect.PickDocument(DocumentRequest.XblImage))
+                        PhysImage.UEFI -> send(GhostlockEffect.PickDocument(DocumentRequest.UefiImage))
+                        PhysImage.DTBO -> send(GhostlockEffect.PickDocument(DocumentRequest.DtboImage))
+                    }
+                } else {
+                    val after = pendingPhysAfter
+                    pendingPhysImage = null
+                    if (after != null) {
+                        viewModelScope.launch(Dispatchers.IO) { advancePhys(after) }
+                    } else {
+                        launchParse()
+                    }
+                }
+            }
+
+            ParseDialogStage.Route -> {
+                val parse = pendingRouteParse
+                val route = pendingRouteChoices.getOrNull(index)?.route
+                val options = pendingRouteOptions
+                pendingRouteParse = null
+                pendingRouteChoices = emptyList()
+                pendingRouteOptions = null
+                parseDialogStage = ParseDialogStage.Mode
+                if (parse != null && route != null) {
+                    appendLog("route chosen: $route")
+                    /* Keep the sidecar re-run path; when the superset is
+                     * present the route choice itself needs no second pass. */
+                    pendingParse = parse.copy(route = route)
+                    val synthetic = options?.let { parsedFromOptions(it, route) }
+                    if (synthetic != null) {
+                        viewModelScope.launch(Dispatchers.IO) { advancePhys(synthetic) }
+                    } else {
+                        launchParse()
+                    }
+                }
+            }
+
+            ParseDialogStage.Plan -> {
+                val parse = pendingPlanParse
+                val route = pendingPlanRoute
+                val pageOffered = pendingPlanPageOffered
+                val choices = pendingPlanChoices
+                pendingPlanParse = null
+                pendingPlanChoices = emptyList()
+                pendingPlanPageOffered = false
+                pendingPlanRoute = ""
+                parseDialogStage = ParseDialogStage.Mode
+                val options = parse?.options
+                if (parse == null || options == null) return
+                val plans = options.plansFor(route) ?: return
+                if (pageOffered && index == 0) {
+                    /* Page-based: the lock-source choice still applies when a
+                     * safe anchor exists. */
+                    if (plans.anchorOnly != null && showLockDialog(parse)) return
+                    val cut = options.cut(route, plans.page) ?: return
+                    appendLog("option: page (no page-free)")
+                    viewModelScope.launch { continueParsed(parse, cut) }
+                    return
+                }
+                val plan = choices.getOrNull(index - if (pageOffered) 1 else 0) ?: return
+                val cut = options.cut(route, plan) ?: return
+                appendLog(
+                    "option: " + plan.label + if (plan.conditioned) " (needs review)" else "",
+                )
+                viewModelScope.launch { continueParsed(parse, cut) }
+            }
+
+            ParseDialogStage.Lock -> {
+                val parse = pendingLockParse
+                pendingLockParse = null
+                parseDialogStage = ParseDialogStage.Mode
+                val document = parse?.documentText
+                if (parse != null && document != null) {
+                    if (index == 1) {
+                        appendLog("lock source: anchor")
+                        viewModelScope.launch { continueParsed(parse, document) }
+                    } else {
+                        val page = repository.applyLockSourceToDocument(
+                            document,
+                            keepAnchor = false,
+                        )
+                        if (page == null) {
+                            appendLog("result: could not remove the lock anchor; export cancelled")
+                        } else {
+                            appendLog("lock source: page (lock anchor removed)")
+                            viewModelScope.launch { continueParsed(parse, page) }
+                        }
+                    }
+                }
             }
         }
+    }
+
+    /**
+     * Applies the chosen stride in memory and asks the user where to export the
+     * generated document. Nothing is stored by the app; the export is the save.
+     */
+    private fun finishGeneratedProfile(
+        document: String,
+        name: String?,
+        release: String,
+        stride: Int?,
+    ) {
+        val text = if (stride != null) {
+            repository.applyStrideToDocument(document, release, stride) ?: run {
+                appendLog("stride: could not update the generated document")
+                document
+            }
+        } else {
+            document
+        }
+        if (stride != null) appendLog("stride: kernelsnitch.mm_struct_sz = $stride")
+        val suggested = name?.takeIf { it.endsWith(".conf") }
+            ?: exportDocumentName(release)
+        requestProfileWrite(
+            PendingProfileWrite(
+                text = text,
+                suggestedName = suggested,
+                selectAfterWrite = true,
+            ),
+        )
     }
 
     fun onDialogInputChange(value: String) = mutableState.update { it.copy(dialogInput = value) }
 
     fun onDialogConfirm(value: String) {
         val dialogType = state.value.dialogType
-        val renameTarget = state.value.userProfileRenameTarget
+        val selectUri = pendingSelectUri
+        pendingSelectUri = null
         dismissDialog(clearConfirmation = false)
         when {
-            renameTarget != null -> renameUserProfile(renameTarget, value)
+            selectUri != null -> selectExternalProfile(selectUri)
             dialogType == DialogType.INPUT -> parseUrl(value)
             dialogType == DialogType.CONFIRM -> toggleShizuku(true)
             else -> Unit
         }
     }
 
-    fun onDialogDismiss() = dismissDialog()
+    fun onDialogDismiss() {
+        if (parseDialogStage == ParseDialogStage.Route) {
+            pendingRouteParse = null
+            pendingRouteChoices = emptyList()
+            pendingRouteOptions = null
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: route choice cancelled")
+        }
+        if (parseDialogStage == ParseDialogStage.Plan) {
+            pendingPlanParse = null
+            pendingPlanChoices = emptyList()
+            pendingPlanPageOffered = false
+            pendingPlanRoute = ""
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: option choice cancelled")
+        }
+        if (parseDialogStage == ParseDialogStage.Lock) {
+            pendingLockParse = null
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: lock source choice cancelled")
+        }
+        if (parseDialogStage == ParseDialogStage.Source) {
+            parseDialogStage = ParseDialogStage.Mode
+            appendLog("result: profile source choice cancelled")
+        }
+        pendingSelectUri = null
+        dismissDialog()
+    }
+
+    /* ---- the slab-stride decision sheet ---- */
+
+    fun onStrideOptionSelected(value: Int) {
+        mutableState.update { state ->
+            val picker = state.stridePicker ?: return@update state
+            state.copy(stridePicker = picker.copy(selectedValue = value))
+        }
+    }
+
+    fun onStrideUse() {
+        val value = state.value.stridePicker?.selectedValue ?: return
+        finishStride(value)
+    }
+
+    fun onStrideSkip() = finishStride(null)
+
+    /** Dismissing the sheet means the same as Skip, with the same log line. */
+    fun onStridePickerDismiss() = finishStride(null)
+
+    /**
+     * Applies the chosen stride to the in-memory generated document and asks
+     * where to export it — in the measured-db model the export is the save.
+     */
+    private fun finishStride(value: Int?) {
+        val parse = pendingStrideParse
+        val document = pendingStrideDocument
+        val name = pendingStrideName
+        val release = pendingStrideRelease
+        pendingStrideParse = null
+        pendingStrideProbe = null
+        pendingStrideDocument = null
+        pendingStrideName = null
+        pendingStrideRelease = null
+        mutableState.update { it.copy(stridePicker = null) }
+        if (document == null || release == null) return
+        if (value == null) {
+            appendLog("stride left unset (native default + stride-agnostic scan)")
+        } else {
+            appendLog("stride chosen: $value")
+        }
+        finishGeneratedProfile(document, name, release, value)
+        parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
+    }
+
+    /** The root-measured stride for this kernel, when the measured DB has one. */
+    private suspend fun rootMeasuredStride(release: String): Int? = runCatching {
+        repository.measurements()
+            .firstOrNull { it.release == release }
+            ?.facts
+            ?.firstOrNull { it.key == MeasuredProfileStore.KeyMmStructSz }
+            ?.value
+            ?.toInt()
+    }.getOrNull()
 
     /** "Export log & report" from the failed-run notice: dismiss, then the picker. */
     fun onDialogExportLog() {
@@ -1240,127 +1558,58 @@ class GhostlockViewModel(
                 cpuPairIndex = snapshot.selectedCpuPair,
                 safeModeEnabled = snapshot.safeModeEnabled,
                 forceAttackTestEnabled = snapshot.forceAttackTest,
+                vrKoTagClear = snapshot.vrKoTagClear,
+                vrKoSelinuxBlock = snapshot.vrKoSelinuxBlock,
                 shizukuEnabled = snapshot.shizukuEnabled,
                 shizukuStatus = snapshot.shizukuStatus,
                 profileInvalidPaths = loaded?.invalidPaths ?: emptySet(),
                 executionHasProfile = loaded?.hasProfile ?: false,
                 profileLayers = loaded?.layers,
+                externalProfile = profileController.activeExternalProfile(),
+                activeUserProfile = loaded?.layers?.takeIf { it.externalApplied }?.external,
                 customCpuPair = loaded?.let(::customCpuPairOf),
             )
         }
         /* At start-up, and from the resolution the run button was just judged
          * on — the same one a run uses (§C.12b). */
         loaded?.let(::maybeRaiseLayerNotice)
-    }
-
-    private fun importDocuments(uris: List<String>) {
-        if (uris.isEmpty() || !beginOperation(showLogSheet = false)) return
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val documents = linkedMapOf<String, String>()
-                uris.forEach { uri ->
-                    val name = uri.toUri().lastPathSegment?.let(Uri::decode)
-                        ?: uri.substringAfterLast('/')
-                    documents[name] = readDocumentUseCase(uri)
-                }
-                handleImportResult(importOffsetsUseCase(documents), documents)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                appendLog("import offsets failed: ${error.message}")
-                appendLog("result: import failed")
-                showNotice(R.string.import_result_title, R.string.import_failed)
-            } finally {
-                endOperation()
-            }
-        }
-    }
-
-    private suspend fun handleImportResult(
-        result: OffsetImportResult,
-        documents: Map<String, String>,
-    ) {
-        when (result) {
-            is OffsetImportResult.RequiresOverwrite -> {
-                pendingConfirmation = PendingConfirmation.Import(documents)
-                showOverwriteDialog(result.releases)
-            }
-
-            is OffsetImportResult.Imported -> {
-                refreshSnapshot()
-                refreshUserProfiles()
-                appendLog("profile imported: ${result.releases.joinToString()}")
-                appendLog("result: offsets imported successfully")
-                val deviceRelease = state.value.kernelRelease
-                val matchesDevice = deviceRelease.isEmpty() ||
-                        result.releases.any { it == deviceRelease }
-                showNotice(
-                    R.string.import_result_title,
-                    if (matchesDevice) R.string.import_success else R.string.import_no_match,
-                )
-            }
-
-            OffsetImportResult.AlreadyPresent -> {
-                appendLog("result: offsets already present")
-                showNotice(R.string.import_result_title, R.string.offsets_already_exist)
-            }
-
-            is OffsetImportResult.MissingIncludes -> {
-                appendLog("import offsets missing includes: ${result.files.joinToString()}")
-                appendLog("result: import failed")
-                showNotice(R.string.import_result_title, R.string.import_missing_includes)
-            }
-
-            is OffsetImportResult.Failed -> {
-                appendLog("import offsets failed: ${result.reason}")
-                appendLog("result: import failed")
-                showNotice(R.string.import_result_title, R.string.import_failed)
-            }
-        }
+        refreshMergeRows()
     }
 
     private fun pickPayload() {
-        pendingParseWithXbl = false
-        pendingParseWithUefi = false
         send(GhostlockEffect.Toast(R.string.parse_pick_payload_hint))
         send(GhostlockEffect.PickDocument(DocumentRequest.PayloadImage))
     }
 
-    private fun pickBoot(withXbl: Boolean, withUefi: Boolean, withVendorBoot: Boolean = false) {
-        pendingParseWithXbl = withXbl
-        pendingParseWithUefi = withUefi
-        pendingParseWithVendorBoot = withVendorBoot
-        pendingXblPath = null
-        pendingUefiPath = null
-        pendingVendorBootPath = null
-        if (withXbl) send(GhostlockEffect.Toast(R.string.parse_pick_boot_hint))
+    private fun pickBoot() {
         send(GhostlockEffect.PickDocument(DocumentRequest.BootImage))
+    }
+
+    /** The input image is staged; ask for the platform's recommended image
+     * before the first pass. */
+    private fun beginParseInput(input: String) {
+        pendingParse = ParseRequest(input)
+        val first = when {
+            isMediaTek() -> PhysImage.VENDOR_BOOT
+            isQualcomm() -> PhysImage.XBL
+            else -> null
+        }
+        if (first == null) launchParse() else showPhysPrompt(first, after = null)
+    }
+
+    private fun launchParse() {
+        val request = pendingParse ?: return
+        pendingPhysImage = null
+        pendingPhysAfter = null
+        viewModelScope.launch(Dispatchers.IO) { runParse(request) }
     }
 
     private fun stageBoot(uri: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val bootPath = readDocumentUseCase.cache(uri, "boot.img")
-                pendingBootPath = bootPath
                 appendLog("boot.img ready: $bootPath")
-                when {
-                    pendingParseWithXbl -> {
-                        send(GhostlockEffect.Toast(R.string.parse_pick_xbl_hint))
-                        send(GhostlockEffect.PickDocument(DocumentRequest.XblImage))
-                    }
-
-                    pendingParseWithUefi -> {
-                        send(GhostlockEffect.Toast(R.string.parse_pick_uefi_hint))
-                        send(GhostlockEffect.PickDocument(DocumentRequest.UefiImage))
-                    }
-
-                    pendingParseWithVendorBoot -> {
-                        send(GhostlockEffect.Toast(R.string.parse_pick_vendor_boot_hint))
-                        send(GhostlockEffect.PickDocument(DocumentRequest.VendorBootImage))
-                    }
-
-                    else -> runParse(bootPath)
-                }
+                beginParseInput(bootPath)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1371,19 +1620,18 @@ class GhostlockViewModel(
         }
     }
 
-    private fun stageXbl(uri: String) {
+    /** Caches one recommended image and re-runs the pass with it attached. */
+    private fun stageSidecar(
+        uri: String,
+        name: String,
+        update: (ParseRequest, String) -> ParseRequest,
+    ) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val bootPath = requireNotNull(pendingBootPath) { "boot.img is not staged" }
-                val xblPath = readDocumentUseCase.cache(uri, "xbl_config.img")
-                pendingXblPath = xblPath
-                appendLog("xbl_config.img ready: $xblPath")
-                if (pendingParseWithUefi) {
-                    send(GhostlockEffect.Toast(R.string.parse_pick_uefi_hint))
-                    send(GhostlockEffect.PickDocument(DocumentRequest.UefiImage))
-                } else {
-                    runParse(bootPath, xblPath = xblPath)
-                }
+                val path = readDocumentUseCase.cache(uri, name)
+                appendLog("$name ready: $path")
+                pendingParse = pendingParse?.let { update(it, path) }
+                launchParse()
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1394,50 +1642,24 @@ class GhostlockViewModel(
         }
     }
 
-    private fun stageUefi(uri: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val bootPath = requireNotNull(pendingBootPath) { "boot.img is not staged" }
-                val uefiPath = readDocumentUseCase.cache(uri, "uefi.img")
-                pendingUefiPath = uefiPath
-                appendLog("uefi.img ready: $uefiPath")
-                runParse(bootPath, xblPath = pendingXblPath, uefiPath = uefiPath)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                appendLog("parse error: ${error.message}")
-                appendLog("result: parse failed")
-                showNotice(R.string.parse_result_title, R.string.parse_failed)
-            }
-        }
-    }
+    private fun stageXbl(uri: String) =
+        stageSidecar(uri, "xbl_config.img") { request, path -> request.copy(xblPath = path) }
 
-    /** vendor_boot.img was chosen (MediaTek only): parses boot.img + this
-     * directly, no xbl_config/uefi/root needed. */
-    private fun stageVendorBoot(uri: String) {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val bootPath = requireNotNull(pendingBootPath) { "boot.img is not staged" }
-                val vendorBootPath = readDocumentUseCase.cache(uri, "vendor_boot.img")
-                pendingVendorBootPath = vendorBootPath
-                appendLog("vendor_boot.img ready: $vendorBootPath")
-                runParse(bootPath, vendorBootPath = vendorBootPath)
-            } catch (error: CancellationException) {
-                throw error
-            } catch (error: Exception) {
-                appendLog("parse error: ${error.message}")
-                appendLog("result: parse failed")
-                showNotice(R.string.parse_result_title, R.string.parse_failed)
-            }
-        }
-    }
+    private fun stageUefi(uri: String) =
+        stageSidecar(uri, "uefi.img") { request, path -> request.copy(uefiPath = path) }
+
+    private fun stageVendorBoot(uri: String) =
+        stageSidecar(uri, "vendor_boot.img") { request, path -> request.copy(vendorBootPath = path) }
+
+    private fun stageDtbo(uri: String) =
+        stageSidecar(uri, "dtbo.img") { request, path -> request.copy(dtboPath = path) }
 
     private fun stagePayload(uri: String) {
         viewModelScope.launch(Dispatchers.IO) {
             try {
                 val payloadPath = readDocumentUseCase.cache(uri, "payload.bin")
                 appendLog("payload.bin ready: $payloadPath")
-                runParse(payloadPath)
+                beginParseInput(payloadPath)
             } catch (error: CancellationException) {
                 throw error
             } catch (error: Exception) {
@@ -1457,7 +1679,11 @@ class GhostlockViewModel(
             return
         }
         appendLog("parse OTA: $url")
-        viewModelScope.launch(Dispatchers.IO) { runParse(url) }
+        pendingParse = ParseRequest(url)
+        /* A remote payload's xbl_config is auto-extracted; a MediaTek payload's
+         * vendor_boot is not, so the follow-up asks for it. */
+        physXblOffered = isQualcomm()
+        launchParse()
     }
 
     /** Confirm/notice popup for an extractor outcome; unlike a Toast it waits
@@ -1475,66 +1701,95 @@ class GhostlockViewModel(
         }
     }
 
+    /** The sidecar warning deferred while the stride picker was up. */
+    private fun showMissingSidecarNotice(result: ParseResult.Parsed) {
+        val mediaTek = isMediaTek()
+        showNotice(
+            titleRes = R.string.parse_result_title,
+            messageRes = if (mediaTek) {
+                R.string.parse_missing_phys_mediatek
+            } else {
+                R.string.parse_missing_phys_hint
+            },
+            docUrl = if (mediaTek) mediatekDocUrl() else null,
+        )
+    }
+
     private fun isMediaTek(): Boolean {
         val soc = kernelSnapshot?.socName?.lowercase(Locale.ROOT).orEmpty()
         return soc.contains("mediatek") || soc.contains("mtk") ||
                 soc.contains("dimensity") || soc.contains("helio")
     }
 
+    private fun isQualcomm(): Boolean {
+        val soc = kernelSnapshot?.socName?.lowercase(Locale.ROOT).orEmpty()
+        return soc.contains("qualcomm") || soc.contains("qti") || soc.contains("snapdragon")
+    }
+
     private fun mediatekDocUrl(): String =
         "https://github.com/YuKongA/ghostlock-app/blob/main/docs/kernel_profiles/" +
                 if (Locale.getDefault().language == "zh") "MEDIATEK_ZH.md" else "MEDIATEK.md"
 
-    private suspend fun runParse(
-        input: String,
-        xblPath: String? = null,
-        uefiPath: String? = null,
-        vendorBootPath: String? = null,
-        overwrite: Boolean = false,
-    ) {
+    private suspend fun runParse(request: ParseRequest) {
         if (!beginOperation()) return
         try {
             when (
                 val result = parseSourceUseCase(
-                    input, xblPath, uefiPath, vendorBootPath, overwrite, ::appendLog,
+                    request.input, request.xblPath, request.uefiPath,
+                    request.vendorBootPath, request.dtboPath,
+                    request.overwrite, request.route, ::appendLog,
                 )
             ) {
                 is ParseResult.RequiresOverwrite -> {
-                    pendingConfirmation =
-                        PendingConfirmation.Parse(input, xblPath, uefiPath, vendorBootPath)
+                    pendingConfirmation = PendingConfirmation.Parse(request)
                     showOverwriteDialog(result.releases)
                 }
 
-                is ParseResult.Parsed -> {
-                    refreshSnapshot()
-                    refreshUserProfiles()
-                    appendLog("offsets exported: ${result.releases.joinToString()}")
-                    appendLog("result: offsets parsed successfully")
-                    /* Auto-load the just-saved document so the parsed profile
-                     * takes effect without a manual trip to the profile list. */
-                    if (result.documentName != null) {
-                        appendLog("auto-loading parsed profile: ${result.documentName}")
-                        selectUserProfile(result.documentName)
-                    }
-                    if (result.missing.isNotEmpty()) {
-                        appendLog(
-                            "warning: missing ${result.missing.joinToString()}; " +
-                                    "run the MediaTek extractor or attach xbl_config.img / uefi.img",
-                        )
-                        val mediaTek = isMediaTek()
-                        showNotice(
-                            titleRes = R.string.parse_result_title,
-                            messageRes = if (mediaTek) {
-                                R.string.parse_missing_phys_mediatek
-                            } else {
-                                R.string.parse_missing_phys_hint
-                            },
-                            docUrl = if (mediaTek) mediatekDocUrl() else null,
-                        )
-                    } else if (result.documentName == null) {
-                        showNotice(R.string.parse_result_title, R.string.parse_success)
+                is ParseResult.Ambiguous -> {
+                    val feasible = result.routes.filter { it.verdict == "feasible" }
+                    appendLog(
+                        "result: ${feasible.size} feasible routes: " +
+                            feasible.joinToString(", ") { it.route },
+                    )
+                    if (feasible.isEmpty()) {
+                        appendLog("result: route ambiguity without a usable route")
+                        showNotice(R.string.parse_result_title, R.string.parse_failed)
+                    } else {
+                        /* The choice is the user's: every feasible route is
+                         * derived from the image, and which one runs is a
+                         * device fact. The second pass forces the pick with
+                         * --route. The picker labels the waiter shape and the
+                         * ABI inline and shows the measured grade. */
+                        pendingRouteParse = request
+                        pendingRouteChoices = feasible
+                        pendingRouteOptions = result.options
+                        parseDialogStage = ParseDialogStage.Route
+                        val routeOptions = result.options
+                        mutableState.update {
+                            it.copy(
+                                dialogVisible = true,
+                                dialogType = DialogType.LIST,
+                                dialogTitleRes = R.string.parse_route_title,
+                                dialogItems = feasible.map { choice ->
+                                    val geometry = routeOptions?.route(choice.route)?.geometry.orEmpty()
+                                    "${RouteDisplay.label(choice.route, geometry, routeOptions?.release)} — ${choice.reason}"
+                                },
+                                dialogItemResIds = emptyList(),
+                                dialogItemGrades = feasible.map { choice ->
+                                    RouteDisplay.grade(choice.route)
+                                },
+                                dialogLeadingResId = null,
+                                dialogCurrentItemIndex = -1,
+                                /* The picker must be the only overlay on
+                                 * screen; a log sheet behind it would swallow
+                                 * its taps (same rule as the overwrite dialog). */
+                                executionSheetVisible = false,
+                            )
+                        }
                     }
                 }
+
+                is ParseResult.Parsed -> advancePhys(result)
 
                 ParseResult.AlreadyPresent -> {
                     appendLog("result: offsets already present")
@@ -1549,6 +1804,307 @@ class GhostlockViewModel(
             }
         } finally {
             endOperation()
+        }
+    }
+
+    /**
+     * The platform's image advice: ask for the next recommended image while
+     * one can still fill the physical pair, otherwise finish the pass.
+     */
+    private suspend fun advancePhys(result: ParseResult.Parsed) {
+        val next = nextPhysImage(physState(result))
+        if (next != null) {
+            showPhysPrompt(next, after = result)
+            return
+        }
+        if (isMediaTek() && !result.physOffsetPresent) {
+            appendLog(
+                "warning: kernel_phys_offset is still missing; attach a vendor_boot/dtbo " +
+                    "with /memory or fill it manually",
+            )
+        }
+        if (isQualcomm() && !sourceSuppliesLoad(result.physSource)) {
+            appendLog(
+                "warning: kernel_phys_load was not supplied by xbl_config/uefi; " +
+                    "attach uefi.img or fill it manually",
+            )
+        }
+        finishParsed(result)
+    }
+
+    private fun physState(result: ParseResult.Parsed) = PhysPromptState(
+        mediaTek = isMediaTek(),
+        qualcomm = isQualcomm(),
+        physSource = result.physSource,
+        offsetPresent = result.physOffsetPresent,
+        vendorBootOffered = physVendorBootOffered,
+        xblOffered = physXblOffered,
+        uefiOffered = physUefiOffered,
+        dtboOffered = physDtboOffered,
+    )
+
+    /** One per-platform prompt: attach the recommended image or skip it. */
+    private fun showPhysPrompt(image: PhysImage, after: ParseResult.Parsed?) {
+        pendingPhysImage = image
+        pendingPhysAfter = after
+        when (image) {
+            PhysImage.VENDOR_BOOT -> physVendorBootOffered = true
+            PhysImage.XBL -> physXblOffered = true
+            PhysImage.UEFI -> physUefiOffered = true
+            PhysImage.DTBO -> physDtboOffered = true
+        }
+        val title = when (image) {
+            PhysImage.VENDOR_BOOT -> R.string.parse_phys_vendor_boot_title
+            PhysImage.XBL -> R.string.parse_phys_xbl_title
+            PhysImage.UEFI -> R.string.parse_phys_uefi_title
+            PhysImage.DTBO -> R.string.parse_phys_dtbo_title
+        }
+        val attach = when (image) {
+            PhysImage.VENDOR_BOOT -> R.string.parse_phys_attach_vendor_boot
+            PhysImage.XBL -> R.string.parse_phys_attach_xbl
+            PhysImage.UEFI -> R.string.parse_phys_attach_uefi
+            PhysImage.DTBO -> R.string.parse_phys_attach_dtbo
+        }
+        parseDialogStage = ParseDialogStage.PhysImage
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = title,
+                dialogItems = emptyList(),
+                dialogItemResIds = listOf(attach, R.string.parse_phys_skip),
+                /* The phys prompt is not a route choice: do not inherit the
+                 * route picker's success-rate chips (they would render above
+                 * "attach uefi / skip"). */
+                dialogItemGrades = emptyList(),
+                dialogLeadingResId = null,
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
+        }
+    }
+
+    /** The Parsed branch once the image advice is satisfied. */
+    private suspend fun finishParsed(result: ParseResult.Parsed) {
+        val document = result.documentText
+        if (document == null) {
+            appendLog("result: the extractor produced no document")
+            showNotice(R.string.parse_result_title, R.string.parse_failed)
+            return
+        }
+        refreshSnapshot()
+        refreshLegacyState()
+        result.route?.let { appendLog("route: $it") }
+        result.anchor?.let {
+            appendLog(
+                "anchor: " + it.removePrefix("info: ").removePrefix("warning: "),
+            )
+        }
+        appendLog("profile generated: ${result.releases.joinToString()}")
+        appendLog("result: profile generated; export it to use it")
+        /* Page-free options first, per the operator rule: one safe option is
+         * taken automatically, several are offered without a page row, and
+         * page is offered only when no safe option exists. */
+        val options = result.options
+        val plans = options?.let { superset ->
+            val route = result.route
+                ?: superset.routes.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
+            route?.let { superset.plansFor(it) }
+        }
+        if (options != null && plans != null) {
+            when (val decision = plans.decision()) {
+                is OptionDecision.Auto -> {
+                    val cut = options.cut(plans.route, decision.plan)
+                    if (cut != null) {
+                        appendLog("option: ${decision.plan.label} (auto)")
+                        continueParsed(result, cut)
+                        return
+                    }
+                }
+                is OptionDecision.Offer -> {
+                    showPlanDialog(result, plans, decision)
+                    return
+                }
+                OptionDecision.NoPageFree -> Unit
+            }
+        }
+        /* No page-free option: the lock source remains the user's choice. */
+        if (showLockDialog(result)) return
+        continueParsed(result, document)
+    }
+
+    /** The page/anchor lock-source dialog; false when there is no anchor. */
+    private fun showLockDialog(result: ParseResult.Parsed): Boolean {
+        if (!result.hasAnchor) return false
+        pendingLockParse = result
+        parseDialogStage = ParseDialogStage.Lock
+        val options = result.options
+        val route = result.route
+            ?: options?.routes?.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
+        val anchorOnly = route?.let { options?.plansFor(it)?.anchorOnly }
+        val anchorSafety = anchorOnly?.let {
+            RegionSafety.classify(it.anchorName, it.scratchSource, Build.MANUFACTURER)
+        }
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = R.string.parse_lock_title,
+                dialogItems = emptyList(),
+                dialogItemResIds = listOf(
+                    R.string.parse_lock_page,
+                    R.string.parse_lock_anchor,
+                ),
+                dialogItemGrades = listOf(null, anchorSafety),
+                dialogLeadingResId = null,
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
+        }
+        return true
+    }
+
+    /**
+     * The plan row's user-facing text: both roles are named, because the same
+     * region can supply the lock and W1's value, or only one of them. The
+     * technical [OptionPlan.label] stays in the logs.
+     */
+    private fun planDisplayLabel(plan: OptionPlan): String {
+        val anchor = plan.anchorName ?: return plan.label
+        val scratch = plan.scratchSource?.takeIf { it != ScratchInAnchor }
+        return if (scratch == null) {
+            application.getString(R.string.parse_plan_label_same, anchor)
+        } else {
+            application.getString(R.string.parse_plan_label_pair, anchor, scratch)
+        }
+    }
+
+    /** The page-free option list; the UI adds a page row only when offered. */
+    private fun showPlanDialog(
+        result: ParseResult.Parsed,
+        plans: RoutePlans,
+        decision: OptionDecision.Offer,
+    ) {
+        pendingPlanParse = result
+        pendingPlanChoices = decision.options
+        pendingPlanPageOffered = decision.pageOffered
+        pendingPlanRoute = plans.route
+        parseDialogStage = ParseDialogStage.Plan
+        mutableState.update {
+            it.copy(
+                dialogVisible = true,
+                dialogType = DialogType.LIST,
+                dialogTitleRes = if (decision.pageOffered) {
+                    R.string.parse_plan_title_conditional
+                } else {
+                    R.string.parse_plan_title
+                },
+                dialogItems = decision.options.map(::planDisplayLabel),
+                dialogItemResIds = emptyList(),
+                /* A kernel region's safety is a property of the region, not of
+                 * the plan: the Samsung serial array is the one conditional
+                 * region (see RegionSafety). */
+                dialogItemGrades = decision.options.map { plan ->
+                    RegionSafety.classify(plan.anchorName, plan.scratchSource, Build.MANUFACTURER)
+                },
+                dialogLeadingResId = if (decision.pageOffered) {
+                    R.string.parse_plan_page
+                } else {
+                    null
+                },
+                dialogCurrentItemIndex = -1,
+                executionSheetVisible = false,
+            )
+        }
+    }
+
+    /**
+     * A parse result synthesized from the superset: the route choice is a cut,
+     * not a second extractor run. The sidecar re-run path still applies when a
+     * physical source is missing.
+     */
+    private fun parsedFromOptions(options: OptionSuperset, route: String): ParseResult.Parsed? {
+        val plans = options.plansFor(route) ?: return null
+        val plan = when (val decision = plans.decision()) {
+            is OptionDecision.Auto -> decision.plan
+            else -> plans.safeOptions.firstOrNull() ?: plans.anchorOnly ?: plans.page
+        }
+        val document = options.cut(route, plan) ?: return null
+        return ParseResult.Parsed(
+            releases = listOf(options.release),
+            missing = if (options.physLoad == null) setOf("kernel_phys_load") else emptySet(),
+            documentName = options.release.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".conf",
+            route = route,
+            anchor = plan.anchorName?.let { "info: plan anchor $it" },
+            hasAnchor = plan.anchor != null,
+            physSource = options.physSource,
+            physLoadPresent = options.physLoad != null,
+            physOffsetPresent = options.physOffset != null,
+            documentText = document,
+            options = options,
+        )
+    }
+
+    /**
+     * The stride probe and the export are shared by the no-anchor path and the
+     * post-choice path: [document] is what will be exported (page mode has had
+     * the `lock_anchor_*` triple removed in memory).
+     */
+    private suspend fun continueParsed(result: ParseResult.Parsed, document: String) {
+        /* The live stride probe only makes sense for the running kernel; a
+         * profile generated for another image skips it. */
+        val runningRelease = kernelSnapshot?.kernelRelease
+        val pair = kernelSnapshot?.let { snapshot ->
+            snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
+        }
+        val strideProbe = if (runningRelease != null && pair != null &&
+            runningRelease in result.releases
+        ) {
+            appendLog("stride: probing the mm_struct slab on the running kernel")
+            runCatching {
+                repository.probeStride(runningRelease, document, pair, ::appendLog)
+            }.getOrNull()
+        } else {
+            null
+        }
+        if (strideProbe != null && runningRelease != null) {
+            pendingStrideParse = result
+            pendingStrideProbe = strideProbe
+            pendingStrideDocument = document
+            pendingStrideName = result.documentName
+            pendingStrideRelease = runningRelease
+            val recommendation = recommendStride(
+                strideProbe,
+                confirmedValue = rootMeasuredStride(runningRelease),
+            )
+            appendLog(
+                "stride: ${strideProbe.candidates.size} candidate(s), " +
+                    "gcd=0x${strideProbe.gcd.toString(16)}, " +
+                    "rounds=${strideProbe.rounds}, samples=${strideProbe.samples}",
+            )
+            mutableState.update {
+                it.copy(
+                    stridePicker = StridePickerUiState(
+                        recommendation = recommendation,
+                        selectedValue = recommendation.recommendedValue,
+                        footerRes = R.string.stride_footer_export,
+                    ),
+                    executionSheetVisible = false,
+                )
+            }
+        } else {
+            finishGeneratedProfile(
+                document,
+                result.documentName,
+                runningRelease ?: result.releases.firstOrNull() ?: "profile",
+                null,
+            )
+        }
+        if (result.missing.isNotEmpty()) {
+            appendLog(
+                "warning: missing ${result.missing.joinToString()}; " +
+                    "attach the platform image or fill the fields manually",
+            )
         }
     }
 
@@ -1575,28 +2131,9 @@ class GhostlockViewModel(
         val confirmation = pendingConfirmation ?: return
         pendingConfirmation = null
         when (confirmation) {
-            is PendingConfirmation.Import -> {
-                if (!beginOperation(showLogSheet = false)) return
-                viewModelScope.launch(Dispatchers.IO) {
-                    try {
-                        handleImportResult(
-                            importOffsetsUseCase.overwrite(confirmation.documents),
-                            confirmation.documents,
-                        )
-                    } finally {
-                        endOperation()
-                    }
-                }
-            }
-
-            is PendingConfirmation.Parse -> viewModelScope.launch(Dispatchers.IO) {
-                runParse(
-                    confirmation.input,
-                    confirmation.xblPath,
-                    confirmation.uefiPath,
-                    confirmation.vendorBootPath,
-                    overwrite = true,
-                )
+            is PendingConfirmation.Parse -> {
+                pendingParse = confirmation.request.copy(overwrite = true)
+                launchParse()
             }
         }
     }
@@ -1642,13 +2179,14 @@ class GhostlockViewModel(
                 dialogMessageRes = 0,
                 dialogItems = emptyList(),
                 dialogItemResIds = emptyList(),
+                dialogItemGrades = emptyList(),
+                dialogLeadingResId = null,
                 dialogCurrentItemIndex = -1,
                 dialogExportLog = false,
                 dialogInput = "",
                 dialogConfirmLabelRes = R.string.parse_start,
                 dialogDocUrl = null,
                 dialogLayerNotice = null,
-                userProfileRenameTarget = null,
             )
         }
     }
@@ -1714,12 +2252,6 @@ class GhostlockViewModel(
     }
 
     private sealed interface PendingConfirmation {
-        data class Import(val documents: Map<String, String>) : PendingConfirmation
-        data class Parse(
-            val input: String,
-            val xblPath: String?,
-            val uefiPath: String?,
-            val vendorBootPath: String? = null,
-        ) : PendingConfirmation
+        data class Parse(val request: ParseRequest) : PendingConfirmation
     }
 }

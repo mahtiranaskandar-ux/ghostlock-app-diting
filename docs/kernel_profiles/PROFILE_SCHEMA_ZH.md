@@ -62,7 +62,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4, mm_struct_sz = 4096 }
+kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # 跨度：内置值或测量后写入
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -110,7 +110,7 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 | `kernel_major` ∈ {5,6}、`cred.copy_size`、`cred.caps_count` 及凭据模板边界 | 必填 | 必填 | 必填 |
 | `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | 必填 | | 必填 |
 | `route.select_stack.waiter_shift` | | 必填（0 合法） | |
-| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`kernelsnitch.mm_struct_sz`、`cred.ref_count`（>0） | | | 必填 |
+| `route.multicast_waiter.waiter_off`（>0）、`route.multicast_waiter.buffer_size`、`route.multicast_waiter.task_offset`、`route.multicast_waiter.lock_offset`、`offset.empty_zero_page`、`cred.ref_count`（>0） | | | 必填 |
 
 凭据模板边界（通用）：`cred.usage_offset + 4 ≤ cred.copy_size`；`cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`；`cred.ref_count ≤ 4`；每个 `cred.refN_image` 非零、`cred.refN_offset + 8 ≤ cred.copy_size`。`multicast_waiter` 还要求 `cred_copy_size ≥ 0xa0` 且 `route.multicast_waiter.waiter_off + route.multicast_waiter.lock_offset + 8 ≤ route.multicast_waiter.buffer_size`。
 
@@ -184,7 +184,7 @@ cred
 | `offset.selinux_blob_sizes` / `offset.security_hook_heads` | SELinux/安全钩子相关偏移 |
 | `offset.slide_nfulnl_logger` / `offset.slide_boot_id` / `offset.slide_loggers_0_1` | 地址滑移（KASLR）定位点 |
 | `kernel_phys_load` | 内核物理加载地址（0 时按 SoC 公式回退） |
-| `kernel_phys_offset` | DRAM 基址 / linear-map `PHYS_OFFSET`，用于 image→direct-map 换算（缺省用编译期 `P0_PHYS_OFFSET = 0x80000000`）。DRAM 基址不同的设备需填写（如 MTK `0x40000000`）；无法从 `boot.img` 提取，取自 `/proc/iomem` |
+| `kernel_phys_offset` | DRAM 基址 / linear-map `PHYS_OFFSET`，用于 image→direct-map 换算（缺省用编译期 `P0_PHYS_OFFSET = 0x80000000`）。DRAM 基址不同的设备需填写（如 MTK `0x40000000`）；`boot.img` 不携带该值——联发科设备上提取器从 `vendor_boot.img` 内嵌 DTB 的 `/memory` 节点（或 `--dtbo`）读取，root 设备也可取自 `/proc/iomem` |
 | `recommend_shizuku` | 该内核是否建议走 Shizuku（0/1，所有 profile 必填，默认 0；仅提示不强制）。不在任何编辑器中显示：推荐内核在**每次启动时自动打开**主页“Run via Shizuku”开关，会话内可手动关闭，关闭后本次会话不再要求 Shizuku |
 
 ### 4.4 select_stack / tcp 路由字段
@@ -202,6 +202,8 @@ cred
 | `route.multicast_waiter.waiter_off` | 多播缓冲区中 waiter 的偏移（必须 > 0） |
 | `route.multicast_waiter.buffer_size` | 伪造缓冲区大小 |
 | `route.multicast_waiter.task_offset` / `route.multicast_waiter.lock_offset` | 缓冲区中任务 / 锁字段偏移 |
+| `route.multicast_waiter.lock_anchor_image` | 可选。以镜像相对偏移给出的、内容为零且无人写入的内核区域，用作 walk 的假 `rt_mutex`（替代回收页），使 walk 的 descent 不论该页内容如何都必定在第一次判断退出。缺省 ⇒ 仍用回收页（旧行为）。此时锚点的 `lock` 字取自该区域而非该页。按设备与内核构建选择；填错会导致内核崩溃 |
+| `route.multicast_waiter.lock_anchor_bytes` / `route.multicast_waiter.lock_anchor_stride` | 可选。该区域已验证安全部分的长度，以及其中槽位的步长（槽位数为 `bytes / stride`）。带锚点的路由要求**三项齐全**：没有可继承的默认值，不得把 diting 的网格（4096 / 32）套用到其他内核。native 会拒绝 `bytes` 非零但不是 `stride` 整数倍的几何，或 `stride` 小于假 `rt_mutex` 自身大小的几何。这三项写在本节而不是借用 `route.select_stack`，因为文档从不跨路由合并 |
 | `offset.empty_zero_page` | `empty_zero_page` 偏移 |
 
 ### 4.6 KernelSnitch 参数（`kernelsnitch`）
@@ -211,7 +213,7 @@ cred
 | 字段 | 含义 |
 |---|---|
 | `kernelsnitch.collisions` | 需要的 futex 碰撞数量 |
-| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 大小（未填写时使用内置默认） |
+| `kernelsnitch.mm_struct_sz` | `mm_struct` 的 SLUB 对象跨度。内置配置携带各自内核家族的实测值（5.10：960；5.15/6.1：1024；6.6/6.12：1280，已用 QEMU 确认）；生成的配置只在测量后写入（生成时的选择器或 root 读取 `/proc/slabinfo`），绝不猜测。省略时使用编译默认值 `0x500`。它决定 spray 的每 slab 对象数（`ORDER3_SIZE / stride`），泄漏扫描本身仍与跨度无关。 |
 
 ## 5. execution 调优参数（advisory）
 
@@ -290,7 +292,8 @@ cred
   | `symbols` 对象（`off_*` 键） | `offset.*` 命名空间 |
   | `struct_fields` 对象（`task_*` 键） | `task_struct.*` 命名空间；`rt_mutex_waiter`/`cred_uid`/`seccomp_*` 等字段保留原处，不参与校验与比较 |
   | 顶层 `pselect_waiter_shift` | `route.select_stack.waiter_shift`；tcp 配置则保留为 `fallback.route.select_stack.waiter_shift` |
-  | 顶层 `compact_waiter` / `mm_struct_sz` | `route.tcp_zerocopy.compact_waiter` / `kernelsnitch.mm_struct_sz` |
+  | 顶层 `compact_waiter` | `route.tcp_zerocopy.compact_waiter` |
+  | 顶层 `mm_struct_sz` | `kernelsnitch.mm_struct_sz` |
   | `kimage_text_base` / `btf_size` / `kallsyms` | 丢弃 |
   | 无 `route` 字段 | 按 6.x 几何推断：`compact_waiter` → tcp，否则 select |
   | 无 cred 模板 | 写入内置 6.x 常量（`credential-6x.conf` / `kernelsnitch-6x.conf`）；5.x 凭据字段仍由作者提供 |

@@ -8,13 +8,19 @@ int32_t main(void) {
     profile::kernel_offsets decoded = {
         .route = ghostlock::profile::kRouteMulticastWaiter,
         .meta = {.kernel_major = 5},
-        .misc = {.compact_waiter = 1, .mm_struct_sz = 0x580},
+        .misc = {.compact_waiter = 1},
         .geometry = {
             .pselect_waiter_shift = 16,
             .mcast_waiter_off = 32,
             .mcast_buffer_size = 128,
             .mcast_task_offset = 40,
             .mcast_lock_offset = 48,
+            /* Synthetic vector: the multicast layout reuses the shared anchor
+             * storage, so all three travel even though only this route's
+             * section stated them. */
+            .select_lock_anchor_image = 0x400000,
+            .select_lock_anchor_bytes = 0x600,
+            .select_lock_anchor_stride = 0x20,
         },
         .execution = {
             .recommended_main_cpu = 2,
@@ -38,11 +44,13 @@ int32_t main(void) {
         profile.supports(ghostlock::profile::RouteKind::SelectStack) ||
         multicast.buffer_size.value_or(0) != 128 ||
         multicast.waiter_offset.value_or(0) != 32 ||
+        multicast.lock_anchor_image.value_or(0) != 0x400000 ||
+        multicast.lock_anchor_bytes.value_or(0) != 0x600 ||
+        multicast.lock_anchor_stride.value_or(0) != 0x20 ||
         select.waiter_shift.value_or(0) != 16 ||
         select.compact_waiter.value_or(0) == 0 ||
         tcp.compact_waiter.value_or(0) == 0 ||
-        !execution || execution->heap_prepare_max_attempts != 7 ||
-        profile.mm_struct_stride(0x500) != 0x580) {
+        !execution || execution->heap_prepare_max_attempts != 7) {
         fputs("target profile snapshot/accessor test failed\n", stderr);
         return 1;
     }
@@ -62,17 +70,6 @@ int32_t main(void) {
         unresolved.supports(ghostlock::profile::RouteKind::TcpZerocopy) ||
         unresolved.supports(ghostlock::profile::RouteKind::SelectStack)) {
         fputs("explicit route selection test failed\n", stderr);
-        return 1;
-    }
-
-    /* A zero profile field and an unloaded profile both use the fallback. */
-    decoded.misc.mm_struct_sz = 0;
-    ghostlock::profile::TargetProfile zero_stride = ghostlock::profile::TargetProfile::from(&decoded);
-    ghostlock::profile::TargetProfile unloaded{};
-    if (zero_stride.mm_struct_stride(0x500) != 0x500 ||
-        unloaded.mm_struct_stride(0x500) != 0x500 ||
-        profile::TargetProfile{}.mm_struct_stride(0x500) != 0x500) {
-        fputs("target profile mm_struct stride fallback test failed\n", stderr);
         return 1;
     }
 

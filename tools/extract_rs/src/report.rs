@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 
 use crate::derive::Cred5x;
 use crate::error::{ExtractError, Result};
+use crate::fact::{Fact, Source};
+use crate::layout::LayoutFacts;
 use crate::symbols::{OPTIONAL_SYMBOLS, kernel_layout_verified};
 
 pub fn pselect_waiter_shift_for(release: Option<&str>) -> Option<i64> {
@@ -66,15 +68,13 @@ pub fn build_report(
     if kernel_layout_verified(release)
         && crate::symbols::kernel_struct_macro(release) == Some("STRUCT_OFFSETS_6_1")
     {
-        // 0x400 is the device SLUB stride, not the BTF 0x3c0
         report["compact_waiter"] = json!(1);
-        report["mm_struct_sz"] = json!(0x400);
     }
     report
 }
 
 /// `task_struct` keys in the bundled profiles' order.
-const CONF_TASK_FIELDS: &[(&str, &str)] = &[
+pub(crate) const CONF_TASK_FIELDS: &[(&str, &str)] = &[
     ("task_prio", "prio"),
     ("task_normal_prio", "normal_prio"),
     ("task_sched_task_group", "sched_task_group"),
@@ -95,7 +95,7 @@ const CONF_TASK_FIELDS: &[(&str, &str)] = &[
 /// Full route field universe per branch (authoritative: Kotlin
 /// `RouteConfig.entries()` / native `kSections`). A missing value renders as
 /// `null` so every generated profile carries every field of its route.
-const CONF_ROUTE_FIELDS: &[(&str, &[&str])] = &[
+pub(crate) const CONF_ROUTE_FIELDS: &[(&str, &[&str])] = &[
     ("tcp_zerocopy", &["compact_waiter"]),
     ("select_stack", &["waiter_shift"]),
     ("sigreturn", &["waiter_off_sve", "waiter_off_plain"]),
@@ -112,7 +112,7 @@ const CONF_ROUTE_FIELDS: &[(&str, &[&str])] = &[
 ];
 
 /// Full credential field universe (native `kCred` / `credential-6x.conf`).
-const CONF_CRED_FIELDS: &[&str] = &[
+pub(crate) const CONF_CRED_FIELDS: &[&str] = &[
     "copy_size",
     "usage_offset",
     "usage_value",
@@ -131,7 +131,7 @@ const CONF_CRED_FIELDS: &[&str] = &[
 ];
 
 /// Full offset field universe (native `kOffset`).
-const CONF_OFFSET_FIELDS: &[&str] = &[
+pub(crate) const CONF_OFFSET_FIELDS: &[&str] = &[
     "init_task",
     "init_cred",
     "empty_zero_page",
@@ -151,6 +151,42 @@ fn conf_lookup(entries: &[(String, String)], key: &str) -> String {
         .find(|(candidate, _)| candidate == key)
         .map(|(_, value)| value.clone())
         .unwrap_or_else(|| "null".to_string())
+}
+
+/* Stage 3: emit a layout fact only when a per-image source (BTF) supplied
+ * it. The release template stays in `--explain` as the labelled fallback;
+ * writing it into the profile would turn a heuristic into a shipped value,
+ * and the 6.1 template is already known to be 6.6/6.12-shaped. */
+fn btf_decimal(value: &Fact<String>) -> Option<String> {
+    if value.source != Source::Btf {
+        return None;
+    }
+    let raw = value.value.trim();
+    let parsed = match raw.strip_prefix("0x") {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => raw.parse::<u32>().ok()?,
+    };
+    Some(parsed.to_string())
+}
+
+fn btf_u32(value: &Fact<u32>) -> Option<String> {
+    (value.source == Source::Btf).then(|| value.value.to_string())
+}
+
+fn btf_flag(value: &Fact<bool>) -> Option<String> {
+    (value.source == Source::Btf).then(|| u8::from(value.value).to_string())
+}
+
+/// One `key=value (source/confidence)` entry for the profile's provenance
+/// header. This is the audit trail, not machine state: the app's HOCON parser
+/// ignores comments.
+fn push_fact<T: std::fmt::Display>(out: &mut Vec<String>, key: &str, fact: &Fact<T>) {
+    out.push(format!(
+        "{key}={} ({}/{})",
+        fact.value,
+        fact.source.label(),
+        fact.confidence.label()
+    ));
 }
 
 /// Extra `offset.*` keys the extractor resolves outside the `off_*` symbol
@@ -208,33 +244,65 @@ pub fn conf_route_geometry(
     pselect_shift: Option<i64>,
     structs: &BTreeMap<String, Option<u32>>,
 ) -> Vec<(&'static str, i64)> {
+    conf_route_geometry_with_sigreturn(route, release, pselect_shift, None, structs)
+}
+
+/// The route's branch geometry, with the sigreturn offsets the extractor
+/// derived for this image. `None` falls back to the patch-range constants
+/// (a labelled heuristic in the caller's log).
+pub fn conf_route_geometry_with_sigreturn(
+    route: &str,
+    release: &str,
+    pselect_shift: Option<i64>,
+    sigreturn_offsets: Option<(i64, i64)>,
+    structs: &BTreeMap<String, Option<u32>>,
+) -> Vec<(&'static str, i64)> {
     let major = release
         .split('.')
         .next()
         .and_then(|part| part.parse::<u32>().ok());
-    // The diting 5.10 line has no BTF, so its route geometry cannot be derived
-    // from the pselect layout; the frame-depth rule selects the route and the
-    // family supplies the constants.
-    if crate::family::matches(release) {
+    // The 5.10 codegen constants apply to any 5.10 build; the route decision
+    // itself is made from the image's own geometry (or the family constant only
+    // as the labelled zero-feasible fallback, supplied by the caller).
+    if crate::family::is_5_10(release) {
         match route {
             "select_stack" => {
-                return vec![
-                    ("waiter_shift", crate::family::SELECT_WAITER_SHIFT),
-                    ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
-                ];
+                if let Some(shift) = pselect_shift {
+                    return vec![
+                        ("waiter_shift", shift),
+                        ("compact_waiter", crate::family::SELECT_COMPACT_WAITER),
+                    ];
+                }
             }
             "sigreturn" => {
-                return vec![
-                    ("waiter_off_sve", crate::family::SIGRETURN_OFF_SVE),
-                    ("waiter_off_plain", crate::family::SIGRETURN_OFF_PLAIN),
-                ];
+                if let Some((sve, plain)) = sigreturn_offsets
+                    .or_else(|| crate::family::sigreturn_offsets(release))
+                {
+                    return vec![
+                        ("waiter_off_sve", sve),
+                        ("waiter_off_plain", plain),
+                    ];
+                }
             }
             _ => {}
         }
     }
     match route {
         "select_stack" => pselect_shift
-            .map(|shift| vec![("waiter_shift", shift)])
+            .map(|shift| {
+                let mut geometry = vec![("waiter_shift", shift)];
+                /* The waiter shape is a family property, not optional tuning:
+                 * the compact strip fits the 15-word fd_set table at a positive
+                 * shift, the rb_node shape does not (its last word lands two
+                 * slots further out). A select-only profile generated for a
+                 * compact family without this flag takes the rb_node branch and
+                 * refuses at word 14 -> global 15 (6.1.138, 2026-10-28). The
+                 * 6.6/6.12 families keep the non-compact shape. */
+                if crate::family::is_compact_waiter_family(release) {
+                    geometry.push(("compact_waiter", crate::family::SELECT_COMPACT_WAITER));
+                }
+                geometry
+            })
             .unwrap_or_default(),
         // android14-6.1 is the compact-waiter family; no other family has a
         // measured tcp layout.
@@ -259,7 +327,7 @@ pub fn conf_route_geometry(
 
 /// `offset` keys in the bundled profiles' order; `empty_zero_page` comes from
 /// kallsyms instead of an `off_*` symbol.
-fn conf_offsets(
+pub(crate) fn conf_offsets(
     symbols: &BTreeMap<String, Option<u64>>,
     extra: &ConfExtraOffsets,
 ) -> Vec<(String, String)> {
@@ -309,12 +377,30 @@ pub struct ConfInputs<'a> {
     /// DRAM base (linear-map PHYS_OFFSET); normally supplied by hand, so the
     /// extractor writes an explicit `null` unless one is known.
     pub phys_offset: Option<u64>,
+    /// The physical pair's source: a bootloader sidecar, `--phys`, or `unset`.
+    pub phys_source: &'a str,
     pub symbols: &'a BTreeMap<String, Option<u64>>,
     pub structs: &'a BTreeMap<String, Option<u32>>,
     pub route: Option<&'a str>,
     pub route_geometry: &'a [(&'static str, i64)],
     pub cred: &'a [(String, String)],
     pub extra_offsets: &'a ConfExtraOffsets,
+    /// Stage-2 facts. Only `Source::Btf` values are emitted; `None` keeps the
+    /// pre-stage-3 profile byte-identical.
+    pub layouts: Option<&'a LayoutFacts>,
+    /// Page-free Stage 1 blocks. Absent when their premises did not hold (no
+    /// BTF/template for the selinux layout, or no valid scratch slot).
+    pub stage1: Option<Stage1Conf>,
+}
+
+/// The two page-free Stage 1 profile blocks.
+#[derive(Clone, Copy, Debug)]
+pub struct Stage1Conf {
+    pub selinux_enforcing: u32,
+    pub selinux_initialized: u32,
+    /// "btf" or "release-template", for the fact header.
+    pub selinux_source: &'static str,
+    pub w1_scratch: Option<crate::anchor::W1Scratch>,
 }
 
 /// Renders a flattened, self-contained GLK profile (`--format conf`): no
@@ -334,6 +420,84 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         format!("kernel_major = {}", major.unwrap_or(0)),
         "recommend_shizuku = 0".to_string(),
     ];
+    /* Stage 4: the provenance header. One comment line; no key and no schema
+     * change. The app's HOCON parser ignores comments, so this is an audit
+     * trail, not machine state. */
+    let mut fact_sources = vec![
+        format!(
+            "kernel_phys_load={} ({})",
+            input
+                .phys
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            input.phys_source
+        ),
+        format!(
+            "kernel_phys_offset={} ({})",
+            input
+                .phys_offset
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "null".to_string()),
+            input.phys_source
+        ),
+    ];
+    /* The 5.x credential block is derived from init_cred and sizeof(cred),
+     * not from the 6.x template's prefix fields; the header must describe the
+     * values the body actually emits. The caller picks that block for every
+     * major-5 release, so the release is the discriminator (not a sniff of
+     * the entries, which the 6.x template fills with explicit nulls). */
+    let cred_from_6x_template = major != Some(5);
+    if let Some(layouts) = input.layouts {
+        push_fact(&mut fact_sources, "rt_mutex_size", &layouts.rt_mutex_size);
+        push_fact(&mut fact_sources, "waiter.compact", &layouts.waiter_compact);
+        push_fact(&mut fact_sources, "waiter.pi_tree", &layouts.waiter_pi_tree);
+        push_fact(&mut fact_sources, "waiter.task", &layouts.waiter_task);
+        push_fact(&mut fact_sources, "waiter.lock", &layouts.waiter_lock);
+        push_fact(&mut fact_sources, "waiter.wake_state", &layouts.waiter_wake_state);
+        push_fact(&mut fact_sources, "cred.usage_size", &layouts.cred_usage_size);
+        push_fact(&mut fact_sources, "cred.uid_offset", &layouts.cred_uid_offset);
+        push_fact(&mut fact_sources, "cred.security_offset", &layouts.cred_security_offset);
+        if !cred_from_6x_template && layouts.cred_caps_offset.source == Source::Btf {
+            fact_sources.push(format!(
+                "cred.caps_offset={} (init_cred/derived)",
+                conf_lookup(input.cred, "caps_offset")
+            ));
+            fact_sources.push(format!(
+                "cred.copy_size={} (btf/derived)",
+                conf_lookup(input.cred, "copy_size")
+            ));
+        } else {
+            push_fact(&mut fact_sources, "cred.caps_offset", &layouts.cred_caps_offset);
+            push_fact(&mut fact_sources, "cred.copy_size", &layouts.cred_copy_size);
+        }
+    }
+    if let Some(stage1) = input.stage1.as_ref() {
+        fact_sources.push(format!(
+            "selinux.enforcing={} ({})",
+            stage1.selinux_enforcing, stage1.selinux_source
+        ));
+        fact_sources.push(format!(
+            "selinux.initialized={} ({})",
+            stage1.selinux_initialized, stage1.selinux_source
+        ));
+        if let Some(scratch) = stage1.w1_scratch {
+            let reservation = if scratch.inside_anchor {
+                format!(
+                    "reserves anchor slots {}..{}",
+                    scratch.reserved_first, scratch.reserved_last
+                )
+            } else {
+                "second region, no slot reservation".to_string()
+            };
+            fact_sources.push(format!(
+                "w1_scratch.image={} ({}; {})",
+                scratch.image,
+                scratch.source.label(),
+                reservation
+            ));
+        }
+    }
+    lines.insert(1, format!("# fact_sources: {}", fact_sources.join("; ")));
     lines.push(match input.phys {
         // Decimal only: HOCON has no `0x` literal, and the Kotlin reader
         // (`getLongAt`) accepts a Number only, so a hex spelling would be
@@ -380,78 +544,57 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         "fallback",
         &[("to".to_string(), "\"none\"".to_string())],
     );
-
-    // The diting 5.10 execution block is identical in all eight bundled
-    // profiles (selected_cpus 4/5, the Batch-E race knobs, the 5 ms first
-    // walk). It is device behaviour, not image layout, but a profile without
-    // it runs on the upstream defaults, which are not the measured ones.
-    if crate::family::matches(release) {
-        lines.push("execution {".to_string());
-        lines.push("  selected_cpus {".to_string());
-        lines.push(format!("    main = {}", crate::family::SELECTED_CPUS.0));
-        lines.push(format!("    consumer = {}", crate::family::SELECTED_CPUS.1));
-        lines.push("  }".to_string());
-        lines.push("  race {".to_string());
-        lines.push(format!(
-            "    route_wait_ms = {}",
-            crate::family::ROUTE_WAIT_MS
-        ));
-        lines.push(format!(
-            "    setup_settle_us = {}",
-            crate::family::SETUP_SETTLE_US
-        ));
-        lines.push("  }".to_string());
-        lines.push("  routes {".to_string());
-        lines.push("    select_stack {".to_string());
-        lines.push(format!(
-            "      enter_delay_us = {}",
-            crate::family::SELECT_ENTER_DELAY_US
-        ));
-        lines.push("    }".to_string());
-        lines.push("  }".to_string());
-        lines.push("}".to_string());
+    /* Page-free Stage 1. Both blocks are optional: `selinux` states the field
+     * offsets the W1 predicate reads, `w1_scratch` names the zeroed region the
+     * W1 value comes from. Absence keeps the release-derived layout and the
+     * reclaimed-page value. */
+    if let Some(stage1) = input.stage1.as_ref() {
+        push_conf_block(
+            &mut lines,
+            "selinux",
+            &[
+                ("enforcing".to_string(), stage1.selinux_enforcing.to_string()),
+                ("initialized".to_string(), stage1.selinux_initialized.to_string()),
+            ],
+        );
+        if let Some(scratch) = stage1.w1_scratch {
+            push_conf_block(
+                &mut lines,
+                "w1_scratch",
+                &[("image".to_string(), scratch.image.to_string())],
+            );
+        }
     }
 
-    // KernelSnitch: full universe. `collisions` is emitted for a verified
-    // train (and every 5.x kernel); `mm_struct_sz` only where it applies. An
-    // unverified release keeps both as `null` rather than omitting the block.
-    let mut snitch = Vec::new();
+    // Execution tuning (`selected_cpus`, the race knobs, route timing) is
+    // device/runtime behaviour, not an image property. The extractor omits the
+    // block entirely; the app fills it from its tuning presets. Omitting the
+    // keys (rather than writing null) is the contract: a null inside a new
+    // route group survives the app's merge and blocks the preset.
+
+    // KernelSnitch: `collisions` is emitted for a verified train (and every
+    // 5.x kernel). The mm_struct SLUB stride is deliberately not a profile
+    // value: the leak scans a stride-agnostic grid and the spray uses the
+    // native default, so the extractor never guesses a value it cannot derive.
+    // An unverified release keeps `collisions` as `null`.
+    let mut snitch: Vec<(String, String)> = Vec::new();
     if kernel_layout_verified(Some(release)) || major == Some(5) {
         match major {
-            Some(6) => {
-                // = kernelsnitch-6x.conf
-                snitch.push(("collisions".to_string(), "4".to_string()));
-                if crate::symbols::kernel_struct_macro(Some(release)) == Some("STRUCT_OFFSETS_6_1")
-                {
-                    // 0x400 is the device SLUB stride, not the BTF sizeof (0x3c0).
-                    snitch.push(("mm_struct_sz".to_string(), "1024".to_string()));
-                }
-            }
-            Some(5) => {
-                snitch.push(("collisions".to_string(), "8".to_string()));
-                // The diting 5.10 line's slab stride is 960; 1024 is the
-                // template default (and the measured 5.15 value).
-                let mm_struct_sz = if crate::family::matches(release) {
-                    crate::family::MM_STRUCT_SZ
-                } else {
-                    1024
-                };
-                snitch.push(("mm_struct_sz".to_string(), mm_struct_sz.to_string()));
-            }
+            Some(6) => snitch.push(("collisions".to_string(), "4".to_string())),
+            Some(5) => snitch.push(("collisions".to_string(), "8".to_string())),
             _ => {}
         }
     }
-    push_conf_block(
-        &mut lines,
-        "kernelsnitch",
-        &[
-            ("collisions".to_string(), conf_lookup(&snitch, "collisions")),
-            (
-                "mm_struct_sz".to_string(),
-                conf_lookup(&snitch, "mm_struct_sz"),
-            ),
-        ],
-    );
+    if !snitch.iter().any(|(key, _)| key == "collisions") {
+        snitch.push(("collisions".to_string(), "null".to_string()));
+    }
+    if let Some(size) = input
+        .layouts
+        .and_then(|layouts| btf_u32(&layouts.rt_mutex_size))
+    {
+        snitch.push(("rt_mutex_size".to_string(), size));
+    }
+    push_conf_block(&mut lines, "kernelsnitch", &snitch);
 
     let task: Vec<(String, String)> = CONF_TASK_FIELDS
         .iter()
@@ -470,11 +613,64 @@ pub fn render_conf(input: &ConfInputs<'_>) -> String {
         .collect();
     push_conf_block(&mut lines, "task_struct", &task);
 
-    let cred: Vec<(String, String)> = CONF_CRED_FIELDS
+    let mut cred: Vec<(String, String)> = CONF_CRED_FIELDS
         .iter()
         .map(|key| ((*key).to_string(), conf_lookup(input.cred, key)))
         .collect();
+    if let Some(layouts) = input.layouts {
+        for (key, fact) in [
+            ("usage_size", &layouts.cred_usage_size),
+            ("uid_offset", &layouts.cred_uid_offset),
+            ("security_offset", &layouts.cred_security_offset),
+        ] {
+            if let Some(value) = btf_decimal(fact) {
+                cred.push((key.to_string(), value));
+            }
+        }
+        /* The existing caps/copy keys are per-image facts too: on 6.1 the BTF
+         * says 40/128 while the shared 6.x template says 48/136; the 6.6/6.12
+         * BTF agrees with the template. A 5.x block is not the template: its
+         * copy_size is sizeof(cred) (user/user_ns/ucounts/group_info/rcu
+         * follow `security`, so `security + 8` undercounts) and its
+         * caps_offset is the first non-zero init_cred capability run, so both
+         * are already per-image and must not be overwritten. */
+        if cred_from_6x_template {
+            for (key, fact) in [
+                ("caps_offset", &layouts.cred_caps_offset),
+                ("copy_size", &layouts.cred_copy_size),
+            ] {
+                if let Some(value) = btf_decimal(fact) {
+                    if let Some(entry) = cred.iter_mut().find(|(name, _)| name == key) {
+                        entry.1 = value;
+                    }
+                }
+            }
+        }
+    }
     push_conf_block(&mut lines, "cred", &cred);
+
+    /* The waiter shape is a per-image BTF fact. Omit the whole block when no
+     * per-image source supplied it, so a 5.10 profile stays byte-identical
+     * and the native keeps its release fallback. */
+    if let Some(layouts) = input.layouts {
+        let mut waiter: Vec<(String, String)> = Vec::new();
+        if let Some(value) = btf_flag(&layouts.waiter_compact) {
+            waiter.push(("compact".to_string(), value));
+        }
+        for (key, fact) in [
+            ("pi_tree", &layouts.waiter_pi_tree),
+            ("task", &layouts.waiter_task),
+            ("lock", &layouts.waiter_lock),
+            ("wake_state", &layouts.waiter_wake_state),
+        ] {
+            if let Some(value) = btf_decimal(fact) {
+                waiter.push((key.to_string(), value));
+            }
+        }
+        if !waiter.is_empty() {
+            push_conf_block(&mut lines, "waiter_layout", &waiter);
+        }
+    }
 
     let offset_entries = conf_offsets(input.symbols, input.extra_offsets);
     let offset: Vec<(String, String)> = CONF_OFFSET_FIELDS
@@ -523,9 +719,12 @@ pub fn optional_struct_fields() -> BTreeSet<&'static str> {
 mod tests {
     use super::{
         CONF_TASK_FIELDS, ConfExtraOffsets, ConfInputs, build_report, conf_cred_5x, conf_cred_6x,
-        conf_route_geometry, pselect_waiter_shift_for, render_conf,
+        conf_route_geometry, conf_route_geometry_with_sigreturn, pselect_waiter_shift_for,
+        render_conf,
     };
     use crate::derive::Cred5x;
+    use crate::fact::{Confidence, Domain, Fact, Source};
+    use crate::layout::LayoutFacts;
     use std::collections::BTreeMap;
 
     fn conf_fixture() -> (BTreeMap<String, Option<u64>>, BTreeMap<String, Option<u32>>) {
@@ -558,12 +757,17 @@ mod tests {
             route_geometry: &geometry,
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
+       
+            layouts: None,
+            stage1: None,
+       
+            phys_source: "test",
         });
         assert!(!out.contains("include"));
         assert!(out.contains("kernel_phys_load = 1073741824"));
         assert!(out.contains("route {\n  select_stack {\n    waiter_shift = -2\n  }\n}"));
         assert!(out.contains("collisions = 4"));
-        assert!(out.contains("mm_struct_sz = null"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(!out.contains("task_prio"));
         assert!(out.contains("  prio = 132"));
         assert!(out.contains("cred {"));
@@ -573,10 +777,15 @@ mod tests {
         assert!(out.contains("init_task = 34595456"));
         assert!(out.contains("security_hook_heads = 0"));
         assert!(!out.contains("off_absent"));
+        /* No layout facts -> no stage-3 keys; the profile stays byte-identical. */
+        assert!(!out.contains("usage_size"));
+        assert!(!out.contains("rt_mutex_size"));
+        assert!(!out.contains("waiter_layout"));
+        assert!(out.contains("# fact_sources:"));
     }
 
     #[test]
-    fn conf_61_writes_the_compact_waiter_and_slub_stride() {
+    fn conf_61_writes_the_compact_waiter() {
         let (symbols, structs) = conf_fixture();
         let geometry: Vec<(&'static str, i64)> = vec![("compact_waiter", 1)];
         let out = render_conf(&ConfInputs {
@@ -589,10 +798,268 @@ mod tests {
             route_geometry: &geometry,
             cred: &conf_cred_6x(),
             extra_offsets: &no_extra_offsets(),
+       
+            layouts: None,
+            stage1: None,
+       
+            phys_source: "test",
         });
         assert!(out.contains("tcp_zerocopy {\n    compact_waiter = 1"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(out.contains("kernel_phys_load = null"));
+    }
+
+    #[test]
+    fn btf_layout_facts_are_emitted_as_optional_keys() {
+        let (symbols, structs) = conf_fixture();
+        let layouts = LayoutFacts {
+            rt_mutex_size: Fact::new(32, Domain::SizeOf, Source::Btf, Confidence::Derived),
+            waiter_compact: Fact::new(true, Domain::EnumValue, Source::Btf, Confidence::Derived),
+            waiter_pi_tree: Fact::new(
+                "0x18".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            waiter_task: Fact::new(
+                "0x30".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            waiter_lock: Fact::new(
+                "0x38".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            waiter_wake_state: Fact::new(
+                "0x40".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_usage_size: Fact::new(
+                "8".to_string(),
+                Domain::SizeOf,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_uid_offset: Fact::new(
+                "0x8".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_security_offset: Fact::new(
+                "0x80".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_caps_offset: Fact::new(
+                "0x30".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_copy_size: Fact::new(
+                "136".to_string(),
+                Domain::SizeOf,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+        };
+        let out = render_conf(&ConfInputs {
+            release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
+            phys: None,
+            phys_offset: None,
+            symbols: &symbols,
+            structs: &structs,
+            route: Some("select_stack"),
+            route_geometry: &[],
+            cred: &conf_cred_6x(),
+            extra_offsets: &no_extra_offsets(),
+            layouts: Some(&layouts),
+            stage1: None,
+       
+            phys_source: "test",
+        });
+        assert!(out.contains("usage_size = 8"));
+        assert!(out.contains("uid_offset = 8"));
+        assert!(out.contains("security_offset = 128"));
+        assert!(out.contains("rt_mutex_size = 32"));
+        assert!(out.contains(
+            "waiter_layout {\n  compact = 1\n  pi_tree = 24\n  task = 48\n  lock = 56\n  wake_state = 64\n}"
+        ));
+        /* The existing caps/copy template is unchanged in this slice; the
+         * 6.1 template mismatch remains the documented bundle item. */
+        assert!(out.contains("caps_offset = 48"));
+        assert!(out.contains("copy_size = 136"));
+        assert!(out.contains("cred.usage_size=8 (btf/derived)"));
+        assert!(out.contains("# fact_sources:"));
+    }
+
+    #[test]
+    fn btf_cred_caps_and_copy_override_the_shared_6x_template() {
+        let (symbols, structs) = conf_fixture();
+        let layouts = LayoutFacts {
+            rt_mutex_size: Fact::new(32, Domain::SizeOf, Source::Btf, Confidence::Derived),
+            waiter_compact: Fact::new(true, Domain::EnumValue, Source::Btf, Confidence::Derived),
+            waiter_pi_tree: Fact::new(
+                "0x18".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            waiter_task: Fact::new(
+                "0x30".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            waiter_lock: Fact::new(
+                "0x38".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            waiter_wake_state: Fact::new(
+                "0x40".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_usage_size: Fact::new(
+                "4".to_string(),
+                Domain::SizeOf,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_uid_offset: Fact::new(
+                "0x4".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_security_offset: Fact::new(
+                "0x78".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_caps_offset: Fact::new(
+                "0x28".to_string(),
+                Domain::FieldOffset,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+            cred_copy_size: Fact::new(
+                "128".to_string(),
+                Domain::SizeOf,
+                Source::Btf,
+                Confidence::Derived,
+            ),
+        };
+        let out = render_conf(&ConfInputs {
+            release: "6.1.25-android14-11-g8744d1c0cf31-ab10888519",
+            phys: None,
+            phys_offset: None,
+            phys_source: "test",
+            symbols: &symbols,
+            structs: &structs,
+            route: Some("select_stack"),
+            route_geometry: &[],
+            cred: &conf_cred_6x(),
+            extra_offsets: &no_extra_offsets(),
+            layouts: Some(&layouts),
+            stage1: None,
+        });
+        assert!(out.contains("caps_offset = 40"));
+        assert!(out.contains("copy_size = 128"));
+        assert!(!out.contains("caps_offset = 48"));
+        assert!(!out.contains("copy_size = 136"));
+    }
+
+    #[test]
+    fn a_5x_credential_block_is_not_overridden_by_the_btf_prefix_facts() {
+        let (symbols, structs) = conf_fixture();
+        let btf = |value: &str, domain| {
+            Fact::new(value.to_string(), domain, Source::Btf, Confidence::Derived)
+        };
+        let unknown = |value: &str| {
+            Fact::new(
+                value.to_string(),
+                Domain::FieldOffset,
+                Source::Unknown,
+                Confidence::Unknown,
+            )
+        };
+        let layouts = LayoutFacts {
+            rt_mutex_size: Fact::new(0, Domain::SizeOf, Source::Unknown, Confidence::Unknown),
+            waiter_compact: Fact::new(false, Domain::EnumValue, Source::Unknown, Confidence::Unknown),
+            waiter_pi_tree: unknown("null"),
+            waiter_task: unknown("null"),
+            waiter_lock: unknown("null"),
+            waiter_wake_state: unknown("null"),
+            cred_usage_size: btf("4", Domain::SizeOf),
+            cred_uid_offset: btf("0x4", Domain::FieldOffset),
+            cred_security_offset: btf("0x78", Domain::FieldOffset),
+            cred_caps_offset: btf("0x28", Domain::FieldOffset),
+            cred_copy_size: btf("128", Domain::SizeOf),
+        };
+        let cred = Cred5x {
+            caps_offset: 48,
+            caps_count: 3,
+            caps_value: 0x1ffffffffff,
+            refs: vec![(0x80, 0xffffffc00ab23a80)],
+        };
+        let out = render_conf(&ConfInputs {
+            release: "5.15.189-android13-8-00016-g51bba4309aac-ab14546557",
+            phys: None,
+            phys_offset: None,
+            phys_source: "test",
+            symbols: &symbols,
+            structs: &structs,
+            route: Some("select_stack"),
+            route_geometry: &[],
+            cred: &conf_cred_5x(&cred, 176),
+            extra_offsets: &no_extra_offsets(),
+            layouts: Some(&layouts),
+            stage1: None,
+        });
+        /* The 5.x block is already per-image: its copy is sizeof(cred) (5.x
+         * keeps pointers and the rcu head after `security`) and its caps is
+         * the init_cred capability run. The 6.x prefix facts must not replace
+         * either; only the new usage/uid/security keys are added. */
+        assert!(out.contains("copy_size = 176"));
+        assert!(out.contains("caps_offset = 48"));
+        assert!(!out.contains("copy_size = 128"));
+        assert!(!out.contains("caps_offset = 40"));
+        assert!(out.contains("security_offset = 120"));
+    }
+
+    #[test]
+    fn operator_physical_override_is_in_the_fact_sources_header() {
+        let (symbols, structs) = conf_fixture();
+        let out = render_conf(&ConfInputs {
+            release: "6.6.89-android15-8-g0889fe95bb10-ab14402178-4k",
+            phys: Some(0xa800_0000),
+            phys_offset: None,
+            phys_source: "--phys",
+            symbols: &symbols,
+            structs: &structs,
+            route: Some("select_stack"),
+            route_geometry: &[("waiter_shift", -2)],
+            cred: &conf_cred_6x(),
+            extra_offsets: &no_extra_offsets(),
+            layouts: None,
+            stage1: None,
+        });
+        assert!(out.contains("kernel_phys_load=2818572288 (--phys)"));
+        assert!(out.contains("kernel_phys_load = 2818572288"));
+        /* The comment is the only record of the operator value; no new key. */
+        assert!(!out.contains("phys_source ="));
     }
 
     #[test]
@@ -627,6 +1094,11 @@ mod tests {
             extra_offsets: &ConfExtraOffsets {
                 empty_zero_page: Some(47_529_984),
             },
+       
+            layouts: None,
+            stage1: None,
+       
+            phys_source: "test",
         });
         assert!(out.contains("multicast_waiter {\n    waiter_off = 96"));
         assert!(out.contains("buffer_size = 264"));
@@ -634,7 +1106,7 @@ mod tests {
         assert!(out.contains("lock_offset = 56"));
         assert!(out.contains("compact_waiter = 1"));
         assert!(out.contains("collisions = 8"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
         assert!(out.contains("cred {"));
         assert!(out.contains("copy_size = 176"));
         assert!(out.contains("usage_value = 256"));
@@ -651,12 +1123,58 @@ mod tests {
     #[test]
     fn conf_route_geometry_follows_the_measured_families() {
         let (_, structs) = conf_fixture();
+        // The 5.10 select_stack geometry follows the image-derived shift, not
+        // the family constant: a delta=8 image emits -1, and no shift means the
+        // caller (the verdict engine) must supply the labelled fallback.
+        assert_eq!(
+            conf_route_geometry("select_stack", "5.10.246-gki", Some(-1), &structs),
+            vec![("waiter_shift", -1), ("compact_waiter", 1)]
+        );
+        assert!(
+            conf_route_geometry("select_stack", "5.10.246-gki", None, &structs).is_empty()
+        );
+        // sigreturn has no BTF derivation dependency; the patch-range fallback
+        // differs by the strip home (0x1c0 vs 0x210).
+        assert_eq!(
+            conf_route_geometry("sigreturn", "5.10.246-gki", None, &structs),
+            vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
+        );
+        assert_eq!(
+            conf_route_geometry("sigreturn", "5.10.81-android12-9", None, &structs),
+            vec![("waiter_off_sve", 336), ("waiter_off_plain", 320)]
+        );
+        assert_eq!(
+            conf_route_geometry_with_sigreturn(
+                "sigreturn",
+                "5.10.236-android12-9",
+                None,
+                Some((256, 240)),
+                &structs
+            ),
+            vec![("waiter_off_sve", 256), ("waiter_off_plain", 240)]
+        );
         assert_eq!(
             conf_route_geometry("select_stack", "6.6.89-android15-8", Some(-2), &structs),
             vec![("waiter_shift", -2)]
         );
         assert!(
             conf_route_geometry("select_stack", "6.6.89-android15-8", None, &structs).is_empty()
+        );
+        // 6.1 and 5.15 are the flat compact-waiter families: a select-only
+        // profile must carry the flag, or the route takes the rb_node branch
+        // and refuses at word 14 -> global 15 (measured on 6.1.138).
+        assert_eq!(
+            conf_route_geometry(
+                "select_stack",
+                "6.1.138-android14-11-g44bda9e8f6e9-ab13792638",
+                Some(1),
+                &structs
+            ),
+            vec![("waiter_shift", 1), ("compact_waiter", 1)]
+        );
+        assert_eq!(
+            conf_route_geometry("select_stack", "5.15.194-android13-8", Some(2), &structs),
+            vec![("waiter_shift", 2), ("compact_waiter", 1)]
         );
         assert_eq!(
             conf_route_geometry("tcp_zerocopy", "6.1.118-android14-11", Some(1), &structs),
@@ -757,6 +1275,11 @@ mod tests {
             extra_offsets: &ConfExtraOffsets {
                 empty_zero_page: None,
             },
+       
+            layouts: None,
+            stage1: None,
+       
+            phys_source: "test",
         });
         assert!(out.contains("route {"));
         assert!(out.contains("multicast_waiter {"));
@@ -776,10 +1299,15 @@ mod tests {
             route_geometry: &[],
             cred: &[],
             extra_offsets: &no_extra_offsets(),
+       
+            layouts: None,
+            stage1: None,
+       
+            phys_source: "test",
         });
         assert!(out.contains("kernelsnitch {"));
         assert!(out.contains("collisions = null"));
-        assert!(out.contains("mm_struct_sz = null"));
+        assert!(!out.contains("mm_struct_sz"));
     }
 
     #[test]
@@ -801,17 +1329,22 @@ mod tests {
             route_geometry: &geometry,
             cred: &[],
             extra_offsets: &no_extra_offsets(),
+       
+            layouts: None,
+            stage1: None,
+       
+            phys_source: "test",
         });
         assert!(out.contains("multicast_waiter {\n    waiter_off = 96"));
         assert!(out.contains("buffer_size = 264"));
         assert!(out.contains("task_offset = 48"));
         assert!(out.contains("lock_offset = 56"));
         assert!(out.contains("compact_waiter = 1"));
-        // The 5.x KernelSnitch defaults are required to run and are emitted even
-        // without the "-android13-" train tag.
+        // The 5.x KernelSnitch collisions value is required to run and is
+        // emitted even without the "-android13-" train tag.
         assert!(out.contains("kernelsnitch"));
         assert!(out.contains("collisions = 8"));
-        assert!(out.contains("mm_struct_sz = 1024"));
+        assert!(!out.contains("mm_struct_sz"));
     }
 
     #[test]
@@ -962,12 +1495,19 @@ mod tests {
             route_geometry: &geometry,
             cred: &cred,
             extra_offsets: &extra,
+       
+            layouts: None,
+            stage1: None,
+       
+            phys_source: "test",
         });
+        /* The r8 bundle dropped its 5.15 assets; this is the hardware-validated
+         * profile as it shipped before the drop, kept as the rendering oracle. */
         let bundled = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../app/src/main/assets/kernel_profiles/5.15.189-android13-8-00016-g51bba4309aac-ab14546557.conf"
+            "/tests/fixtures/5.15.189-android13-8-00016-g51bba4309aac-ab14546557.conf"
         ))
-        .expect("bundled 5.15.189 profile");
+        .expect("the 5.15.189 rendering fixture");
         let generated = flatten_conf(&generated);
         let bundled = flatten_conf(&bundled);
 
@@ -984,7 +1524,11 @@ mod tests {
         );
 
         for key in bundled.keys() {
-            if key == "recommend_shizuku" {
+            // Two intentional differences: shizuku defaults to off in generated
+            // confs, and the slab stride is a runtime measurement (QEMU/device
+            // /proc/slabinfo, restored into the bundles by 91ceeea) that an
+            // image-only generation cannot supply.
+            if key == "recommend_shizuku" || key == "kernelsnitch.mm_struct_sz" {
                 continue;
             }
             assert_eq!(
