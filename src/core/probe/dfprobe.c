@@ -1,8 +1,10 @@
+#define _GNU_SOURCE
 #include <jni.h>
 #include <stdint.h>
 #include <string.h>
 #include <errno.h>
 #include <unistd.h>
+#include <sched.h>
 #include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -38,7 +40,7 @@ static int send_one(int sk, int file_fd, off_t off, const uint8_t iv[16],
 }
 
 JNIEXPORT jint JNICALL
-Java_com_ghostlock_app_data_DirtyfragProbe_nativeSendEspWrite(
+Java_com_sesame_app_data_DirtyfragProbe_nativeSendEspWrite(
         JNIEnv *env, jobject thiz, jstring path, jlong offset, jint spi, jint seq,
         jbyteArray ivArr, jint encap_port, jint sender_port) {
     (void)thiz;
@@ -75,4 +77,19 @@ out:
     (*env)->ReleaseByteArrayElements(env, ivArr, iv, JNI_ABORT);
     (*env)->ReleaseStringUTFChars(env, path, p);
     return rc;
+}
+
+/* sched_setaffinity for the app's own thread; the public SDK's Os class does
+ * not expose it. Returns 0 on success, -errno otherwise. Used by the run-log
+ * thread to keep its fsyncs off the route's cores. */
+JNIEXPORT jint JNICALL
+Java_com_sesame_app_data_NativeCpuPin_setThreadAffinity(
+        JNIEnv *env, jobject thiz, jint tid, jint cpu) {
+    (void) env;
+    (void) thiz;
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    CPU_SET((int) cpu, &set);
+    if (sched_setaffinity((pid_t) tid, sizeof(set), &set) != 0) return -errno;
+    return 0;
 }

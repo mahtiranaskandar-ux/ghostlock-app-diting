@@ -49,7 +49,7 @@ Two facts, both measured:
   fails loudly in the run log and everything else still works. First thing to
   check on the device try.
 * Our own harness reads `/sdcard/Download/ghostlock-debug-log`. It has to move to
-  `adb exec-out run-as com.ghostlock.app …` (verified: the released APKs are
+  `adb exec-out run-as com.sesame.app …` (verified: the released APKs are
   `android:debuggable=true`, so this works without root — which matters because
   a device that has just crashed is unrooted until the exploit runs).
 

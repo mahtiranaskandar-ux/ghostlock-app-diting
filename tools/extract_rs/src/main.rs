@@ -262,36 +262,58 @@ fn resolve_kallsyms(
         .map_err(|err| ExtractError::kallsyms(err.to_string()))
 }
 
-/// `selinux_state`'s field offsets: from the image's BTF when present (and
-/// consistent), else the 5.10 release template. `None` = fail closed, the
-/// profile omits the block and the native keeps its release-derived layout.
-fn selinux_layout(btf: Option<&Btf>, release: &str) -> Option<(u32, u32, &'static str)> {
+/// `selinux_state`'s field facts: `(enforcing offset, the byte of the W1 value
+/// that lands on initialized, source)`. The second value is relative: the write
+/// starts at `selinux_state + enforcing`, so initialized's value byte is
+/// `initialized - enforcing`.
+///
+/// BTF when present (any coherent layout, including a `disabled` byte); else
+/// the measured release table. `None` = fail closed, the profile omits the
+/// block and the native keeps its release-derived layout.
+///
+/// `5.4` keeps the unconditional `disabled` byte (enforcing@1, initialized@3);
+/// `5.10` gates it out with `CONFIG_SECURITY_SELINUX_DISABLE` off
+/// (enforcing@0, initialized@2). The config premises ride the source string as
+/// provenance — never a gate. Measured on the venus 5.4.274 and star 5.4.233
+/// Images (`docs/analysis/five-four-support-plan.md` §1.1).
+fn selinux_layout(
+    btf: Option<&Btf>,
+    release: &str,
+    config: Option<&ikconfig::KernelConfig>,
+) -> Option<(u32, u32, String)> {
     if let Some(btf) = btf {
         let enforcing = btf.field("selinux_state", "enforcing")?;
         let initialized = btf.field("selinux_state", "initialized")?;
-        if btf.field("selinux_state", "disabled").is_some() {
-            eprintln!("warning: selinux_state.disabled is present; the selinux block is omitted");
-            return None;
-        }
-        if enforcing != 0 || initialized >= 8 {
+        if enforcing >= 8 || initialized >= 8 || initialized <= enforcing {
             eprintln!(
                 "warning: unexpected selinux_state layout (enforcing {enforcing}, \
                  initialized {initialized}); the selinux block is omitted"
             );
             return None;
         }
-        return Some((enforcing, initialized, "btf"));
+        return Some((enforcing, initialized - enforcing, "btf".to_string()));
     }
-    /* No BTF: only the 5.10 series has a template; 5.15/6.1 and 6.6/6.12 are
-     * BTF-carrying images, so a no-BTF member of those families fails closed. */
+    /* No BTF: the measured release table. A release not in it fails closed;
+     * 5.15/6.1/6.6/6.12 carry BTF, so a no-BTF member of those families is
+     * outside the measured set. */
     let mut parts = release.split('.');
     let major: u32 = parts.next()?.parse().ok()?;
     let minor: u32 = parts.next()?.parse().ok()?;
-    if major == 5 && minor == 10 {
-        Some((0, 2, "release-template"))
-    } else {
-        None
-    }
+    let (enforcing, initialized) = match (major, minor) {
+        (5, 10) => (0, 2),
+        (5, 4) => (1, 2),
+        _ => return None,
+    };
+    let source = match config {
+        Some(config) => format!(
+            "release-template {major}.{minor}; SELINUX={} DEVELOP={} DISABLE={}",
+            config.value("CONFIG_SECURITY_SELINUX"),
+            config.value("CONFIG_SECURITY_SELINUX_DEVELOP"),
+            config.value("CONFIG_SECURITY_SELINUX_DISABLE"),
+        ),
+        None => format!("release-template {major}.{minor}; no IKCONFIG"),
+    };
+    Some((enforcing, initialized, source))
 }
 
 fn run(cli: &Cli) -> Result<i32> {
@@ -1284,8 +1306,9 @@ fn run(cli: &Cli) -> Result<i32> {
                              * first unconditioned region with a slot, then an
                              * unconditioned second region. The superset and
                              * the CLI must not disagree. */
-                            let initialized = selinux_layout(btf.as_ref(), release_text)
-                                .map(|(_, initialized, _)| initialized);
+                            let initialized =
+                                selinux_layout(btf.as_ref(), release_text, kernel_config.as_ref())
+                                    .map(|(_, initialized, _)| initialized);
                             let candidates = options::scan_candidates(&options::CandidateInput {
                                 kernel: &boot.kernel,
                                 rel_symbols: &rel_symbols,
@@ -1525,7 +1548,8 @@ fn run(cli: &Cli) -> Result<i32> {
          * The scratch arithmetic needs the physical pair the native will use
          * (the profile's values, else the compiled defaults) and a 64 KiB
          * delta, so an unknown load or a misaligned delta fails closed. */
-        let selinux_fields = selinux_layout(btf.as_ref(), release_text);
+        let selinux_fields =
+            selinux_layout(btf.as_ref(), release_text, kernel_config.as_ref());
         let w1_scratch = (|| {
             if !cli.anchor {
                 if cli.w1_scratch_image.is_some() || cli.w1_scratch_symbol.is_some() {
@@ -1546,7 +1570,7 @@ fn run(cli: &Cli) -> Result<i32> {
             let anchor_image = field("lock_anchor_image")?;
             let anchor_bytes = field("lock_anchor_bytes")?;
             let stride = field("lock_anchor_stride")?;
-            let initialized = selinux_fields?.1;
+            let initialized = selinux_fields.as_ref()?.1;
             let load = kernel_phys_load?;
             let offset = kernel_phys_offset.unwrap_or(0x8000_0000);
             let delta = load.checked_sub(offset)?;
@@ -1613,12 +1637,14 @@ fn run(cli: &Cli) -> Result<i32> {
                 }),
             }
         })();
-        let stage1 = selinux_fields.map(|(enforcing, initialized, source)| report::Stage1Conf {
-            selinux_enforcing: enforcing,
-            selinux_initialized: initialized,
-            selinux_source: source,
-            w1_scratch,
-        });
+        let stage1 = selinux_fields
+            .as_ref()
+            .map(|(enforcing, initialized, source)| report::Stage1Conf {
+                selinux_enforcing: *enforcing,
+                selinux_initialized: *initialized,
+                selinux_source: source.clone(),
+                w1_scratch,
+            });
         let inputs = report::ConfInputs {
             release: release_text,
             phys: kernel_phys_load,
@@ -1635,7 +1661,7 @@ fn run(cli: &Cli) -> Result<i32> {
             cred: &cred,
             extra_offsets: &extra_offsets,
             layouts: Some(&layouts),
-            stage1,
+            stage1: stage1.clone(),
         };
         /* The option superset, written once the common profile facts exist so
          * it can be cut into any plan. An ambiguous route set reaches this
@@ -1719,7 +1745,7 @@ fn run(cli: &Cli) -> Result<i32> {
                     ..stage
                 }),
             });
-            let initialized = selinux_fields.map(|(_, initialized, _)| initialized);
+            let initialized = selinux_fields.as_ref().map(|(_, initialized, _)| *initialized);
             let input = options::Input {
                 release: release_text,
                 kernel_major: major,
@@ -1991,4 +2017,27 @@ register provenance across branches; supply it in the profile (see the design do
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::selinux_layout;
+
+    #[test]
+    fn selinux_layout_reads_the_measured_release_table() {
+        let layout = |release: &str| {
+            selinux_layout(None, release, None)
+                .map(|(enforcing, initialized, _)| (enforcing, initialized))
+        };
+        assert_eq!(
+            layout("5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284"),
+            Some((0, 2))
+        );
+        assert_eq!(layout("5.4.274-qgki-g76ac0b265f44"), Some((1, 2)));
+        assert_eq!(
+            layout("5.15.194-android13-8-00019-gf4321180a397-ab15212794"),
+            None
+        );
+        assert_eq!(layout("not-a-release"), None);
+    }
 }

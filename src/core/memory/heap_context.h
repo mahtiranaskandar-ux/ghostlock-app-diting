@@ -85,6 +85,9 @@ namespace ghostlock::memory {
     struct HeapContext {
         ghostlock::kernelsnitch::kernelsnitch_shared_state *snitch;
         size_t mm_objs_per_slab;
+        /* The slab size the page path used (PAGE_SIZE << the voted order);
+         * zero before the first prepare. The stride probe reads it back. */
+        size_t mm_slab_size;
         std::unique_ptr<unsigned char[]> skb_buffer;
         MmContextSet prepare;
         MmContextSet spray;

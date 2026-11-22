@@ -79,6 +79,22 @@ pub fn ensure_rtmutex_43499_unpatched(
             .map_or(start + cap, |off| *off),
     );
     let dis = disassemble_range(kernel, start as usize, stop as usize)?;
+    /* The 5.10.246 diting variant keeps the `mrs sp_el0` read (for a task
+     * refcount) but performs the task-side work and passes the PI walk's
+     * `top_task` on `waiter->task`. A forged waiter's task word would become
+     * the chain anchor, so the walk exits without the rb-erase collateral even
+     * though the `mrs` rule below calls the image vulnerable. The walk's
+     * argument is the decisive fact; the rule only fires when it is proved to
+     * come from the waiter structure. */
+    if let Some(walk) = unique_offset_optional(symbols, "rt_mutex_adjust_prio_chain")
+        && walk_top_task_source(&dis, walk) == WalkTopTask::WaiterTask
+    {
+        return Err(ExtractError::already_fixed(format!(
+            "remove_waiter()@{start:#x} passes waiter->task as the PI walk's \
+             top_task (rt_mutex_adjust_prio_chain@{walk:#x}); the forged-waiter \
+             chain is cut (rtmutex UAF fix variant present)"
+        )));
+    }
     if remove_waiter_uses_current(&dis) {
         return Ok(start);
     }
@@ -93,6 +109,185 @@ pub fn ensure_rtmutex_43499_unpatched(
 pub fn remove_waiter_uses_current(dis: &[String]) -> bool {
     let mrs_current = Regex::new(r"(?i)\bmrs\s+x\d+,\s*s3_0_c4_c1_0\b").unwrap();
     dis.iter().any(|line| mrs_current.is_match(line))
+}
+
+/// Where `remove_waiter()`'s call to the PI walk takes its `top_task` (the
+/// sixth argument) from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalkTopTask {
+    /// `mrs xN, sp_el0` ... `mov x5, xN`: the calling task (vulnerable).
+    Current,
+    /// `ldr xN, [waiter, #..]` ... `mov x5, xN`: the waiter's recorded task.
+    /// 5.10.246 performs the `pi_lock`/`pi_blocked_on` work on this value too;
+    /// the forged-waiter chain is cut even though `sp_el0` is still read.
+    WaiterTask,
+    /// Not resolvable (no call found, argument moved from elsewhere, ...).
+    Unknown,
+}
+
+/// The instruction text without an optional leading `addr:` label. The decoder
+/// emits bare instructions; the unit fixtures carry an address prefix.
+fn instruction_text(line: &str) -> &str {
+    let trimmed = line.trim();
+    if let Some((head, rest)) = trimmed.split_once(':')
+        && !head.is_empty()
+        && head.chars().all(|ch| ch.is_ascii_hexdigit())
+    {
+        return rest.trim();
+    }
+    trimmed
+}
+
+fn first_operand_register(operands: &str) -> Option<String> {
+    let first = operands.split(',').next()?.trim().to_ascii_lowercase();
+    if first.len() > 1 && first.starts_with('x') && first[1..].chars().all(|ch| ch.is_ascii_digit())
+    {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+/// `ldr xN, [xM, #0x30]` -> the base register. Indexed forms are not used by
+/// the argument setup and stay unknown.
+fn ldr_base_register(text: &str) -> Option<String> {
+    let re = Regex::new(r"(?i)^ldr\s+x\d+,\s*\[(x\d+),\s*#0x[0-9a-f]+\]\s*$").unwrap();
+    re.captures(text).map(|caps| caps[1].to_ascii_lowercase())
+}
+
+/// `mov xD, xS`.
+fn mov_registers(text: &str) -> Option<(String, String)> {
+    let re = Regex::new(r"(?i)^mov\s+(x\d+),\s*(x\d+)\s*$").unwrap();
+    let caps = re.captures(text)?;
+    Some((caps[1].to_ascii_lowercase(), caps[2].to_ascii_lowercase()))
+}
+
+fn is_current_read(operands: &str) -> bool {
+    operands.split(',').nth(1).is_some_and(|reg| {
+        let reg = reg.trim().to_ascii_lowercase();
+        reg == "s3_0_c4_c1_0" || reg == "sp_el0"
+    })
+}
+
+/// Opcodes whose first operand is a general-purpose destination register. The
+/// argument setup only needs this to find the nearest definition of `x5` and
+/// of its source; reads (`cmp`, stores, branches) are excluded.
+fn writes_register(op: &str) -> bool {
+    matches!(
+        op.to_ascii_lowercase().as_str(),
+        "mov"
+            | "movz"
+            | "movk"
+            | "movn"
+            | "mrs"
+            | "ldr"
+            | "ldur"
+            | "ldp"
+            | "adr"
+            | "adrp"
+            | "add"
+            | "adds"
+            | "sub"
+            | "subs"
+            | "orr"
+            | "and"
+            | "ands"
+            | "eor"
+            | "bic"
+            | "lsl"
+            | "lsr"
+            | "asr"
+            | "ubfx"
+            | "sbfx"
+            | "mul"
+            | "madd"
+            | "msub"
+            | "csel"
+            | "cset"
+            | "csinc"
+            | "csinv"
+    )
+}
+
+/// Index of the nearest instruction before `before` that writes `reg`.
+fn definition_of(dis: &[String], reg: &str, before: usize) -> Option<usize> {
+    for index in (0..before).rev() {
+        let text = instruction_text(&dis[index]);
+        let (op, operands) = split_line(text);
+        if !writes_register(&op) {
+            continue;
+        }
+        if first_operand_register(&operands).as_deref() == Some(reg) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Registers that hold the `remove_waiter(lock, waiter)` waiter argument: x1
+/// and every direct `mov xA, x1`/`mov xA, xB` alias up to `until`.
+fn waiter_aliases(dis: &[String], until: usize) -> BTreeSet<String> {
+    let mut aliases = BTreeSet::new();
+    aliases.insert("x1".to_string());
+    for line in dis.iter().take(until) {
+        let text = instruction_text(line);
+        if let Some(dst) = is_mov_x1(text) {
+            aliases.insert(dst);
+            continue;
+        }
+        if let Some((dst, src)) = mov_registers(text)
+            && aliases.contains(&src)
+        {
+            aliases.insert(dst);
+        }
+    }
+    aliases
+}
+
+fn classify_walk_argument(dis: &[String], def: usize) -> WalkTopTask {
+    let text = instruction_text(&dis[def]);
+    let (op, operands) = split_line(text);
+    if op.eq_ignore_ascii_case("mrs") {
+        return if is_current_read(&operands) {
+            WalkTopTask::Current
+        } else {
+            WalkTopTask::Unknown
+        };
+    }
+    if op.eq_ignore_ascii_case("ldr") {
+        return match ldr_base_register(text) {
+            Some(base) if waiter_aliases(dis, def).contains(&base) => WalkTopTask::WaiterTask,
+            _ => WalkTopTask::Unknown,
+        };
+    }
+    if op.eq_ignore_ascii_case("mov") {
+        let Some((_, src)) = mov_registers(text) else {
+            return WalkTopTask::Unknown;
+        };
+        return definition_of(dis, &src, def)
+            .map(|index| classify_walk_argument(dis, index))
+            .unwrap_or(WalkTopTask::Unknown);
+    }
+    WalkTopTask::Unknown
+}
+
+/// Resolve the `top_task` argument (x5) of `remove_waiter()`'s direct call to
+/// `rt_mutex_adjust_prio_chain`. `Current` is the vulnerable shape; a
+/// `WaiterTask` result is the fix variant (the argument is loaded from the
+/// waiter's task field through an x1 alias).
+pub fn walk_top_task_source(dis: &[String], walk: u64) -> WalkTopTask {
+    let target = format!("0x{walk:x}");
+    let call = dis.iter().rposition(|line| {
+        let (op, operands) = split_line(instruction_text(line));
+        op.eq_ignore_ascii_case("bl") && operands.trim() == target
+    });
+    let Some(call) = call else {
+        return WalkTopTask::Unknown;
+    };
+    let Some(argument) = definition_of(dis, "x5", call) else {
+        return WalkTopTask::Unknown;
+    };
+    classify_walk_argument(dis, argument)
 }
 
 /// Some Android kernels inline `tcp_zerocopy_receive()` into the TCP option
@@ -858,6 +1053,67 @@ mod tests {
             "01068e30: str xzr, [x20, #0x938]".to_string(),
         ];
         assert!(remove_waiter_uses_current(&dis));
+    }
+
+    #[test]
+    fn walk_top_task_detects_the_waiter_task_variant() {
+        // 5.10.246 diting: x20 = waiter->task; sp_el0 is still read (x25) for
+        // a refcount, so the `mrs` rule alone calls the image unpatched.
+        let dis: Vec<String> = vec![
+            "1ecf8c: mov x23, x1".to_string(),
+            "1ecfa4: mrs x25, s3_0_c4_c1_0".to_string(),
+            "1ecfb0: ldr x20, [x23, #0x30]".to_string(),
+            "1ecfc0: add x21, x20, #0x86c".to_string(),
+            "1ed02c: str xzr, [x20, #0x898]".to_string(),
+            "1ed254: mov x5, x20".to_string(),
+            "1ed258: bl 0x1ed608".to_string(),
+        ];
+        assert!(remove_waiter_uses_current(&dis));
+        assert_eq!(
+            super::walk_top_task_source(&dis, 0x1ed608),
+            super::WalkTopTask::WaiterTask
+        );
+    }
+
+    #[test]
+    fn walk_top_task_detects_current() {
+        // 5.10.236: x20 = current, and the walk's top_task is that value.
+        let dis: Vec<String> = vec![
+            "1ecc3c: mov x23, x1".to_string(),
+            "1ecc54: mrs x20, s3_0_c4_c1_0".to_string(),
+            "1ecc6c: add x21, x20, #0x86c".to_string(),
+            "1eccd8: str xzr, [x20, #0x898]".to_string(),
+            "1ecf00: mov x5, x20".to_string(),
+            "1ecf04: bl 0x1ed2b0".to_string(),
+        ];
+        assert_eq!(
+            super::walk_top_task_source(&dis, 0x1ed2b0),
+            super::WalkTopTask::Current
+        );
+    }
+
+    #[test]
+    fn walk_top_task_ignores_a_non_waiter_load() {
+        // x19 holds the lock, not the waiter: a load through it is not the fix.
+        let dis: Vec<String> = vec![
+            "1ecf8c: mov x23, x1".to_string(),
+            "1ecfb0: ldr x20, [x19, #0x30]".to_string(),
+            "1ed254: mov x5, x20".to_string(),
+            "1ed258: bl 0x1ed608".to_string(),
+        ];
+        assert_eq!(
+            super::walk_top_task_source(&dis, 0x1ed608),
+            super::WalkTopTask::Unknown
+        );
+    }
+
+    #[test]
+    fn walk_top_task_unknown_without_the_call() {
+        let dis: Vec<String> = vec!["1ecf00: mov x5, x20".to_string()];
+        assert_eq!(
+            super::walk_top_task_source(&dis, 0x1ed2b0),
+            super::WalkTopTask::Unknown
+        );
     }
 
     #[test]

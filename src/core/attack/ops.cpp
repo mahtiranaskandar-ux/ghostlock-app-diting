@@ -348,11 +348,34 @@ namespace ghostlock::attack {
              * where a $LOG write does not. */
             "  echo \"ENFORCE-RESTORE reason=$e_reason before=${e_before:-unreadable} wrote=$e_wrote readback=${e_after:-unreadable}\"\n"
             "}\n"
+            /* Page-free W1 stores a kernel address across `selinux_state`, so
+             * the caps (and, below 6.6, `checkreqprot`) are damage the fixes
+             * below repair. `checkreqprot` is a cached field, so this read is
+             * the damage itself; the `policy_capabilities` files report the
+             * *policy's* caps (the load target), not the cached
+             * `state->policycap[]` array -- that array is repaired by
+             * `security_load_policycaps()` and its post-load values are the
+             * kernel's own `policy capability ...` dmesg batch. The list is
+             * per family (7 names on 5.10, 8 from 6.6), so the names are
+             * carried in the line instead of a fixed field order. */
+            "selinux_status() {\n"
+            "  st_enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null)\n"
+            "  st_cr=$(cat /sys/fs/selinux/checkreqprot 2>/dev/null)\n"
+            "  st_caps=''\n"
+            "  for f in /sys/fs/selinux/policy_capabilities/*; do\n"
+            "    [ -r \"$f\" ] || continue\n"
+            "    st_caps=\"$st_caps ${f##*/}=$(cat \"$f\" 2>/dev/null)\"\n"
+            "  done\n"
+            "  echo \"enforce=${st_enforce:-unreadable} checkreqprot=${st_cr:-n/a} caps:${st_caps:- unreadable}\"\n"
+            "}\n"
             "if [ \"$(id -u)\" -ne 0 ]; then\n"
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
             "  restore_enforce not-root\n"
             "  exit 1\n"
             "fi\n"
+            /* Before this script's own `checkreqprot` reset, so the line shows
+             * W1's cached damage rather than the repaired byte. */
+            "echo \"[*] selinux status at start: $(selinux_status)\" >>\"$LOG\"\n"
             /* Diagnostics for the Samsung mount path: the init shell's
              * capability set and whether it can mount at all. Unredirected on
              * purpose: the app's files dir may not be writable by this shell,
@@ -572,6 +595,7 @@ namespace ghostlock::attack {
             "  if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
             "    AFTER_POLICYLOAD=$(od -An -tu4 -j12 -N4 /sys/fs/selinux/status 2>/dev/null | tr -d ' ')\n"
             "    echo \"[*] policyload before=$BEFORE_POLICYLOAD after=$AFTER_POLICYLOAD\" >>\"$LOG\"\n"
+            "    echo \"[*] selinux status post-fix: $(selinux_status)\" >>\"$LOG\"\n"
             "    if [ -n \"$AFTER_POLICYLOAD\" ] && [ \"$AFTER_POLICYLOAD\" != \"$BEFORE_POLICYLOAD\" ]; then\n"
             "      break\n"
             "    fi\n"
@@ -584,6 +608,9 @@ namespace ghostlock::attack {
              * the failure-exit enforcing restore and the stage's DFRC verdict
              * can be exercised on a device whose late-load would succeed. */
             "case \"$MODE_TEXT\" in *failfixup*) echo '[*] test: forcing fixup failure' >>\"$LOG\"; FIXUP_RC=1 ;; esac\n"
+            "if [ \"$FIXUP_RC\" -ne 0 ]; then\n"
+            "  echo \"[*] selinux status final: $(selinux_status)\" >>\"$LOG\"\n"
+            "fi\n"
             "echo \"[*] policy fixup rc=$FIXUP_RC\" >>\"$LOG\"\n"
             /* The working copy is spent once the policy loaded: delete it here,
              * not only in the EXIT trap. Measured 2026-10-09: the trap runs in

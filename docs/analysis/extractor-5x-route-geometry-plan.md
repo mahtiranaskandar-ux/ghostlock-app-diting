@@ -597,7 +597,7 @@ and the companion plan's progress section — all committed as `c3aeb69` on the 
    `kernelsnitch.mm_struct_sz` is the SLUB stride, not `sizeof(mm_struct)`, and is not derivable
    from the Image (BTF gives sizeof; slab merging and alignment change the object size — 6.1:
    0x3c0 against 1024). The app cannot read it unprivileged: measured 2026-10-24,
-   `run-as com.ghostlock.app` gets **EACCES** on both `/sys/kernel/slab/mm_struct/object_size`
+   `run-as com.sesame.app` gets **EACCES** on both `/sys/kernel/slab/mm_struct/object_size`
    and `/proc/slabinfo` (`-r--r----- root:log`), and the spray runs before root. The value is
    therefore **measured** wherever a probe can see it, and a candidate set is decided by probe:
    - **The candidate set.** The observed family strides are the 32-multiples

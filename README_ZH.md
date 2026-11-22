@@ -1,8 +1,10 @@
-# 为广泛内核支持及成功率优化的GhostLock
+# Sesame — 为广泛内核支持及成功率优化
 
 > English: [README.md](README.md)
 
 为尚未修补 CVE-2026-43499 漏洞的安卓内核提供临时 root。**三星手机需要同时未修补 CVE-2026-43284。**
+
+本应用在 r11 及之前的版本中名为 GhostLock；漏洞与路线的名称保持不变。
 
 本仓库是 [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app) 的分支。
 **本分支新增3条路线，并优化了决定配置文件导出准确性和漏洞利用成功率的关键部分**。

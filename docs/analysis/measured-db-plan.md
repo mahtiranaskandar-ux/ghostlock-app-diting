@@ -1,5 +1,11 @@
 # Measured database and the profile storage model (2026-10-25)
 
+> **2026-11-19 — superseded on the external-source half.** The SAF reference plus persisted grant
+> was replaced by one app-private imported copy
+> (`filesDir/profiles/imported_profile.conf`); see
+> [external-profile-local-copy-plan.md](external-profile-local-copy-plan.md). The measured DB,
+> the editor, the precedence order and the rest of this model stand.
+
 Status: implementation plan for `feat/measured-db` (PORT-PLAN Priority 1, items 3–6). L-level:
 it changes where profiles live, what the editor persists, and adds a cross-layer contract
 (native root script → app data → UI). No native attack-path change: the root script gains one
@@ -14,13 +20,15 @@ is uncommitted for the operator to review):
   key, refuses an unreadable/newer file), root-script `/proc/slabinfo` capture into
   `$HOME_DIR/.ghostlock_slabinfo`, ingest only after a completed attack run, the raw capture as
   the run's `slabinfo-mm_struct.txt` sidecar, and the read-only Measurements screen (Advanced).
-- **Sources** — `ExternalProfileStore` (SAF read + persisted grant), `ProfileDocumentParser`
-  (includes resolved against bundled assets only), precedence external > builtin > bundled, an
-  unreadable external selection is an error not a fallback, and the selection reference
-  (URI/name/release/sha256/parent) in preferences. The live controller has **no** edit layer.
+- **Sources** — `ExternalProfileStore` (one SAF read at import; the app-private copy is the
+  steady-state source), `ProfileDocumentParser` (includes resolved against bundled assets only),
+  precedence external > builtin > bundled, an unreadable copy is an error not a fallback, and the
+  old selection reference (URI/name/release/sha256/parent) is migrated once and deleted. The live
+  controller has **no** edit layer.
 - **Editor** — the session controller gets a `MemoryOverrideStore`; export through SAF is the
-  only save; diff against the bundle and rebase (bundle becomes the base, edits kept); exported
-  documents carry a `# ghostlock-profile parent=…` lineage comment.
+  only save; diff against the bundle and rebase (bundle becomes the base, edits kept). Exported
+  documents no longer carry a lineage comment (retired 2026-11-19; the copy is kept verbatim, so
+  a header on the source document survives as text).
 - **Merge** — the home card appears when a measured fact differs from the active profile; the
   preview shows field/profile/measured/source/evidence; the export writes a new document and
   offers to select it (never applies the DB automatically).
@@ -72,30 +80,36 @@ model where a profile is a document the user owns rather than an app-data overri
 ### 1. Sources and precedence
 
 A profile document is either a **bundled asset** or an **external file on the SD card**. App
-data keeps no profile documents and no override layer.
+data keeps exactly one **imported copy** of the selected external document
+(`filesDir/profiles/imported_profile.conf`): the active profile, overwritten on every import,
+schema-upgraded in place when the profile schema advances, deleted when the selection is cleared
+or replaced, and never a precedence layer or a document library. The SD card remains the document
+store. The copy is the whole external-profile state: an entry whose `release` matches the running
+kernel decides applicability, and the import reference (URI/name/SHA-256/parent) stays transient.
+The old reference keys are migrated once and deleted.
 
 Live resolution order for the device's release:
 
-1. **External** — the document the user selected with the system picker (SAF, persistable read
-   permission). It wins over the bundle for its release: the bundle stays the default, an
-   explicit selection is an explicit statement.
+1. **External** — the app-private copy of the document the user imported. It wins over the
+   bundle for its release: the bundle stays the default, an explicit import is an explicit
+   statement.
 2. **Builtin** — a hand-picked bundled asset (the existing escape hatch).
 3. **Bundled** — the asset whose `release` equals the device's `uname -r`.
 
-An external selection that can no longer be read (file deleted, permission lost) is an error,
+An imported copy that cannot be read, or that has no entry for the running release, is an error,
 not a silent fallback to the bundle: the run log and the profile screen say why. Clearing the
-selection restores the bundle.
+copy restores the bundle.
 
 **Update 2026-10-26 — the home support flag follows the same model.**
-`isKernelSupported()` = bundled release ∪ legacy `user_profiles` import ∪ the stored external
-selection's release (`releaseSupportedByProfileSources`, covered by `ProfileLayerPolicyTest`).
+`isKernelSupported()` = bundled release ∪ legacy `user_profiles` import ∪ the imported copy's
+existence (`releaseSupportedByProfileSources`, covered by `ProfileLayerPolicyTest`).
 Before this, a device with no bundled profile could select an external document — it loaded —
 but the home stayed "Not supported" and `runExploit()` refused. Device test:
 `external/port/external-profile-support-2026-10-26/` in the port repository.
 
 App data keeps, and only keeps: the bundled assets; the measured DB; the run logs (with the
-per-run `profile.conf`/`profile.bin` and the source metadata); the selected profile's reference
-(URI, display name, release, SHA-256, parent lineage); ordinary settings.
+per-run `profile.conf`/`profile.bin` and the source metadata); the imported profile copy
+(`filesDir/profiles/imported_profile.conf`); the builtin selection; ordinary settings.
 
 The editor never writes app data. Edits live in an in-memory base + sparse map; the only save
 is an export through SAF. An unexported edit is lost, and the UI says so before leaving.
@@ -198,12 +212,16 @@ UI but never merged, so the root ingest records only profile-addressable facts.
 
 External selection reference (preferences):
 
+Pre-2026-11-19 exports carried a `# ghostlock-profile parent=…` first line. The import-copy model
+retired it: the app neither parses nor generates the header, and a header on an imported document
+is preserved as text. The old preference keys below are read only by the one-time migration.
+
 ```
 external_profile_uri, external_profile_name, external_profile_release,
 external_profile_sha256, external_profile_parent, external_profile_parent_sha256
 ```
 
-Export lineage header (first line of an app-exported document):
+Old export lineage header (no longer written):
 
 ```
 # ghostlock-profile parent=<bundled:<release>|external:<name>@<sha8>|builtin:<release>> sha256=<hash>

@@ -27,6 +27,6 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "GhostLock"
+rootProject.name = "Sesame"
 include(":app")
 include(":profile-core")

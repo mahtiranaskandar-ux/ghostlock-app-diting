@@ -36,5 +36,28 @@ int main() {
         for (std::size_t j = 0; j < objects; ++j)
             assert(((j * stride) % 32) == 0);
     }
+
+    using ghostlock::kernelsnitch::clip_scan_range;
+    using ghostlock::kernelsnitch::scan_bounds;
+    using ghostlock::kernelsnitch::scan_has_tail;
+    using ghostlock::kernelsnitch::scan_phase1_ceiling;
+
+    /* Phase 2 exists only for the model tail beyond the built-in ceiling: a
+     * measured span (model end) below it never pays the extra passes, and a
+     * cache whose span exceeds it contributes only its tail. */
+    assert(scan_phase1_ceiling(0x1000, 0x800) == 0x800);
+    assert(scan_phase1_ceiling(0x400, 0x800) == 0x400);
+    assert(!scan_has_tail(0x800, 0x800));
+    assert(!scan_has_tail(0x400, 0x800));
+    assert(scan_has_tail(0x900, 0x800));
+
+    scan_bounds clipped{};
+    assert(clip_scan_range(0x1000, 0x2000, 0x1800, 0x2800, &clipped) &&
+           clipped.start == 0x1800 && clipped.end == 0x2000);
+    assert(clip_scan_range(0x2000, 0x3000, 0x1800, 0x2800, &clipped) &&
+           clipped.start == 0x2000 && clipped.end == 0x2800);
+    assert(clip_scan_range(0x1000, 0x2000, 0x1800, 0x2800, nullptr));
+    assert(!clip_scan_range(0x1000, 0x1700, 0x1800, 0x2800, &clipped));
+    assert(!clip_scan_range(0x2900, 0x3000, 0x1800, 0x2800, &clipped));
     return 0;
 }

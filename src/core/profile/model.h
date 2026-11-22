@@ -555,13 +555,18 @@ namespace ghostlock::profile {
             return (major > 6U || (major == 6U && minor >= 6U)) ? 1U : 2U;
         }
 
-        /* `selinux_state.enforcing`'s byte inside the struct (0 on every
-         * sampled image; stated by the profile so a future layout cannot
-         * silently keep the old constant). */
+        /* `selinux_state.enforcing`'s byte inside the struct. The profile states
+         * it per image; the release fallback covers a profile without the
+         * block — 5.4 keeps the unconditional `disabled` byte (enforcing at
+         * +1), every sampled later family starts at enforcing. */
         [[nodiscard]] uint32_t selinux_enforcing_offset() const noexcept {
-            return loaded_ && values_.selinux.enforcing.has_value()
-                       ? *values_.selinux.enforcing
-                       : 0;
+            if (loaded_ && values_.selinux.enforcing.has_value()) {
+                return *values_.selinux.enforcing;
+            }
+            unsigned major = 0;
+            unsigned minor = 0;
+            release_version(major, minor);
+            return (major == 5U && minor == 4U) ? 1U : 0U;
         }
 
         [[nodiscard]] MulticastWaiterLayout multicast_layout() const noexcept {

@@ -38,6 +38,7 @@ CXX_SRCS := \
   core/route/compat_carrier.cpp \
   core/memory/payload_builder.cpp \
   core/session/runtime_config.cpp \
+  core/session/cpu_select.cpp \
   core/profile/binary.cpp \
   core/support/util.cpp \
   core/session/exploit_session.cpp \
@@ -168,10 +169,10 @@ NATIVE_HOST_TESTS := \
   kernelsnitch_scan_bounds_test route_controller_test pi_race_test \
   tcp_zerocopy_route_test select_stack_route_test sigreturn_route_test \
   target_constants_test native_resource_test \
-  profile_binary_test futex_hash_test scan_grid_test stride_verify_test \
+  profile_binary_test futex_hash_test scan_grid_test stride_verify_test slab_order_test \
   number_parse_test runtime_paths_test runtime_config_test handoff_probe_test victim_context_test \
   run_state_test address_space_test cpp_link_probe_test compat_bitmap_test dirtyfrag_verdict_test \
-  anchor_align_test
+  anchor_align_test cpu_select_test
 
 native-host-tests: $(addprefix $(HOST_BUILD_DIR)/,$(NATIVE_HOST_TESTS))
 	@status=0; for test in $^; do $$test || status=1; done; exit $$status
@@ -262,6 +263,10 @@ $(HOST_BUILD_DIR)/runtime_config_test: core/tests/runtime_config_test.cpp core/s
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
+$(HOST_BUILD_DIR)/cpu_select_test: core/tests/cpu_select_test.cpp core/session/cpu_select.h core/session/cpu_select.cpp
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/cpu_select_test.cpp core/session/cpu_select.cpp core/support/native_resource.cpp -o $@
+
 $(HOST_BUILD_DIR)/backend_contract_test: core/tests/backend_contract_test.cpp \
   core/route/backend_contract.hpp core/route/backend_policy.hpp core/route/component_catalog.hpp \
   core/route/route_policy.hpp core/route/frontend_contract.hpp core/session/stage_types.hpp \
@@ -340,6 +345,10 @@ $(HOST_BUILD_DIR)/scan_grid_test: core/tests/scan_grid_test.cpp core/kernelsnitc
 $(HOST_BUILD_DIR)/stride_verify_test: core/tests/stride_verify_test.cpp core/kernelsnitch/stride_verify.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
+
+$(HOST_BUILD_DIR)/slab_order_test: core/tests/slab_order_test.cpp core/kernelsnitch/slab_order.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore -DTARGET_CONFIG_H=\"kernel/target.h\" $< -o $@
 
 $(HOST_BUILD_DIR)/number_parse_test: core/tests/number_parse_test.cpp core/kernelsnitch/number_parse.h
 	@mkdir -p $(HOST_BUILD_DIR)

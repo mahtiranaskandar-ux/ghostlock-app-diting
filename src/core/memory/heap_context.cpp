@@ -81,6 +81,7 @@ namespace ghostlock::memory {
     void HeapContext::init() {
         snitch = nullptr;
         mm_objs_per_slab = 0;
+        mm_slab_size = 0;
         skb_buffer.reset();
         prepare = MmContextSet{};
         spray = MmContextSet{};

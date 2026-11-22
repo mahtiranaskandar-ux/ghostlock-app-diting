@@ -449,12 +449,13 @@ pub struct ConfInputs<'a> {
 }
 
 /// The two page-free Stage 1 profile blocks.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Stage1Conf {
     pub selinux_enforcing: u32,
     pub selinux_initialized: u32,
-    /// "btf" or "release-template", for the fact header.
-    pub selinux_source: &'static str,
+    /// "btf" or the release template with its config premises, for the fact
+    /// header (provenance, never a gate).
+    pub selinux_source: String,
     pub w1_scratch: Option<crate::anchor::W1Scratch>,
 }
 

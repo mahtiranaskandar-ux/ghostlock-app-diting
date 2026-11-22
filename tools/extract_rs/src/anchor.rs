@@ -494,10 +494,23 @@ pub fn named_candidate(
         }
     }
     all.sort();
-    let (index, (offset, _)) = all
-        .iter()
-        .enumerate()
-        .find(|(_, (_, symbol))| symbol == name)?;
+    let exact = all.iter().enumerate().find(|(_, (_, symbol))| symbol == name);
+    let hit = exact.or_else(|| {
+        /* LTO builds internalize static data as `<name>.llvm.<hash>` (the 5.4
+         * vendor builds' serial8250_ports is one); accept exactly one clone.
+         * Two or more stay ambiguous and fail closed. */
+        let mut clones = all
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, symbol))| {
+                symbol
+                    .strip_prefix(name)
+                    .is_some_and(|suffix| suffix.starts_with(".llvm."))
+            });
+        let first = clones.next()?;
+        clones.next().is_none().then_some(first)
+    })?;
+    let (index, (offset, _)) = hit;
     let extent = all
         .get(index + 1)
         .map(|(next, _)| next.saturating_sub(*offset))
@@ -896,6 +909,40 @@ mod tests {
     fn profile_triple_refuses_a_prefix_shorter_than_one_slot() {
         let a = assessment(0x1f, Verdict::Unsafe);
         assert_eq!(profile_triple(&a), None);
+    }
+
+    #[test]
+    fn named_candidate_resolves_a_unique_lto_clone() {
+        let mut rel = BTreeMap::new();
+        rel.insert("serial8250_ports.llvm.123".to_string(), BTreeSet::from([0x1000]));
+        rel.insert("next".to_string(), BTreeSet::from([0x1c00]));
+        let mut b = bounds(0, 0, 0, 0);
+        b.bss_end = 0x2000;
+        let candidate = named_candidate(&rel, &b, "serial8250_ports").expect("clone");
+        assert_eq!(candidate.name, "serial8250_ports");
+        assert_eq!(candidate.offset, 0x1000);
+        assert_eq!(candidate.extent, 0xc00);
+    }
+
+    #[test]
+    fn named_candidate_refuses_ambiguous_lto_clones() {
+        let mut rel = BTreeMap::new();
+        rel.insert("serial8250_ports.llvm.1".to_string(), BTreeSet::from([0x1000]));
+        rel.insert("serial8250_ports.llvm.2".to_string(), BTreeSet::from([0x1100]));
+        let mut b = bounds(0, 0, 0, 0);
+        b.bss_end = 0x2000;
+        assert!(named_candidate(&rel, &b, "serial8250_ports").is_none());
+    }
+
+    #[test]
+    fn named_candidate_prefers_the_exact_name_over_a_clone() {
+        let mut rel = BTreeMap::new();
+        rel.insert("serial8250_ports".to_string(), BTreeSet::from([0x1000]));
+        rel.insert("serial8250_ports.llvm.1".to_string(), BTreeSet::from([0x1100]));
+        let mut b = bounds(0, 0, 0, 0);
+        b.bss_end = 0x2000;
+        let candidate = named_candidate(&rel, &b, "serial8250_ports").expect("exact");
+        assert_eq!(candidate.offset, 0x1000);
     }
 
     #[test]

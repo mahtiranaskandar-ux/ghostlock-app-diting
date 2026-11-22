@@ -7,7 +7,7 @@
 > 适配新内核的操作步骤见 [README_ZH.md](README_ZH.md)；`execution` 调优建议见 [defaults_ZH.md](defaults_ZH.md)。
 
 > **两个"版本"是彼此独立的东西**（不要当成同一条版本序列）：
-> - **Profile schema 版本**：HOCON 配置代际，由每份 profile 里的 `schema_version` 字段表达（见第 2 节）。
+> - **Profile schema 版本**：HOCON 配置代际，由每份 profile 里的 `schema_version` 字段表达（见第 2 节）。`1` 表示物理字段为标量或缺省；`2` 表示按设备编码的映射。
 > - **Binary wire 版本**：magic `0x0D000721` 之后的 GLK1 传输版本。当前 writer 写 wire version `2`
 >   （对象分段，见第 9 节）；它是唯一版本，Kotlin 与 native 版本绑定。
 >
@@ -72,7 +72,7 @@ offset { init_task = 34464384, init_cred = 34538824 }
 | 字段 | 类型 | 说明 |
 |---|---|---|
 | `release` | string | 必须与设备 `uname -r` 完全一致（区分大小写/后缀）；模板文件不参与匹配 |
-| `schema_version` | int | 固定为 `1` |
+| `schema_version` | int | `1` 或 `2`：物理字段为标量或缺省时用 `1`，按设备映射时必须用 `2` |
 | `kernel_major` | int | `5` 或 `6`；用于地址解析与合法性检查，不再决定路由 |
 | `route` | object | 显式路由父项，只含一个分支，见第 3 节 |
 | `fallback` | object | 回退声明（`to` + 可选 `route` 分支），见第 3 节 |
@@ -180,7 +180,7 @@ cred
 |---|---|
 | `offset.init_task` / `offset.init_cred` | `init_task` / `init_cred` 相对内核镜像基址的偏移 |
 | `offset.root_task_group` | `root_task_group` 偏移 |
-| `offset.selinux_enforcing` | `selinux_state.enforcing` 偏移（W1 写 0） |
+| `offset.selinux_enforcing` | `selinux_state` 符号偏移；字段字节由 `selinux.enforcing` 块补充 |
 | `offset.selinux_blob_sizes` / `offset.security_hook_heads` | SELinux/安全钩子相关偏移 |
 | `offset.slide_nfulnl_logger` / `offset.slide_boot_id` / `offset.slide_loggers_0_1` | 地址滑移（KASLR）定位点 |
 | `kernel_phys_load` | 内核物理加载地址（0 时按 SoC 公式回退） |
@@ -221,14 +221,14 @@ cred
 
 | 字段 | 含义 |
 |---|---|
-| `selinux.enforcing` | `enforcing` 字节的偏移；必须为 `0`（W1 向其写入 0） |
-| `selinux.initialized` | 初始化字节的偏移。page-free 写入值必须使该字节非零；提取器据此选择 scratch。无 BTF 时的回退：6.6 之前为 `2`，6.6 起为 `1` |
+| `selinux.enforcing` | `selinux_state` 内 `enforcing` 字段的字节偏移；5.10/6.x 为 `0`，5.4 系列为 `1`（其 `disabled` 字节无条件存在，使后续字段后移）。W1 写入值的第 0 字节落在此处。 |
+| `selinux.initialized` | W1 写入值中落在初始化字段上的字节（`initialized_struct − enforcing_struct`）。page-free 写入值必须使该字节非零；提取器据此选择 scratch。无 BTF 时的回退：6.6 之前为 `2`，6.6 起为 `1`。 |
 
-提取器在 5.15/6.x 上从 BTF 生成，在 5.10 上从版本模板生成；校验 `enforcing == 0` 且不存在 `disabled`，两者都无见证时失败关闭。缺少该块时使用版本回退。解析器校验 `enforcing == 0` 与 `initialized < 8`。
+提取器在 5.15/6.x 上从 BTF 生成，在 5.10 与 5.4 上从实测版本表生成（表中配置前提仅作为来源记录，不作为门禁）；两者都无见证时失败关闭。缺少该块时使用版本回退（5.4：enforcing `1`、initialized `2`）。解析器将 `enforcing` 与 `initialized` 校验为 `0..7` 内的字节偏移。
 
 ### 4.8 W1 scratch 与 page-free 模式（`w1_scratch`）
 
-`w1_scratch` 指定一个镜像内区域，其直接映射别名作为 W1 的写入值（`alias(image) + 0x100`）：第 0 字节落在 `selinux.enforcing` 上且必须为 0，`selinux.initialized` 处的字节必须非零。提取器通过锁锚扫描选择位置：锚内窗口存在时使用锚内（native 会保留重叠的锁槽），否则使用第二个安全区域。profile 只记录镜像偏移；错误的值会导致内核崩溃。
+`w1_scratch` 指定一个镜像内区域，其直接映射别名作为 W1 的写入值（`alias(image) + 0x100`）：写入目标是字段而非结构体基址，第 0 字节落在 `selinux.enforcing` 上且必须为 0，写入值中第 `selinux.initialized` 字节必须非零。提取器通过锁锚扫描选择位置：锚内窗口存在时使用锚内（native 会保留重叠的锁槽），否则使用第二个安全区域。profile 只记录镜像偏移；错误的值会导致内核崩溃。
 
 | 字段 | 含义 |
 |---|---|
@@ -236,7 +236,7 @@ cred
 
 路由策略支持 page-free（`select_stack`、`sigreturn`、`multicast_waiter`；`tcp_zerocopy` 因假锁是构造的页对象而排除）、profile 带 `w1_scratch.image`、且带该路由的 `lock_anchor_*` 三元组时，本次运行即 page-free。该标志是每次运行的常量，运行存储首行给出：`page_free=1 reason=policy+scratch+anchor`，或 `page_free=0 reason=<第一个缺失条件>`（`route-not-capable` / `no-scratch` / `no-anchor`）。
 
-page-free 路径不调用 `prepare_good_kernel_page()`：无 spray、无 KernelSnitch 泄漏、无回收套接字、无页面接受检查、无 `[spray]` 行、`base=0`。每次写入记录取值来源（W1/W1p 为 scratch，W2 为 `init_cred`，叶子写入为 `target-8`）。基于页的凭据复制/填充与 fops 哨兵仍留在页路径；缺少任一锚的 profile 行为不变。两个键都是可选的，`schema_version` 保持 1；缺省键即页路径。
+page-free 路径不调用 `prepare_good_kernel_page()`：无 spray、无 KernelSnitch 泄漏、无回收套接字、无页面接受检查、无 `[spray]` 行、`base=0`。每次写入记录取值来源（W1/W1p 为 scratch，W2 为 `init_cred`，叶子写入为 `target-8`）。基于页的凭据复制/填充与 fops 哨兵仍留在页路径；缺少任一锚的 profile 行为不变。两个键都是可选的，且不改变 `schema_version`（按设备映射的 profile 仍为 `2`）；缺省键即页路径。
 
 ## 5. execution 调优参数（advisory）
 

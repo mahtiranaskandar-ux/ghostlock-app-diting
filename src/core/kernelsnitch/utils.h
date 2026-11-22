@@ -27,10 +27,12 @@
 #include <sys/ioctl.h>
 #include <sys/types.h>
 #include <sys/prctl.h>
+#include <sys/syscall.h>
 
 #include "number_parse.h"
 #include "support/time.h"
 #include "support/native_resource.hpp"
+#include "support/cpu_affinity.hpp"
 
 #ifdef ANDROID_APP_NO_LKM
 #include <android/log.h>
@@ -141,17 +143,42 @@
 /* CPP02 review: SYSCHK is log-and-continue (it reports the error and returns
  * -1); callers have no better recovery than proceeding, so the form is kept. */
 namespace ghostlock::kernel {
+    /* Pin one thread to one CPU and log the kernel's answer: the return code,
+     * the mask the kernel actually stored, and the CPU the thread is on now.
+     * A successful set with a non-exact readback is logged but does not abort;
+     * the callers that need an enforced pin use the race's verified path. */
     static inline void pin_to_core(size_t core) {
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
-        CPU_SET(core, &cpuset);
-        SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
+        const auto pinned = cpu_affinity::pin_current_thread(static_cast<int>(core));
+        char allowed[128] = "unreadable";
+        if (pinned.readback_ok) {
+            cpu_affinity::format_mask(pinned.mask, allowed, sizeof(allowed));
+        }
+#if defined(SYS_gettid)
+        const long tid = static_cast<long>(syscall(SYS_gettid));
+#else
+        const long tid = 0;
+#endif
+        pr_info("pin: tid=%ld core=%zu rc=%d errno=%d now_cpu=%d allowed=%s%s\n",
+                tid, core, pinned.set_ok ? 0 : -1, pinned.error, pinned.now_cpu,
+                allowed, (pinned.set_ok && !pinned.exact) ? " (not exact)" : "");
+        if (!pinned.set_ok) {
+            errno = pinned.error;
+            pr_error("SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset)): %m\n");
+        }
     }
 
     static inline void reset_cpu_pin(void) {
-        cpu_set_t cpuset;
-        memset(&cpuset, 0xff, sizeof(cpu_set_t));
-        SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
+        const auto pinned = cpu_affinity::pin_all_current_thread();
+        char allowed[128] = "unreadable";
+        if (pinned.readback_ok) {
+            cpu_affinity::format_mask(pinned.mask, allowed, sizeof(allowed));
+        }
+        pr_info("pin reset: rc=%d errno=%d now_cpu=%d allowed=%s\n",
+                pinned.set_ok ? 0 : -1, pinned.error, pinned.now_cpu, allowed);
+        if (!pinned.set_ok) {
+            errno = pinned.error;
+            pr_error("SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset)): %m\n");
+        }
     }
 
     /* CPP02 review: same log-and-continue retention as pin_to_core(). */

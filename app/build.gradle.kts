@@ -13,7 +13,7 @@ plugins {
 // Keep this module's output under the repository-root build/ directory.
 layout.buildDirectory.set(rootProject.layout.buildDirectory.dir("app"))
 
-val appName = "GhostLock"
+val appName = "Sesame"
 val appVersionName = "1.2"
 
 val gitVersionCode = runCatching {
@@ -50,7 +50,7 @@ val generateBuildInfo = tasks.register("generateBuildInfo") {
     // Always rewrite so the debug UI shows the timestamp of the installed build.
     outputs.upToDateWhen { false }
     doLast {
-        val directory = outputDirectory.get().asFile.resolve("com/ghostlock/app")
+        val directory = outputDirectory.get().asFile.resolve("com/sesame/app")
         directory.mkdirs()
         // CPP-BUILD-02: this task is the only writer of the directory, so any
         // other file is a stale duplicate that must not reach the Kotlin build.
@@ -60,7 +60,7 @@ val generateBuildInfo = tasks.register("generateBuildInfo") {
             .format(Date(timeMillis))
         directory.resolve("BuildInfo.kt").writeText(
             buildString {
-                appendLine("package com.ghostlock.app")
+                appendLine("package com.sesame.app")
                 appendLine()
                 appendLine("/** Generated per build; shown only by debug builds. */")
                 appendLine("object BuildInfo {")
@@ -73,14 +73,14 @@ val generateBuildInfo = tasks.register("generateBuildInfo") {
 }
 
 android {
-    namespace = "com.ghostlock.app"
+    namespace = "com.sesame.app"
     compileSdk {
         version = release(37) {
             minorApiLevel = 2
         }
     }
     defaultConfig {
-        applicationId = "com.ghostlock.app"
+        applicationId = "com.sesame.app"
         minSdk = 31
         targetSdk = 37
         versionCode = gitVersionCode

@@ -67,7 +67,10 @@ namespace ghostlock::support {
 
     void prepare_ctxs(void);
 
-    int32_t prepare_skb_payload(uintptr_t base, const ghostlock::memory::WriteRequest *request);
+    int32_t prepare_skb_payload(uintptr_t base,
+                                std::size_t slab_size,
+                                std::size_t send_size,
+                                const ghostlock::memory::WriteRequest *request);
 
     /* leak_only: run the spray and the mm_struct leak, then tear the spray
      * down without preparing a payload page. Used by the profile-generation

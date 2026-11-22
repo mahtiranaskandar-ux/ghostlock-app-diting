@@ -87,6 +87,9 @@ namespace ghostlock::race {
         std::atomic<int32_t> consumer_calls;
         std::atomic<int32_t> consumer_success;
         std::atomic<int32_t> consumer_inflight;
+        /* Set by a worker whose verified CPU pin failed; the race then reports
+         * ROUTE_RETRYABLE / step 34 instead of running the dance. */
+        std::atomic<int32_t> cpu_error;
         std::atomic<uint32_t> route_delay_usec;
         std::atomic<int32_t> fast_repair;
 

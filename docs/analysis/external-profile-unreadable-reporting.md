@@ -4,6 +4,11 @@ Level: **M** — app-only Kotlin (snapshot field, home status card, one toast, o
 fact). No native, wire, profile-schema or route change; no device run is needed to design it, and
 the host gates plus one device check are the acceptance.
 
+**Superseded 2026-11-19 on the SAF half.** The import-copy model
+(`external-profile-local-copy-plan.md`) removes the steady-state URI read, so the inode-swap
+failure cannot recur; the read-failure state is repurposed for the app-private copy. The design
+below is history.
+
 **Status 2026-11-14.** Implemented (uncommitted on `document`); host gates green
 (`:app:testDebugUnitTest` 244/0, `:profile-core:test`, `assembleDebug` 748) and the device
 acceptance passed on the diting: with the selected document deleted the home reads 配置无法读取 /

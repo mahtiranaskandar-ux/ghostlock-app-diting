@@ -15,6 +15,8 @@
 
 #include "compat/carrier_engine.h"
 
+#include "support/cpu_affinity.hpp"
+
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/futex.h>
@@ -22,6 +24,7 @@
 #include <pthread.h>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <sched.h>
 #include <signal.h>
 #include <stdint.h>
@@ -124,6 +127,18 @@ namespace {
         std::atomic<int> consumer_inflight{0};
         std::atomic<int> route_done{0};
         std::atomic<int> waiter_tid{0};
+        /* Set when a thread's CPU pin did not take effect (cpuset ceiling or a
+         * vendor affinity override). The dance is refused, not run blind. */
+        std::atomic<int> cpu_error{0};
+        /* The pair handshake before the dance: each thread reads its current
+         * CPU, re-pins (preferred, then the highest available), reads back and
+         * reports the effective CPU; the main thread requires two distinct
+         * reported CPUs and may ask the consumer to re-resolve a constant
+         * number of times. */
+        std::atomic<int> cpu_eff[2];   /* 0 = waiter, 1 = consumer */
+        std::atomic<int> cpu_ready[2];
+        std::atomic<int> cpu_go{0};
+        std::atomic<int> cpu_retry{0};
         uint32_t wait_futex = 0;
         uint32_t target_futex = 0;
         uint32_t chain_futex = 0;
@@ -240,11 +255,106 @@ namespace {
         return &storage->t32;
     }
 
-    void pin_cpu(uint32_t cpu) noexcept {
-        cpu_set_t set;
-        CPU_ZERO(&set);
-        CPU_SET(static_cast<int>(cpu), &set);
-        (void) sched_setaffinity(0, sizeof(set), &set);
+    /* Pin one thread and verify the kernel kept it. A cpuset ceiling or a
+     * vendor affinity override can accept or silently rewrite the request; the
+     * shared helper's exact readback is the only truth. */
+    bool pin_cpu(uint32_t cpu) noexcept {
+        return ghostlock::cpu_affinity::pin_current_thread(static_cast<int>(cpu)).exact;
+    }
+
+    /* The available-highest fallback. The universe is every CPU the process
+     * may actually use, never the calling thread's current mask: the helper
+     * is forked from a main thread already pinned to one CPU, so that mask
+     * can be a single CPU while the cpuset still permits others (the real
+     * 6.1.134 report: preferred 4 refused, fallback saw only {7} and gave
+     * up with -1). Each candidate is accepted only when pin_cpu()'s readback
+     * says the pin took effect, so a vendor affinity override (setaffinity
+     * returns success, readback differs) is skipped instead of retried.
+     * Ranks by cpuinfo_max_freq (the cluster order the native picker uses)
+     * and never returns the other thread's CPU. The shared probe restores
+     * the thread's mask after each candidate; resolve_cpu() pins the chosen
+     * CPU again. */
+    int fallback_cpu(int exclude) noexcept {
+        int best = -1;
+        long best_khz = -1;
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+            if (cpu == exclude) continue;
+            if (!ghostlock::cpu_affinity::probe_cpu(cpu)) continue;
+            char path[96];
+            std::snprintf(path, sizeof(path),
+                          "/sys/devices/system/cpu/cpu%d/cpufreq/cpuinfo_max_freq", cpu);
+            long khz = 0;
+            if (FILE *f = std::fopen(path, "r")) {
+                char buffer[32] = {};
+                if (std::fgets(buffer, sizeof(buffer), f)) khz = std::strtol(buffer, nullptr, 10);
+                std::fclose(f);
+            }
+            if (khz > best_khz) {
+                best_khz = khz;
+                best = cpu;
+            }
+        }
+        return best;
+    }
+
+    /* The kernel's own answer to "which CPUs can this 32-bit thread use":
+     * probe a single-CPU mask on every possible CPU; a core without AArch32
+     * EL0 refuses it. Logged once per helper invocation. */
+    void log_compat_cpus_once() noexcept {
+        static bool logged = false;
+        if (logged) return;
+        logged = true;
+        cpu_set_t capable;
+        CPU_ZERO(&capable);
+        int first_error = 0;
+        for (int cpu = 0; cpu < CPU_SETSIZE; cpu++) {
+            int error = 0;
+            if (ghostlock::cpu_affinity::probe_cpu(cpu, nullptr, &error)) {
+                CPU_SET(cpu, &capable);
+            } else if (first_error == 0) {
+                first_error = error;
+            }
+        }
+        char mask[256] = "unreadable";
+        ghostlock::cpu_affinity::format_mask(capable, mask, sizeof(mask));
+        char line[320];
+        std::snprintf(line, sizeof(line),
+                      "compat-engine: aarch32 cpus=%s first_error=%d",
+                      mask, first_error);
+        log_line(line);
+    }
+
+    /* Before the dance: log the CPU the thread is on, try the preferred CPU,
+     * fall back to the highest usable one, verify the readback and log it.
+     * Constant retries; false when no attempt satisfies the condition. */
+    bool resolve_cpu(Engine *engine, int role, uint32_t preferred, int exclude,
+                     const char *name) noexcept {
+        log_compat_cpus_once();
+        for (int attempt = 0; attempt < 4; attempt++) {
+            const int before = sched_getcpu();
+            const int target = attempt == 0
+                                   ? static_cast<int>(preferred)
+                                   : fallback_cpu(exclude);
+            char line[160];
+            std::snprintf(line, sizeof(line),
+                          "compat-engine: %s cpu before=%d target=%d attempt=%d",
+                          name, before, target, attempt);
+            log_line(line);
+            if (target >= 0 && target != exclude &&
+                pin_cpu(static_cast<uint32_t>(target))) {
+                std::snprintf(line, sizeof(line),
+                              "compat-engine: %s cpu after=%d target=%d ok",
+                              name, sched_getcpu(), target);
+                log_line(line);
+                engine->cpu_eff[role].store(target);
+                return true;
+            }
+            std::snprintf(line, sizeof(line),
+                          "compat-engine: %s cpu target=%d refused", name, target);
+            log_line(line);
+            usleep(1000);
+        }
+        return false;
     }
 
     int32_t open_never_ready() noexcept {
@@ -314,7 +424,17 @@ namespace {
     void *waiter_main(void *arg) {
         auto *engine = static_cast<Engine *>(arg);
         const CarrierCommand &command = *engine->cmd;
-        pin_cpu(command.waiter_cpu);
+        if (!resolve_cpu(engine, 0, command.waiter_cpu, -1, "waiter")) {
+            engine->cpu_error.store(1);
+            engine->consumer_stop.store(1);
+            engine->owner_stop.store(1);
+            return nullptr;
+        }
+        engine->cpu_ready[0].store(1);
+        while (!engine->cpu_go.load()) {
+            if (engine->cpu_error.load() != 0) return nullptr;
+            relax();
+        }
         engine->waiter_tid.store(static_cast<int32_t>(syscall(__NR_gettid)));
         log_line("compat-engine: waiter start");
         if (futex_op(command, &engine->chain_futex, FUTEX_LOCK_PI, 0, nullptr,
@@ -355,6 +475,18 @@ namespace {
             route_fd = static_cast<int32_t>(
                 syscall(__NR_socket, AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0));
             if (route_fd >= 0) {
+                /* Exactly before the dangerous part: re-read, re-pin and verify.
+                 * The stamp is placed by the setsockopt below, so a syscall
+                 * here cannot clobber anything. */
+                const int pre_cpu = sched_getcpu();
+                log_value("compat-engine: waiter pre-copy cpu", pre_cpu);
+                if (!pin_cpu(static_cast<uint32_t>(engine->cpu_eff[0].load()))) {
+                    engine->cpu_error.store(1);
+                    engine->consumer_stop.store(1);
+                    engine->owner_stop.store(1);
+                    log_line("compat-engine: waiter cpu changed before the copy; refusing");
+                    return nullptr;
+                }
                 errno = 0;
                 const long set = syscall(
                     __NR_setsockopt, route_fd, IPPROTO_IP,
@@ -368,7 +500,8 @@ namespace {
                  * userspace only (vDSO clock, yield). */
                 engine->consumer_go.store(1);
                 for (uint64_t spin = 0;
-                     spin < kDriveSpins && engine->consumer_calls.load() == 0;
+                     spin < kDriveSpins && engine->consumer_calls.load() == 0 &&
+                     engine->cpu_error.load() == 0;
                      spin++) {
                     relax();
                 }
@@ -456,7 +589,38 @@ namespace {
     void *consumer_main(void *arg) {
         auto *engine = static_cast<Engine *>(arg);
         const CarrierCommand &command = *engine->cmd;
-        pin_cpu(command.consumer_cpu);
+        /* Serialize on the waiter (the stamp holder): its effective CPU is the
+         * one to avoid. Userspace spin only -- a lock here would be a futex
+         * syscall on the very stacks the dance depends on. */
+        const int64_t wait_deadline = now_ms() + 2000;
+        while (engine->cpu_eff[0].load() < 0) {
+            if (engine->cpu_error.load() != 0) return nullptr;
+            if (now_ms() >= wait_deadline) {
+                engine->cpu_error.store(1);
+                engine->consumer_stop.store(1);
+                engine->owner_stop.store(1);
+                log_line("compat-engine: consumer timed out waiting for the waiter cpu");
+                return nullptr;
+            }
+            relax();
+        }
+        int seen_retry = engine->cpu_retry.load();
+        for (;;) {
+            const int exclude = engine->cpu_eff[0].load();
+            if (!resolve_cpu(engine, 1, command.consumer_cpu, exclude, "consumer")) {
+                engine->cpu_error.store(1);
+                engine->consumer_stop.store(1);
+                engine->owner_stop.store(1);
+                return nullptr;
+            }
+            engine->cpu_ready[1].store(1);
+            while (!engine->cpu_go.load() && engine->cpu_retry.load() == seen_retry) {
+                if (engine->cpu_error.load() != 0) return nullptr;
+                relax();
+            }
+            if (engine->cpu_go.load()) break;
+            seen_retry = engine->cpu_retry.load();
+        }
         int32_t seen = 0;
         while (!engine->consumer_stop.load()) {
             const int32_t sequence = engine->consumer_go.load();
@@ -482,6 +646,14 @@ namespace {
                      * stack) and clobber the stamp under the walk. */
                     engine->consumer_inflight.store(1);
                     engine->consumer_calls.fetch_add(1);
+                    const int walk_cpu = sched_getcpu();
+                    if (walk_cpu != engine->cpu_eff[1].load() ||
+                        !pin_cpu(static_cast<uint32_t>(engine->cpu_eff[1].load()))) {
+                        log_value("compat-engine: consumer cpu changed before the walk", walk_cpu);
+                        engine->cpu_error.store(1);
+                        engine->consumer_stop.store(1);
+                        break;
+                    }
                     SchedAttr attr {};
                     attr.size = sizeof(attr);
                     attr.sched_policy = 3; /* SCHED_BATCH */
@@ -516,6 +688,58 @@ namespace {
         }
         return nullptr;
     }
+
+    /* The pre-dance CPU pair handshake. Both threads have already been
+     * created; this waits for their verified pins, requires two distinct
+     * CPUs, and lets the consumer re-resolve a constant number of times.
+     * On refusal it fills the retryable step-34 result and stops the
+     * threads; on success it logs the effective pair. */
+    bool run_pair_handshake(Engine *engine, const CarrierCommand &command,
+                            CarrierResult *result, int *waiter_cpu,
+                            int *consumer_cpu) noexcept {
+        bool pair_error = false;
+        int waiter = -1;
+        int consumer = -1;
+        for (int round = 0; round < 4; round++) {
+            const int64_t pair_deadline = now_ms() + 2000;
+            while ((engine->cpu_ready[0].load() == 0 ||
+                    engine->cpu_ready[1].load() == 0) &&
+                   now_ms() < pair_deadline && engine->cpu_error.load() == 0) {
+                sleep_poll(command);
+            }
+            waiter = engine->cpu_eff[0].load();
+            consumer = engine->cpu_eff[1].load();
+            if (engine->cpu_error.load() != 0 || engine->cpu_ready[0].load() == 0 ||
+                engine->cpu_ready[1].load() == 0 || waiter < 0 || consumer < 0) {
+                pair_error = true;
+                break;
+            }
+            if (waiter != consumer) break;
+            if (round == 3) {
+                pair_error = true;
+                break;
+            }
+            log_line("compat-engine: cpu pair equal; re-resolving the consumer");
+            engine->cpu_ready[1].store(0);
+            engine->cpu_retry.fetch_add(1);
+        }
+        if (pair_error) {
+            engine->cpu_error.store(1);
+            engine->consumer_stop.store(1);
+            engine->owner_stop.store(1);
+            result->status = static_cast<uint32_t>(kRouteRetryable);
+            result->step = 34;
+            result->error_number = EINVAL;
+            result->kernel_disarmed = 0;
+            log_line("compat-engine: cpu pair never satisfied; refusing the dance");
+            return false;
+        }
+        log_value("compat-engine: waiter effective cpu", waiter);
+        log_value("compat-engine: consumer effective cpu", consumer);
+        if (waiter_cpu) *waiter_cpu = waiter;
+        if (consumer_cpu) *consumer_cpu = consumer;
+        return true;
+    }
 } // namespace
 
 namespace ghostlock::compat {
@@ -526,6 +750,8 @@ namespace ghostlock::compat {
     void run_carrier_attempt(const CarrierCommand &command, CarrierResult *result) {
         Engine engine;
         engine.cmd = &command;
+        engine.cpu_eff[0].store(-1);
+        engine.cpu_eff[1].store(-1);
         result->status = static_cast<uint32_t>(kRouteRetryable);
 
         FdPlan plan;
@@ -561,14 +787,34 @@ namespace ghostlock::compat {
             return;
         }
 
+        /* The CPU pair handshake, before anything dangerous. */
+        if (!run_pair_handshake(&engine, command, result, nullptr, nullptr)) {
+            return;
+        }
+        engine.cpu_go.store(1);
+
         const int64_t deadline = now_ms() + static_cast<int64_t>(command.route_done_timeout_ms);
         bool dirty = false;
         while (!engine.waiter_waiting.load() || !engine.owner_started.load()) {
+            if (engine.cpu_error.load()) break;
             if (now_ms() >= deadline) {
                 dirty = true;
                 break;
             }
             sleep_poll(command);
+        }
+        if (engine.cpu_error.load()) {
+            /* One of the two CPUs did not take the pin. Running the dance on
+             * the waiter's CPU is the first-call strip clobber (2026-11-16
+             * reproduction); refuse cleanly and let the native back off. */
+            engine.consumer_stop.store(1);
+            engine.owner_stop.store(1);
+            result->status = static_cast<uint32_t>(kRouteRetryable);
+            result->step = 34;
+            result->error_number = EINVAL;
+            result->kernel_disarmed = 0;
+            log_line("compat-engine: cpu pair unusable; refusing the dance");
+            return;
         }
         if (!dirty) {
             if (command.setup_settle_us != 0) sleep_us(command.setup_settle_us);
@@ -583,8 +829,19 @@ namespace ghostlock::compat {
                                            &engine.target_futex, 0);
             log_value("compat-engine: CMP_REQUEUE_PI ret", requeued);
             log_value("compat-engine: CMP_REQUEUE_PI errno", errno);
-            while (!engine.route_done.load() && now_ms() < deadline) {
+            while (!engine.route_done.load() && now_ms() < deadline &&
+                   engine.cpu_error.load() == 0) {
                 sleep_poll(command);
+            }
+            if (engine.cpu_error.load() != 0) {
+                engine.consumer_stop.store(1);
+                engine.owner_stop.store(1);
+                result->status = static_cast<uint32_t>(kRouteRetryable);
+                result->step = 34;
+                result->error_number = EINVAL;
+                result->kernel_disarmed = 0;
+                log_line("compat-engine: cpu changed under the dance; refusing");
+                return;
             }
             if (!engine.route_done.load()) dirty = true;
         }
@@ -640,5 +897,58 @@ namespace ghostlock::compat {
         log_value("compat-engine: status", static_cast<long>(result->status));
         log_value("compat-engine: calls", calls);
         log_value("compat-engine: successes", successes);
+    }
+
+    int32_t run_pair_test(int32_t waiter_cpu, int32_t consumer_cpu) noexcept {
+        /* Test-only: the handshake alone, so a device can produce (and after a
+         * fix, recover from) a refused preferred CPU without running the
+         * dance. The engine and command are leaked on purpose: the helper
+         * process exits as soon as the verdict is printed. */
+        auto *command = new CarrierCommand;
+        command->mode = static_cast<uint32_t>(CarrierMode::Run);
+        command->waiter_cpu = static_cast<uint32_t>(waiter_cpu);
+        command->consumer_cpu = static_cast<uint32_t>(consumer_cpu);
+        command->state_poll_us = 1000;
+        auto *engine = new Engine;
+        engine->cmd = command;
+        engine->cpu_eff[0].store(-1);
+        engine->cpu_eff[1].store(-1);
+        /* Test-only: show the mask the engine's threads will inherit, so a
+         * vendor affinity override or a taskset/cpuset setup is visible. */
+        cpu_set_t initial {};
+        if (sched_getaffinity(0, sizeof(initial), &initial) == 0) {
+            int first = -1;
+            int last = -1;
+            int count = 0;
+            for (int i = 0; i < CPU_SETSIZE; i++) {
+                if (!CPU_ISSET(i, &initial)) continue;
+                if (first < 0) first = i;
+                last = i;
+                count++;
+            }
+            char line[96];
+            snprintf(line, sizeof(line),
+                     "compat-engine: pair test entry cpus first=%d last=%d count=%d",
+                     first, last, count);
+            log_line(line);
+        }
+        CarrierResult result;
+        pthread_t consumer_thread {};
+        pthread_t waiter_thread {};
+        int32_t thread_error =
+            pthread_create(&consumer_thread, nullptr, consumer_main, engine);
+        if (thread_error == 0) {
+            thread_error = pthread_create(&waiter_thread, nullptr, waiter_main, engine);
+        }
+        if (thread_error != 0) {
+            log_line("compat-engine: pair test thread create failed");
+            return 41;
+        }
+        if (!run_pair_handshake(engine, *command, &result, nullptr, nullptr)) {
+            log_line("compat-engine: pair test: no pair");
+            return result.step;
+        }
+        log_line("compat-engine: pair test: pair established");
+        return 0;
     }
 } // namespace ghostlock::compat

@@ -10,9 +10,10 @@
  * The slab-stride verifier.
  *
  * After a KernelSnitch leak the address is a real mm_struct object start in
- * its order-3 slab, so its offset inside the 32 KiB slab (leaked & 0x7fff)
- * is j * stride for some object index j. Every clean round casts one vote
- * for each candidate stride that divides its offset.
+ * its slab, so its offset inside the slab the caller masks with (leaked &
+ * (slab_size - 1); the page path's derived order, 32 KiB on the sampled
+ * families) is j * stride for some object index j. Every clean round casts
+ * one vote for each candidate stride that divides its offset.
  *
  * The candidate window is the 64-byte grid in [800, 1400]: mm_struct is
  * created with SLAB_HWCACHE_ALIGN and the arm64 cache line is 64 B, so the

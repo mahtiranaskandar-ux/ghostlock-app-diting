@@ -22,6 +22,13 @@ namespace ghostlock::compat {
      * A dirty outcome (status 3) leaves the process safe to exit; the caller
      * writes the result and exits 70 to mirror the native's dirty stop. */
     void run_carrier_attempt(const CarrierCommand &command, CarrierResult *result);
+
+    /* Test-only: create the waiter and consumer threads, run the pre-dance
+     * CPU pair handshake for the two given CPUs, and return before any route
+     * setup. 0 when a distinct, readback-verified pair was established; the
+     * refusal step (34 or 41) otherwise. The process must exit afterwards:
+     * the threads and their engine/command are intentionally leaked. */
+    int32_t run_pair_test(int32_t waiter_cpu, int32_t consumer_cpu) noexcept;
 } // namespace ghostlock::compat
 
 #endif

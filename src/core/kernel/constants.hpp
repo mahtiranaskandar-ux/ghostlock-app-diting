@@ -15,6 +15,10 @@ namespace ghostlock::kernel {
     inline constexpr long long SKB_DATA_DELTA = -0xe80LL;
     inline constexpr unsigned long MM_STRUCT_SZ = 0x500;
 
+    /* The compiled page-path geometry: the 8-CPU order on every sampled
+     * family. prepare_kernel_page() derives the runtime order (kernelsnitch/
+     * slab_order.h); these constants stay the default and the tcp payload's
+     * requirement. */
     inline constexpr unsigned MM_ORDER = 3;
     inline constexpr unsigned MM_PARTIALS = 5;
 

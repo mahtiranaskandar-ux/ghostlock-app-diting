@@ -1,5 +1,6 @@
 #include "common.h"
 #include "session/runtime_config.h"
+#include "session/cpu_select.h"
 #include "session/runtime_paths.h"
 
 using namespace ghostlock;
@@ -15,7 +16,7 @@ static void runtime_config_init_cpus(config::RuntimeConfig *config) {
 
     cpu_set_t allowed;
     /* both CPU ids are range-checked against CPU_SETSIZE by init_cpus */
-    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0 &&
+    if (ghostlock::cpu_affinity::read_mask(&allowed) &&
         (!CPU_ISSET(config->main_cpu, &allowed) || // NOLINT(clang-analyzer-security.ArrayBound)
          !CPU_ISSET(config->consumer_cpu, &allowed))) { // NOLINT(clang-analyzer-security.ArrayBound)
         pr_warning("cores %d/%d not in allowed cpuset; falling back to 0/1\n",
@@ -37,7 +38,7 @@ static int32_t runtime_config_validate_cpus(config::RuntimeConfig *config) {
         return -1;
     }
     cpu_set_t allowed;
-    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0 &&
+    if (ghostlock::cpu_affinity::read_mask(&allowed) &&
         (!CPU_ISSET(config->main_cpu, &allowed) || // NOLINT(clang-analyzer-security.ArrayBound)
          !CPU_ISSET(config->consumer_cpu, &allowed))) { // NOLINT(clang-analyzer-security.ArrayBound)
         pr_warning("profile cores %d/%d not in allowed cpuset\n",
@@ -59,6 +60,27 @@ int32_t ghostlock::config::RuntimeConfig::apply_profile(const profile::TargetPro
     if (runtime_config_validate_cpus(this) != 0) {
         main_cpu = old_main;
         consumer_cpu = old_consumer;
+    }
+    /* The profile pair is a recommendation, not a fact: a CPU in the allowed
+     * mask can still refuse sched_setaffinity (cpuset ceiling, vendor
+     * cpu_active), and the customer devices differ in which core is big. Pick
+     * the two highest-frequency CPUs that accept a pin right now; the pair
+     * only has to be two distinct cores. */
+    const auto candidates = cpu_select::available_candidates();
+    int runtime_main = -1;
+    int runtime_consumer = -1;
+    for (const auto &candidate : candidates) {
+        pr_info("cpu select: usable cpu%d max_khz=%ld\n", candidate.cpu,
+                candidate.max_khz);
+    }
+    if (cpu_select::select_pair(candidates, &runtime_main, &runtime_consumer)) {
+        pr_info("cpu select: runtime pair main=%d consumer=%d (usable=%zu)\n",
+                runtime_main, runtime_consumer, candidates.size());
+        main_cpu = runtime_main;
+        consumer_cpu = runtime_consumer;
+    } else {
+        pr_warning("cpu select: fewer than two usable CPUs; keeping the profile "
+                   "pair %d/%d\n", main_cpu, consumer_cpu);
     }
     return 0;
 }

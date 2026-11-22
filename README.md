@@ -1,9 +1,11 @@
-# GhostLock — broad kernel support, measured success
+# Sesame — broad kernel support, measured success
 
 > 中文: [README_ZH.md](README_ZH.md)
 
 Temporary root for Android kernels that have not yet patched CVE-2026-43499. **Samsung phones must
 also be unpatched for CVE-2026-43284.**
+
+The app was released as GhostLock through r11; the exploit and route names are unchanged.
 
 This repository is a fork of [YuKongA/ghostlock-app](https://github.com/YuKongA/ghostlock-app).
 **This branch rebuilds the parts of the pipeline that decide whether a generated profile is

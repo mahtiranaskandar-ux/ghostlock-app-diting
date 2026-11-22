@@ -100,6 +100,36 @@ int32_t main(void) {
         return 1;
     }
 
+    /* Page-free Stage 1 selinux offsets: a stated block wins on every family;
+     * a block-less profile falls back by release — 5.4 keeps the unconditional
+     * `disabled` byte (enforcing at +1) while 5.10/6.x start at enforcing, and
+     * initialized's value byte is 2 below 6.6 / 1 from 6.6. */
+    decoded.selinux = {};
+    decoded.uname_r = "5.4.274-qgki-g76ac0b265f44";
+    ghostlock::profile::TargetProfile selinux_54 =
+            ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.uname_r = "5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284";
+    ghostlock::profile::TargetProfile selinux_510 =
+            ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.uname_r = "6.6.66-android15-8-g29d86c5fc9dd-abogki428889875-4k";
+    ghostlock::profile::TargetProfile selinux_66 =
+            ghostlock::profile::TargetProfile::from(&decoded);
+    decoded.uname_r = "5.4.274-qgki-g76ac0b265f44";
+    decoded.selinux = {.enforcing = 1, .initialized = 2};
+    ghostlock::profile::TargetProfile selinux_54_stated =
+            ghostlock::profile::TargetProfile::from(&decoded);
+    if (selinux_54.selinux_enforcing_offset() != 1 ||
+        selinux_54.selinux_initialized_offset() != 2 ||
+        selinux_510.selinux_enforcing_offset() != 0 ||
+        selinux_510.selinux_initialized_offset() != 2 ||
+        selinux_66.selinux_enforcing_offset() != 0 ||
+        selinux_66.selinux_initialized_offset() != 1 ||
+        selinux_54_stated.selinux_enforcing_offset() != 1 ||
+        selinux_54_stated.selinux_initialized_offset() != 2) {
+        fputs("selinux layout offset test failed\n", stderr);
+        return 1;
+    }
+
     puts("target profile snapshot/accessor test passed");
     return 0;
 }
