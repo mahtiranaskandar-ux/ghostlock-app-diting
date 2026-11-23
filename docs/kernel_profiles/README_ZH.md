@@ -5,8 +5,8 @@
 GhostLock 用 `uname -r` 精确匹配内核版本：匹配不到时应用会直接拒绝运行。
 因此你通常不需要改代码，只要为新内核补一份 profile（一份 HOCON 配置）。
 
-> 只有内核几何（符号与结构体偏移）是必填项。`recommend_shizuku` 和 `execution`
-> 里的重试次数、等待时间都是建议值：profile 可以省略，省略时使用随包默认值
+> 只有内核几何（符号与结构体偏移）是必填项。`execution` 里的重试次数、等待时间
+> 都是建议值：profile 可以省略，省略时使用随包默认值
 > （见[公共执行默认值](defaults_ZH.md)）。
 
 ## 开始之前
@@ -73,8 +73,7 @@ GhostLock 用 `uname -r` 精确匹配内核版本：匹配不到时应用会直�
 
 5. **逐字段转录并自检。**
    字段含义与必填要求见 [Profile 结构文档](PROFILE_SCHEMA_ZH.md)。
-   确认所有必填的 `off_*` 非零，task/cred 布局来自同一镜像，然后按需设置
-   `recommend_shizuku`（默认 `0`；只有 5.15 的 multicast 配置建议开启）。
+   确认所有必填的 `off_*` 非零，task/cred 布局来自同一镜像。
 
 6. **确有必要时才改 `execution`。**
    没有真机实测证据就保留[公共默认值](defaults_ZH.md)；也可以先在 App 的参数覆盖页试（见下节），确认后再写回 profile。

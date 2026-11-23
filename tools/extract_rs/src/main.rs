@@ -1057,14 +1057,20 @@ fn run(cli: &Cli) -> Result<i32> {
                     if let Some(path) = &cli.feasible_out {
                         write_feasible_out(path, release_text, &route_verdicts, None)?;
                     }
-                    eprintln!(
-                        "error: more than one feasible route ({}); pass --route",
-                        routes.join(", ")
-                    );
-                    if cli.options_out.is_some() {
-                        ambiguous = true;
+                    if cli.format == "conf" {
+                        /* The storage/export form is the superset: every
+                         * feasible route is written and the app's route picker
+                         * resolves the choice at run time. */
+                        eprintln!(
+                            "info: more than one feasible route ({}); writing the superset",
+                            routes.join(", ")
+                        );
                         None
                     } else {
+                        eprintln!(
+                            "error: more than one feasible route ({}); pass --route",
+                            routes.join(", ")
+                        );
                         return Ok(7);
                     }
                 }
@@ -1663,10 +1669,11 @@ fn run(cli: &Cli) -> Result<i32> {
             layouts: Some(&layouts),
             stage1: stage1.clone(),
         };
-        /* The option superset, written once the common profile facts exist so
-         * it can be cut into any plan. An ambiguous route set reaches this
-         * point and exits 7 below, after the document is on disk. */
-        if let Some(path) = &cli.options_out {
+        /* The option superset, built once the common profile facts exist: it
+         * feeds the conf superset (the app's route picker) and, with
+         * --options-out, the store document. A route ambiguity no longer stops
+         * the pass; a pipeline-empty pass still exits 7 below. */
+        let option_superset = {
             let mut all_geometry: BTreeMap<(String, String), BTreeMap<String, i64>> =
                 BTreeMap::new();
             let build_geometry = |route: &str,
@@ -1764,11 +1771,16 @@ fn run(cli: &Cli) -> Result<i32> {
                 common_profile: &common_text,
             };
             let superset = options::build(&input);
-            let text = serde_json::to_string_pretty(&superset)
-                .map_err(|err| ExtractError::new(format!("cannot serialize options: {err}")))?;
-            std::fs::write(path, text + "\n").map_err(|err| ExtractError::new(format!("{err}")))?;
-            eprintln!("info: options superset written to {}", path.display());
-        }
+            if let Some(path) = &cli.options_out {
+                let text = serde_json::to_string_pretty(&superset).map_err(|err| {
+                    ExtractError::new(format!("cannot serialize options: {err}"))
+                })?;
+                std::fs::write(path, text + "\n")
+                    .map_err(|err| ExtractError::new(format!("{err}")))?;
+                eprintln!("info: options superset written to {}", path.display());
+            }
+            superset
+        };
         if ambiguous {
             return Ok(7);
         }
@@ -1783,7 +1795,21 @@ fn run(cli: &Cli) -> Result<i32> {
             };
             eprint!("{}", fact::explain_conf(&inputs, &provenance).render());
         }
-        report::render_conf_with_device(&inputs, cli.device.as_deref())
+        let feasible_routes = option_superset
+            .routes
+            .iter()
+            .filter(|route| route.verdict == "feasible")
+            .count();
+        if cli.route.is_none() && feasible_routes > 1 {
+            options::render_superset(
+                &option_superset,
+                options::PlanKind::Auto,
+                cli.device.as_deref(),
+            )
+            .unwrap_or_else(|| report::render_conf_with_device(&inputs, cli.device.as_deref()))
+        } else {
+            report::render_conf_with_device(&inputs, cli.device.as_deref())
+        }
     } else {
         let report_value = report::build_report(
             release.as_deref(),

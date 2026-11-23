@@ -17,12 +17,16 @@ internal object PipelineResolver {
         order: List<String>,
         ghostlock: () -> String?,
         dirtyfrag: () -> String?,
+        /* The bundled module chain. Bundle-only: the caller decides whether the
+         * staged/bundled pair authorizes it. */
+        module: () -> String? = { "module pipeline is not available here" },
     ): Decision {
         val rejected = mutableListOf<String>()
         for (entry in order) {
             val reason = when (entry) {
                 "ghostlock" -> ghostlock()
                 "dirtyfrag" -> dirtyfrag()
+                "module" -> module()
                 else -> "unknown pipeline"
             }
             if (reason == null) {

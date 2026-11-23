@@ -121,7 +121,7 @@ fn tcp_verdicts_match_the_family_expectations() {
 }
 
 #[test]
-fn the_6_1_image_asks_for_a_route_choice() {
+fn the_6_1_image_writes_the_route_superset() {
     let Some(dir) = std::env::var_os("GHOSTLOCK_IMAGE_DIR") else {
         eprintln!("skipping: GHOSTLOCK_IMAGE_DIR is not set");
         return;
@@ -158,8 +158,8 @@ fn the_6_1_image_asks_for_a_route_choice() {
         .expect("run extractor");
     assert_eq!(
         first.status.code(),
-        Some(7),
-        "{release}: expected the ambiguity exit: {}",
+        Some(0),
+        "{release}: the ambiguity is resolved by the superset, not an exit: {}",
         String::from_utf8_lossy(&first.stderr)
     );
     let report = std::fs::read_to_string(&feasible).expect("feasible report");
@@ -167,6 +167,17 @@ fn the_6_1_image_asks_for_a_route_choice() {
         report.contains("\"route\": \"select_stack\"")
             && report.contains("\"route\": \"tcp_zerocopy\""),
         "{release}: feasible report must carry both routes:\n{report}"
+    );
+    /* No route is forced: every feasible branch is written for the app's
+     * picker, and there is no `routes` order line. */
+    let superset = std::fs::read_to_string(&out).expect("superset document");
+    assert!(
+        superset.contains("select_stack {") && superset.contains("tcp_zerocopy {"),
+        "{release}: the superset must carry both route branches:\n{superset}"
+    );
+    assert!(
+        !superset.lines().any(|line| line.trim_start().starts_with("routes =")),
+        "{release}: the superset must not write a route order:\n{superset}"
     );
 
     let forced = Command::new(binary)

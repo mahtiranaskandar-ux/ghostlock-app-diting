@@ -3,7 +3,6 @@ package com.sesame.app.data
 import android.app.Application
 import android.content.SharedPreferences
 import androidx.core.content.edit
-import com.sesame.app.domain.model.CpuPair
 import com.sesame.app.domain.model.ProfileConfig
 import com.sesame.app.domain.model.ProfileImportResult
 import com.sesame.app.domain.repository.ProfileConfigController
@@ -33,7 +32,6 @@ class ProfileLayerPolicyTest {
 
     /** A kernel no profile ships for: an external document is the only source. */
     private val foreignRelease = "6.1.999-android14-11-gdeadbeefcafe-ab99999999"
-    private val pair = CpuPair(primary = 0, consumer = 1)
     private val routeWaitPath = "execution.race.route_wait_ms"
 
     /** The bundled value, i.e. what a run gets when nothing overrides it. */
@@ -62,7 +60,7 @@ class ProfileLayerPolicyTest {
 
     @Test
     fun `the bundled profile applies by default`() = runBlocking {
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertTrue(config.hasProfile)
         assertEquals(bundledRouteWaitMs, generalValue(config, routeWaitPath))
@@ -79,9 +77,9 @@ class ProfileLayerPolicyTest {
             "content://profiles/wins.conf",
             document(bundledRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
 
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertTrue(config.hasProfile)
         assertEquals(4242L, generalValue(config, routeWaitPath))
@@ -97,12 +95,12 @@ class ProfileLayerPolicyTest {
             "content://profiles/wins.conf",
             document(bundledRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
         /* The CN MIUI sequence: the provider stops opening the URI after the
          * import. Every later resolution reads the copy. */
         external.documents.clear()
 
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertTrue(config.hasProfile)
         assertEquals(4242L, generalValue(config, routeWaitPath))
@@ -115,7 +113,7 @@ class ProfileLayerPolicyTest {
             "content://profiles/wins.conf",
             document(bundledRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
 
         assertTrue(controller.importedProfileExists())
         for (key in listOf(
@@ -145,7 +143,7 @@ class ProfileLayerPolicyTest {
             putString(AndroidProfileConfigController.PrefExternalParentSha256, "parent-sha")
         }
 
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertTrue(config.hasProfile)
         assertEquals(4242L, generalValue(config, routeWaitPath))
@@ -161,7 +159,7 @@ class ProfileLayerPolicyTest {
             putString(AndroidProfileConfigController.PrefExternalRelease, bundledRelease)
         }
 
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertFalse(controller.importedProfileExists())
         assertFalse(preferences.contains(AndroidProfileConfigController.PrefExternalUri))
@@ -179,7 +177,7 @@ class ProfileLayerPolicyTest {
         /* A read would fail; the copy must win and the stale key must go. */
         external.documents.clear()
 
-        assertTrue(controller.load(bundledRelease, pair).hasProfile)
+        assertTrue(controller.load(bundledRelease).hasProfile)
 
         assertTrue(controller.importedProfileExists())
         assertFalse(preferences.contains(AndroidProfileConfigController.PrefExternalUri))
@@ -191,9 +189,9 @@ class ProfileLayerPolicyTest {
             "content://profiles/foreign.conf",
             document(foreignRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, foreignRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, foreignRelease))
 
-        val config = controller.load(foreignRelease, pair)
+        val config = controller.load(foreignRelease)
 
         assertTrue(config.hasProfile)
         assertEquals(4242L, generalValue(config, routeWaitPath))
@@ -208,7 +206,7 @@ class ProfileLayerPolicyTest {
             "content://profiles/foreign.conf",
             document(foreignRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, foreignRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, foreignRelease))
 
         assertTrue(controller.importedProfileExists())
         assertTrue(releaseSupportedByProfileSources(foreignRelease, emptySet(), true))
@@ -231,9 +229,9 @@ class ProfileLayerPolicyTest {
             "content://profiles/foreign.conf",
             document(foreignRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, foreignRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, foreignRelease))
 
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertFalse(config.hasProfile)
         val layers = checkNotNull(config.layers)
@@ -251,10 +249,10 @@ class ProfileLayerPolicyTest {
             "content://profiles/wins.conf",
             document(bundledRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
         external.importedReadable = false
 
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertFalse(config.hasProfile)
         val layers = checkNotNull(config.layers)
@@ -272,14 +270,14 @@ class ProfileLayerPolicyTest {
             "content://profiles/wins.conf",
             document(bundledRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
         external.importedReadable = false
-        assertTrue(controller.load(bundledRelease, pair).layers!!.externalReadFailure)
+        assertTrue(controller.load(bundledRelease).layers!!.externalReadFailure)
 
         /* Re-importing the same file repairs the state without a restart: the
          * copy already exists, and the next resolution reads it. */
         external.importedReadable = true
-        val config = controller.load(bundledRelease, pair)
+        val config = controller.load(bundledRelease)
 
         assertTrue(config.hasProfile)
         val layers = checkNotNull(config.layers)
@@ -296,19 +294,19 @@ class ProfileLayerPolicyTest {
             "content://profiles/wins.conf",
             document(bundledRelease, routeWaitMs = 4242),
         )
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
 
-        controller.selectBuiltin(other, bundledRelease, pair)
+        controller.selectBuiltin(other, bundledRelease)
 
         assertFalse(controller.importedProfileExists())
-        val layers = checkNotNull(controller.load(bundledRelease, pair).layers)
+        val layers = checkNotNull(controller.load(bundledRelease).layers)
         assertTrue(layers.builtinSelected)
         assertEquals(other, layers.builtinRelease)
     }
 
     @Test
     fun `nothing resolves for an unknown release`() = runBlocking {
-        val config = controller.load("9.9.9-unknown", pair)
+        val config = controller.load("9.9.9-unknown")
 
         assertFalse(config.hasProfile)
         assertNull(config.layers?.builtinRelease)
@@ -321,8 +319,8 @@ class ProfileLayerPolicyTest {
             .replace(Regex("(?m)^pipeline\\s*=.*$"), "")
         val uri = external.add("content://profiles/no-pipeline.conf", text)
 
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
-        val config = controller.load(bundledRelease, pair)
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
+        val config = controller.load(bundledRelease)
 
         assertTrue(config.hasProfile)
         assertTrue(config.invalidPaths.isEmpty())
@@ -334,8 +332,8 @@ class ProfileLayerPolicyTest {
         val text = removeTopLevelBlock(document(bundledRelease, routeWaitMs = 4242), "execution")
         val uri = external.add("content://profiles/no-execution.conf", text)
 
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease, pair))
-        val config = controller.load(bundledRelease, pair)
+        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
+        val config = controller.load(bundledRelease)
 
         assertTrue(config.hasProfile)
         assertTrue(config.invalidPaths.isEmpty())
@@ -348,15 +346,35 @@ class ProfileLayerPolicyTest {
             .replace(Regex("(?m)^\\s*init_task\\s*=.*$"), "")
         val uri = external.add("content://profiles/no-init-task.conf", text)
 
-        val result = controller.selectExternalProfile(uri, bundledRelease, pair)
+        val result = controller.selectExternalProfile(uri, bundledRelease)
         assertTrue(
             result.toString(),
             result is ProfileImportResult.Rejected &&
                 result.errors.any { it.startsWith("offset.init_task") },
         )
         /* The rejected copy is not kept: the bundled profile applies again. */
-        assertTrue(controller.load(bundledRelease, pair).hasProfile)
+        assertTrue(controller.load(bundledRelease).hasProfile)
         assertFalse(controller.importedProfileExists())
+    }
+
+    @Test
+    fun `an older schema is refused, not upgraded`() = runBlocking {
+        val text = document(bundledRelease, routeWaitMs = 4242)
+        val variants = listOf(
+            text.replace("schema_version = 3", "schema_version = 2"),
+            text.replace("schema_version = 3", "schema_version = 1"),
+            text.replace(Regex("(?m)^schema_version = 3\n"), ""),
+        )
+        for (old in variants) {
+            val uri = external.add("content://profiles/old-schema.conf", old)
+            val result = controller.selectExternalProfile(uri, bundledRelease)
+            assertTrue(
+                result.toString(),
+                result is ProfileImportResult.Rejected &&
+                    result.errors.any { it.contains("schema") },
+            )
+            assertFalse(controller.importedProfileExists())
+        }
     }
 
     private fun generalValue(config: ProfileConfig, path: String): Long? =
@@ -370,9 +388,17 @@ class ProfileLayerPolicyTest {
     private fun document(release: String, routeWaitMs: Long): String {
         val text = AssetConfigLoader(context).load("kernel_profiles/$bundledRelease.conf")
         check(text.isNotBlank()) { "the bundled profile is missing from the assets" }
-        return text
-            .replace("release = \"$bundledRelease\"", "release = \"$release\"")
-            .replace("route_wait_ms = null", "route_wait_ms = $routeWaitMs")
+        val relabelled = text.replace("release = \"$bundledRelease\"", "release = \"$release\"")
+        val replaced = relabelled.replace("route_wait_ms = null", "route_wait_ms = $routeWaitMs")
+        /* A refreshed superset omits the execution block (the app fills the
+         * tuning presets); insert the override when no null placeholder
+         * exists. */
+        return if (replaced != relabelled) {
+            replaced
+        } else {
+            relabelled +
+                "\nexecution {\n  race {\n    route_wait_ms = $routeWaitMs\n  }\n}\n"
+        }
     }
 
     @Test
@@ -380,9 +406,9 @@ class ProfileLayerPolicyTest {
         val release = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638"
         val uri = external.add("content://profiles/compat.conf", compatMulticastDocument(release))
 
-        val result = controller.selectExternalProfile(uri, release, pair)
+        val result = controller.selectExternalProfile(uri, release)
         assertTrue(result.toString(), result is ProfileImportResult.Accepted)
-        val config = controller.load(release, pair)
+        val config = controller.load(release)
 
         assertTrue(config.hasProfile)
         assertTrue(config.layers!!.externalApplied)
@@ -399,7 +425,7 @@ class ProfileLayerPolicyTest {
             .replace("compat_waiter_off = 72\n", "")
         val uri = external.add("content://profiles/compat-truncated.conf", text)
 
-        val result = controller.selectExternalProfile(uri, release, pair)
+        val result = controller.selectExternalProfile(uri, release)
         assertTrue(
             result.toString(),
             result is ProfileImportResult.Rejected &&
@@ -418,7 +444,7 @@ class ProfileLayerPolicyTest {
         include "credential-6_1.conf"
         include "kernelsnitch-6x.conf"
         release = "$release"
-        schema_version = 2
+        schema_version = 3
         kernel_major = 6
         kernel_phys_load = 2684354560
         kernel_phys_offset = 2147483648

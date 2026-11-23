@@ -1,10 +1,11 @@
 package com.sesame.app.ui.state
 
 import androidx.compose.runtime.Stable
-import com.sesame.app.domain.model.CpuPair
+import com.sesame.app.data.profile.ModuleConfig
 import com.sesame.app.domain.model.MeasuredKernelInfo
 import com.sesame.app.domain.model.MeasurementMergeRow
 import com.sesame.app.domain.model.ProfileLayers
+import com.sesame.app.domain.model.RouteCandidate
 import com.sesame.app.domain.model.ShizukuStatus
 import com.sesame.app.domain.model.VrKoMode
 import com.sesame.app.ui.GhostlockLogLine
@@ -26,16 +27,12 @@ data class SessionState(
     val run: RunState = RunState(),
     val measurements: MeasurementsState = MeasurementsState(),
 ) {
-    /** The device identity line and the CPU-pair picker's facts. */
+    /** The device identity line. */
     @Stable
     data class DeviceState(
         val deviceName: String = "",
         val kernelRelease: String = "",
         val socName: String = "",
-        val cpuPairLabels: List<String> = emptyList(),
-        val cpuPairIndex: Int = 0,
-        /** CPU pair from the resolved profile when it differs from the device pick. */
-        val customCpuPair: CpuPair? = null,
     )
 
     /** The resolved profile: what it is, which route it takes, and its layers. */
@@ -48,6 +45,28 @@ data class SessionState(
         val importedProfilePresent: Boolean = false,
         val activeBuiltinProfile: String? = null,
         val layers: ProfileLayers? = null,
+        /** The viable routes, in the profile's order; the picker's only source. */
+        val routeCandidates: List<RouteCandidate> = emptyList(),
+        /** The remembered picker choice (a native route or the timer). */
+        val selectedRoute: String? = null,
+        /** The active native route's carriers, and the remembered choice. */
+        val carrierCandidates: List<String> = emptyList(),
+        val selectedCarrier: String? = null,
+        /** DirtyFrag is a choice when the profile's pipeline lists both entries. */
+        val dirtyFragSelectable: Boolean = false,
+        val dirtyFragOn: Boolean = false,
+        /** The profile's ordered pipeline (the DirtyFrag list's capability source). */
+        val pipelineOrder: List<String> = emptyList(),
+        /**
+         * The module chain's pair manifest, when `pipeline` selects `module`.
+         * The chain has no route to pick, so the home and the parameters screen
+         * present this block instead of a route line.
+         */
+        val module: ModuleConfig? = null,
+        /** The bundled `.ko` opens and matches its `asset_sha256`. */
+        val moduleAssetVerified: Boolean = false,
+        /** Installed Magisk manager package; null = the chain cannot run. */
+        val magiskManager: String? = null,
     )
 
     /** Privileged-access facts: the Shizuku switch and the chosen root manager. */

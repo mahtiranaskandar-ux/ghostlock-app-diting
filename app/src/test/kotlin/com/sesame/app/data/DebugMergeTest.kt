@@ -63,7 +63,6 @@ class DebugMergeTest {
                 "to" to "tcp_zerocopy",
             ),
         )
-        LegacyProfileConverter.convertValue(imported)
         val merged = mergeSource(builtin, imported, replaceRouteBranch = true)
         println("merged fallback=${merged["fallback"]}")
         println("merged route=${merged["route"]}")

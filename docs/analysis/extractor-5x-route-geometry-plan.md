@@ -149,7 +149,7 @@ The 5.10 template currently treats all of them as one family constant. They must
 | per-image | ten `offset.*`, `cred.ref*_image`, `multicast_waiter.waiter_off`, `lock_anchor_image`, phys pair | derive/read from the image every time |
 | train/config-stable | `task_struct.*`, `cred` field layout, `mm_struct_sz=960`, waiter `task/lock`, `compact_waiter` | derive per image where possible; the measured-series template fills only the remainder, only on an IKCONFIG fingerprint match; a patch-range match is the lowest-priority fallback, marks every value it fills `heuristic`, and is recorded in the log |
 | codegen-specific | pselect `waiter_shift`, sigreturn `off_sve/plain`, anchor suitability | derive from the image; never carry across builds |
-| device/runtime | `selected_cpus`, `route_wait_ms`, `setup_settle_us`, route timing | never emitted by the extractor; the app supplies the device pair and its tuning presets |
+| device/runtime | `route_wait_ms`, `setup_settle_us`, route timing | never emitted by the extractor; the native chooses the CPU pair at run time and the app supplies its tuning presets |
 
 Source priority for every shared field: per-image derivation → template under an IKCONFIG
 fingerprint match → template under a patch-range match (**heuristic**, logged) → family constant
@@ -272,9 +272,9 @@ diting's `delta = 0`, not a separate train constant.
    are logged and surfaced in the app (profile/import view and generation log), so the user sees
    which anchor a profile carries. On the 5.10.246 image the scan yields
    `dump_skip.zeroes +0x2ec7bd8`, 0x440 bytes, **unsafe** — it must be omitted.
-8. **The extractor does not emit execution tuning; the app owns it.** `selected_cpus`, the race
+8. **The extractor does not emit execution tuning; the app owns it.** The race
    knobs and the route timing are device/runtime values measured on the diting, not image
-   properties. The conf renderer omits the `execution` block entirely (keys omitted, never `null`:
+   properties. The CPU pair is chosen by the native at run time. The conf renderer omits the `execution` block entirely (keys omitted, never `null`:
    the app's merge skips a null into an existing map, but a null inside a new route group survives
    and blocks `fillRouteExecutionDefaults`). The app fills it from `execution-tuning.conf`, the
    selected route's `execution-<route>.conf` and the device pair, with a diting/device preset so a

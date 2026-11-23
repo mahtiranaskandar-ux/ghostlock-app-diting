@@ -28,7 +28,6 @@ class ProfileMergerTest {
                 builtin = null,
                 imported = imported,
                 tuningExecution = null,
-                pair = CpuPairView(0, 1),
                 routePresets = emptyMap(),
             )
         }
@@ -51,7 +50,6 @@ class ProfileMergerTest {
             builtin = null,
             imported = imported,
             tuningExecution = null,
-            pair = CpuPairView(0, 1),
             routePresets = emptyMap(),
         )
         assertEquals(valueMapOf("image" to 44279296L), resolved["w1_scratch"])
@@ -70,7 +68,6 @@ class ProfileMergerTest {
             builtin = null,
             imported = imported,
             tuningExecution = null,
-            pair = CpuPairView(0, 1),
             routePresets = emptyMap(),
         )
         assertEquals(device, resolved["release"])

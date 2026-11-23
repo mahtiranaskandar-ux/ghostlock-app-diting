@@ -80,51 +80,8 @@ internal object ImportedProfileCopy {
 }
 
 /**
- * The copy's document-schema policy.
- *
- * `schema_version` is a format discriminator, not a generation counter: `2`
- * when the physical fields are per-device maps, `1` otherwise. A copy that
- * carries no version is upgraded in memory (and then written back by the
- * caller); a versioned copy is returned unchanged. The parser expands includes
- * and normalises the layout first, so the rendered copy is self-contained.
- * Rendering drops comments, so a lineage header on the first lines is
- * re-emitted as text (decision 8: the app does not parse it).
- */
-internal object ImportedProfileSchema {
-    fun ensureSchema(
-        text: String,
-        loadInclude: ((String) -> String?)? = null,
-    ): String {
-        val entries = ProfileDocumentParser.entries(text, loadInclude) ?: return text
-        var changed = false
-        for (entry in entries) {
-            if (entry.containsKey("schema_version")) continue
-            entry["schema_version"] = if (hasPhysMaps(entry)) 2L else 1L
-            changed = true
-        }
-        if (!changed) return text
-        val isList = text.trimStart().startsWith("[")
-        val rendered = if (isList) {
-            HoconSupport.render(entries)
-        } else {
-            HoconSupport.render(entries.firstOrNull() ?: return text)
-        }
-        val header = lineageHeader(text)
-        return if (header == null) rendered else "$header\n$rendered"
-    }
-
-    private fun hasPhysMaps(entry: ValueMap): Boolean =
-        entry["kernel_phys_load"] is Map<*, *> || entry["kernel_phys_offset"] is Map<*, *>
-
-    private fun lineageHeader(text: String): String? =
-        text.lineSequence().take(5).firstOrNull { line ->
-            line.trimStart().startsWith("#") && line.contains("ghostlock-profile")
-        }
-}
-
-/**
  * Parses one profile document (HOCON text, an object or a list of objects) and
- * converts every entry to the current layout. `include` targets are resolved
+ * returns every entry as authored. `include` targets are resolved
  * through [loadInclude] — the bundled assets in the app; imported documents are
  * not searched for siblings, because the model has no folder to search. An
  * app export is self-contained and never needs one.
@@ -141,8 +98,10 @@ internal object ProfileDocumentParser {
             is List<*> -> value.mapNotNull { it.asValueMap() }
             else -> return null
         }
+        /* Schema v3 only: the entries are returned as authored; a v1/v2 or
+         * unversioned document is refused by the resolver's schema check. */
         val entries = maps.filter { it["release"] is String }
-        return entries.takeIf { it.isNotEmpty() }?.onEach { LegacyProfileConverter.convertValue(it) }
+        return entries.takeIf { it.isNotEmpty() }
     }
 
     /** First entry carrying [release], converted; null when absent. */

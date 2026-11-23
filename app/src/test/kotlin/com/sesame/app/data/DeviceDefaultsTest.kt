@@ -3,7 +3,6 @@ package com.sesame.app.data
 import android.app.Application
 import androidx.core.content.edit
 import com.sesame.app.data.profile.PerDevicePhys
-import com.sesame.app.domain.model.CpuPair
 import com.sesame.app.domain.model.ProfileConfig
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -41,7 +40,7 @@ class DeviceDefaultsTest {
 
     @Test
     fun `diting gets the measured route timing`() = runBlocking {
-        val config = controller("diting").load(release, CpuPair(4, 5))
+        val config = controller("diting").load(release)
         assertEquals(30L, value(config, "execution.race.route_wait_ms"))
         assertEquals(10000L, value(config, "execution.race.setup_settle_us"))
         assertEquals(5000L, value(config, "execution.routes.select_stack.enter_delay_us"))
@@ -49,7 +48,7 @@ class DeviceDefaultsTest {
 
     @Test
     fun `a device in the map gets the generic timing`() = runBlocking {
-        val config = controller("yunluo").load(release, CpuPair(0, 1))
+        val config = controller("yunluo").load(release)
         assertEquals(1000L, value(config, "execution.race.route_wait_ms"))
         assertEquals(50000L, value(config, "execution.race.setup_settle_us"))
         assertEquals(50000L, value(config, "execution.routes.select_stack.enter_delay_us"))
@@ -57,7 +56,7 @@ class DeviceDefaultsTest {
 
     @Test
     fun `a device the physical map does not name is refused`() = runBlocking {
-        val config = controller("not-diting").load(release, CpuPair(0, 1))
+        val config = controller("not-diting").load(release)
         assertFalse(config.hasProfile)
         assertTrue(
             config.layers?.externalError.orEmpty().contains("does not name not-diting"),
@@ -121,7 +120,7 @@ class DeviceDefaultsTest {
             deviceCodename = "missi",
             deviceAliases = listOf("spinel"),
         )
-        val config = controller.load(spinelRelease, CpuPair(0, 1))
+        val config = controller.load(spinelRelease)
         assertEquals(1073741824L, config.physLoad)
         assertEquals(1073741824L, config.physOffset)
     }

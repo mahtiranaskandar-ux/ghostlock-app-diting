@@ -1,6 +1,5 @@
 package com.sesame.app.data
 
-import com.sesame.app.data.profile.CpuPairView
 import com.sesame.app.data.profile.ProfileMerger
 import java.io.File
 import org.junit.Assert.assertEquals
@@ -43,7 +42,6 @@ class AnchorMergeProbeTest {
             builtin = null,
             imported = doc,
             tuningExecution = null,
-            pair = CpuPairView(4, 5),
             routePresets = emptyMap(),
         )
 
@@ -51,7 +49,7 @@ class AnchorMergeProbeTest {
         println("C. MERGED route.select_stack = $body")
         println("C. lock_anchor_image = ${body?.get("lock_anchor_image")} (present=${body?.containsKey("lock_anchor_image")})")
         println("C. waiter_shift = ${body?.get("waiter_shift")} (present=${body?.containsKey("waiter_shift")})")
-        println("C. kernel_major = ${merged["kernel_major"]}  cpus = ${(merged["execution"] as? Map<*, *>)?.get("selected_cpus")}")
+        println("C. kernel_major = ${merged["kernel_major"]}")
         println("C. rendered:\n${HoconSupport.render(merged)}")
 
         assertEquals("document key must reach the merged profile", anchor, (body?.get("lock_anchor_image") as? Number)?.toLong())
@@ -63,7 +61,7 @@ class AnchorMergeProbeTest {
         println("SIZE with anchor    = ${renderWith.toByteArray(Charsets.UTF_8).size}")
         val noAnchor = HoconSupport.parseValue(confFile.readText()).asValueMap()!!
         ((noAnchor["route"] as Map<*, *>)["select_stack"] as MutableMap<String, Any?>).remove("lock_anchor_image")
-        val mergedNo = ProfileMerger.resolveMerged(release, null, noAnchor, null, CpuPairView(4, 5), emptyMap())
+        val mergedNo = ProfileMerger.resolveMerged(release, null, noAnchor, null, emptyMap())
         println("SIZE without anchor = ${HoconSupport.render(mergedNo).toByteArray(Charsets.UTF_8).size}")
         val line = renderWith.lines().first { it.contains("lock_anchor_image") }
         println("anchor line = '${line}' (${line.toByteArray(Charsets.UTF_8).size + 1} bytes with newline)")

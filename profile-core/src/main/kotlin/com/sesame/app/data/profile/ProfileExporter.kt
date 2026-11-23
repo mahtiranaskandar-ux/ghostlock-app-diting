@@ -58,30 +58,50 @@ object ProfileExporter {
             /* Reference templates are not device profiles and are not exported. */
             if (release.endsWith("-template")) continue
             val parsed = parseFile(File(srcDir, file), srcDir) ?: error("cannot parse $file")
-            /* The exporter is device-neutral: the schema-v2 physical map is
+            /* The exporter is device-neutral: the schema-v3 per-device physical map is
              * validated and left null (the native default). */
             val resolved = PerDevicePhys.resolveNeutral(parsed)
             val actualRelease = resolved["release"] as? String ?: error("$file has no release")
             require(actualRelease == release) { "index/file release mismatch for $file" }
-            val route = routeNameOf(resolved, routes)
             val fallbackTo = fallbackOf(resolved)
             val merged = ProfileMerger.resolveMerged(
                 deviceRelease = actualRelease,
                 builtin = resolved,
                 imported = null,
                 tuningExecution = tuningExecution,
-                pair = CpuPairView(0, 1),
                 routePresets = routePresets,
             )
+            /* The app's default route: the viable branches alphabetically, the
+             * first with no route-specific validation error. The runtime
+             * renders exactly this branch, and the agreement test holds the two
+             * paths together. */
+            val route = defaultRoute(merged, routes, fallbackTo)
             val errors = ProfileResolver.validateMerged(merged, route, fallbackTo)
             if (errors.isNotEmpty()) {
                 error("$file fails validation: ${errors.joinToString()}")
+            }
+            /* A module-only profile has no native wire: the DirtyFrag stage is
+             * invoked with its plan, not a profile document. A mixed list keeps
+             * the W1 fallback's wire. */
+            val order = ProfileResolver.pipelineOrder(merged)
+            if ("module" in order && !ProfileResolver.requiresW1(order)) {
+                println("exportKernelProfiles: $actualRelease (module-only; no native wire)")
+                continue
             }
             val bytes = NativeProfileDocument.from(
                 release = actualRelease,
                 route = RouteKind.fromToken(route)?.token,
                 fallbackTo = RouteKind.fromToken(fallbackTo)?.token,
-            ) { path -> ProfileResolver.nativeValue(merged, route, fallbackTo, path) }.toBinary()
+            ) { path ->
+                when (path) {
+                    /* The native chooses the CPU pair at run time; the wire's
+                     * required slots carry the neutral fallback, exactly as the
+                     * app's transport boundary does. */
+                    "execution.recommended_cpus.main" -> 0L
+                    "execution.recommended_cpus.consumer" -> 1L
+                    else -> ProfileResolver.nativeValue(merged, route, fallbackTo, path)
+                }
+            }.toBinary()
             File(staging, "$actualRelease.bin").writeBytes(bytes)
             count++
             println("exportKernelProfiles: $actualRelease (${bytes.size} bytes)")
@@ -133,12 +153,31 @@ object ProfileExporter {
         }
     }
 
-    private fun routeNameOf(profile: Map<*, *>, routes: List<String>): String? =
-        when (val route = profile["route"]) {
-            is String -> route.takeIf { it.isNotEmpty() && it != "null" }
-            is Map<*, *> -> route.keys.filterIsInstance<String>().firstOrNull { it in routes }
-            else -> null
+    private fun defaultRoute(
+        merged: ValueMap,
+        routes: List<String>,
+        fallbackTo: String?,
+    ): String? {
+        val branches = when (val raw = merged["route"]) {
+            is String -> listOf(raw)
+            is Map<*, *> -> raw.keys.filterIsInstance<String>()
+            else -> emptyList()
         }
+        val names = branches.filter { it in routes }.sorted()
+        for (name in names) {
+            val errors = ProfileResolver.validateMerged(merged, name, fallbackTo)
+                .filterNot { foreignRoute(it.fieldPath, name) }
+            if (errors.isEmpty()) return name
+        }
+        return names.firstOrNull()
+    }
+
+    private fun foreignRoute(path: String, route: String): Boolean = when {
+        path.startsWith("timer_98260") -> true
+        path.startsWith("route.") && !path.startsWith("route.$route.") -> true
+        path.startsWith("fallback.route.") && !path.startsWith("fallback.route.$route.") -> true
+        else -> false
+    }
 
     private fun fallbackOf(profile: Map<*, *>): String? {
         val to = ((profile["fallback"] as? Map<*, *>)?.get("to") as? String)

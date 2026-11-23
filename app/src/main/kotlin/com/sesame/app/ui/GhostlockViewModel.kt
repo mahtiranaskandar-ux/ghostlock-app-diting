@@ -14,15 +14,16 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.sesame.app.R
 import com.sesame.app.RunStatusService
+import com.sesame.app.data.BundledModule
+import com.sesame.app.data.MagiskStage
 import com.sesame.app.data.MeasuredProfileStore
 import com.sesame.app.data.OptionDecision
 import com.sesame.app.data.OptionPlan
 import com.sesame.app.data.OptionSuperset
 import com.sesame.app.data.RoutePlans
 import com.sesame.app.data.ScratchInAnchor
+import com.sesame.app.data.TimerBlockText
 import com.sesame.app.data.decision
-import com.sesame.app.domain.model.CpuPair
-import com.sesame.app.domain.model.customCpuPairHint
 import com.sesame.app.domain.model.generationPhysComplete
 import com.sesame.app.domain.model.isMediaTekSoc
 import com.sesame.app.domain.model.isQualcommSoc
@@ -39,8 +40,11 @@ import com.sesame.app.domain.model.ProfileImportResult
 import com.sesame.app.domain.model.RootManagerCandidate
 import com.sesame.app.domain.model.nextPhysImage
 import com.sesame.app.domain.model.CrashEvidenceInfo
-import com.sesame.app.domain.model.RouteVerdict
+import com.sesame.app.domain.model.RouteCandidate
 import com.sesame.app.domain.model.ShizukuStatus
+import com.sesame.app.data.profile.RouteCarriers
+import com.sesame.app.data.profile.Timer98260
+import com.sesame.app.shizuku.TimerVerdict
 import com.sesame.app.domain.model.StrideProbe
 import com.sesame.app.domain.model.VrKoMode
 import com.sesame.app.domain.repository.GhostlockRepository
@@ -50,7 +54,6 @@ import com.sesame.app.domain.usecase.LoadKernelSnapshotUseCase
 import com.sesame.app.domain.usecase.ParseSourceUseCase
 import com.sesame.app.domain.usecase.ReadDocumentUseCase
 import com.sesame.app.domain.usecase.RunExploitUseCase
-import com.sesame.app.domain.usecase.SelectCpuPairUseCase
 import com.sesame.app.ui.nav.NavController
 import com.sesame.app.ui.nav.Screen
 import com.sesame.app.ui.state.AdvancedActions
@@ -158,15 +161,6 @@ private data class ParseRequest(
     val vendorBootPath: String? = null,
     val dtboPath: String? = null,
     val overwrite: Boolean = false,
-    val route: String? = null,
-)
-
-/** One carrier of one route, as offered by the parse flow's route picker. */
-private data class RouteChoice(
-    val route: String,
-    val carrier: String,
-    val geometry: Map<String, Long>,
-    val reason: String,
 )
 
 /**
@@ -178,11 +172,6 @@ private sealed interface ParseStep {
     data object ModePick : ParseStep
     data object SourcePick : ParseStep
     data class Phys(val image: PhysImage, val after: ParseResult.Parsed?) : ParseStep
-    data class Route(
-        val request: ParseRequest,
-        val choices: List<RouteChoice>,
-        val options: OptionSuperset?,
-    ) : ParseStep
 
     data class Plan(
         val parse: ParseResult.Parsed,
@@ -203,7 +192,6 @@ class GhostlockViewModel(
     private var initialized = false
     private var running = false
     private val loadKernelSnapshot = LoadKernelSnapshotUseCase(repository)
-    private val selectCpuPairUseCase = SelectCpuPairUseCase(repository)
     private val parseSourceUseCase = ParseSourceUseCase(repository)
     private val readDocumentUseCase = ReadDocumentUseCase(repository)
     private val runExploitUseCase = RunExploitUseCase(repository)
@@ -244,6 +232,7 @@ class GhostlockViewModel(
     private val homeActionsImpl = object : HomeActions {
         override fun run() = onRun()
         override fun statusClick() = onStatusClick()
+        override fun chooseRoute() = this@GhostlockViewModel.chooseRoute()
         override fun showDeviceInfo() = onShowDeviceInfo()
         override fun openLastRunLog() = onOpenLastRunLog()
         override fun exportReport() = onExportRunLog()
@@ -254,7 +243,6 @@ class GhostlockViewModel(
     }
 
     private val runSettingsActionsImpl = object : RunSettingsActions {
-        override fun cpuPairSelected(index: Int) = selectCpuPair(index)
         override fun safeModeChanged(enabled: Boolean) = toggleSafeMode(enabled)
         override fun shizukuChanged(enabled: Boolean) = toggleShizuku(enabled)
         override fun openVrKo() = onOpenVrKo()
@@ -317,6 +305,12 @@ class GhostlockViewModel(
 
         override fun onDialogDismiss() = this@GhostlockViewModel.onDialogDismiss()
         override fun onDialogExportLog() = this@GhostlockViewModel.onDialogExportLog()
+        override fun onRouteMatrixSave(
+            backend: String,
+            syscall: String?,
+            carrier: String?,
+            dirtyFragOn: Boolean?,
+        ) = this@GhostlockViewModel.onRouteMatrixSave(backend, syscall, carrier, dirtyFragOn)
         override fun onStrideOptionSelected(value: Int) =
             this@GhostlockViewModel.onStrideOptionSelected(value)
 
@@ -400,6 +394,8 @@ class GhostlockViewModel(
     private var managerPickerOpen = false
     private var managerChoices: List<RootManagerCandidate> = emptyList()
 
+    /** The route picker's open list; non-null while its dialog is up. */
+
     /** The document text and behaviour waiting for the user's export destination. */
     private data class PendingProfileWrite(
         val text: String,
@@ -427,8 +423,7 @@ class GhostlockViewModel(
         viewModelScope.launch {
             refreshSnapshot()
             markInterruptedRunLogs()
-            applyRecommendedShizuku()
-            maybeSuggestShizukuForW3()
+            maybeNoticeInterruptedRun()
         }
         /* Best effort and off the main path: a no-shell device still records
          * the boot it was on; a Shizuku/root device captures the pstore.
@@ -455,53 +450,27 @@ class GhostlockViewModel(
         runCatching { repository.markInterruptedRunLogs() }
     }
 
-    private var recommendedShizukuApplied = false
+    private var interruptedRunNoticeChecked = false
 
     /**
-     * Kernels that recommend Shizuku start with the toggle on at every launch;
-     * a manual switch-off still applies for the rest of the session.
+     * A previous run that stopped mid-step left the step file `in_progress`.
+     * Name it with the export and leave the cause to the run store and the
+     * exported log: the step alone cannot tell a route miss from a crash, and
+     * it must not turn into an automatic execution-mode change.
      */
-    private fun applyRecommendedShizuku() {
-        if (recommendedShizukuApplied) return
-        recommendedShizukuApplied = true
-        val snapshot = kernelSnapshot ?: return
-        if (!snapshot.recommendShizuku || state.value.session.access.shizukuEnabled) return
-        toggleShizuku(true)
-    }
-
-    private var w3HintChecked = false
-
-    /**
-     * The previous run's native log survives export settings; when it failed
-     * at the W3 seccomp bypass in-process, suggest switching to Shizuku.
-     */
-    private suspend fun maybeSuggestShizukuForW3() {
-        if (w3HintChecked) return
-        w3HintChecked = true
-        val step = runCatching { repository.lastRunStuckStep() }.getOrNull() ?: return
-        if (state.value.session.access.shizukuEnabled) return
-        /* Any interrupted step is reported; only a W3 stall offers Shizuku,
-         * because Shizuku (shell uid, no seccomp) skips exactly that stage. */
-        val isW3 = step.startsWith("w3")
+    private suspend fun maybeNoticeInterruptedRun() {
+        if (interruptedRunNoticeChecked) return
+        interruptedRunNoticeChecked = true
+        runCatching { repository.lastRunStuckStep() }.getOrNull() ?: return
         mutableState.update {
             it.copy(
-                overlay = it.overlay.copy(dialog = if (isW3) {
-                    AppDialog.Confirm(
-                        titleRes = R.string.w3_shizuku_hint_title,
-                        messageRes = R.string.w3_shizuku_hint_message,
-                        confirmLabelRes = R.string.w3_shizuku_hint_enable,
-                        /* Both notices that say "your run did not finish" carry
-                         * the export: whichever one a reporter is looking at,
-                         * the log they need to send is one tap away. */
-                        exportLog = true,
-                    )
-                } else {
-                    AppDialog.Notice(
+                overlay = it.overlay.copy(
+                    dialog = AppDialog.Notice(
                         titleRes = R.string.run_interrupted_title,
                         messageRes = R.string.run_interrupted_message,
                         exportLog = true,
-                    )
-                }),
+                    ),
+                ),
             )
         }
     }
@@ -513,9 +482,8 @@ class GhostlockViewModel(
     /* profile-ui: the controller owns loading, merging and persistence. */
     fun loadExecutionProfile() {
         val snapshot = kernelSnapshot ?: return
-        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
-            applyExecutionConfig(profileController.load(snapshot.kernelRelease, pair))
+            applyExecutionConfig(profileController.load(snapshot.kernelRelease))
             refreshMergeRows()
         }
     }
@@ -523,6 +491,7 @@ class GhostlockViewModel(
     private fun applyExecutionConfig(config: ProfileConfig) {
         /* The run consumes exactly this resolution (D7); nothing re-loads later. */
         resolvedProfile = config
+        val (moduleAssetVerified, magiskManager) = moduleFacts(config)
         mutableState.update { state ->
             state.copy(
                 session = state.session.copy(
@@ -534,11 +503,31 @@ class GhostlockViewModel(
                         activeBuiltinProfile = profileController.activeBuiltinRelease(),
                         importedProfilePresent = profileController.importedProfileExists(),
                         layers = config.layers,
+                        routeCandidates = config.routeCandidates,
+                        selectedRoute = config.selectedRoute,
+                        carrierCandidates = config.carrierCandidates,
+                        selectedCarrier = config.selectedCarrier,
+                        dirtyFragSelectable = config.dirtyFragSelectable,
+                        dirtyFragOn = config.dirtyFragOn,
+                        pipelineOrder = config.pipelineOrder,
+                        module = config.module,
+                        moduleAssetVerified = moduleAssetVerified,
+                        magiskManager = magiskManager,
                     ),
-                    device = state.session.device.copy(customCpuPair = customCpuPairOf(config)),
                 ),
             )
         }
+    }
+
+    /**
+     * The module chain's delivery facts: whether the bundled `.ko` matches its
+     * declared hash, and which installed Magisk manager the root script can
+     * stage. Both are cheap enough to re-read on every resolution, and the
+     * chain refuses to start when either is absent.
+     */
+    private fun moduleFacts(config: ProfileConfig?): Pair<Boolean, String?> {
+        val module = config?.module ?: return false to null
+        return BundledModule.verify(application, module) to MagiskStage.installed(application)
     }
 
     /** Recomputes the facts the home merge would change; cheap, runs on IO. */
@@ -547,21 +536,6 @@ class GhostlockViewModel(
         mutableState.update { it.copy(
             session = it.session.copy(measurements = it.session.measurements.copy(mergeRows = rows)),
         ) }
-    }
-
-    /** The pair actually resolved from the profile, when it beats the device pick. */
-    private fun customCpuPairOf(config: ProfileConfig): CpuPair? {
-        val snapshot = kernelSnapshot ?: return null
-        val main = config.general
-            .firstOrNull { it.path == "execution.selected_cpus.main" }?.value ?: return null
-        val consumer = config.general
-            .firstOrNull { it.path == "execution.selected_cpus.consumer" }?.value ?: return null
-        return customCpuPairHint(
-            main,
-            consumer,
-            snapshot.cpuPairs,
-            snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair),
-        )
     }
 
     /* advanced-ui: the merged screen loads its editors and debug prefs. */
@@ -1223,12 +1197,11 @@ class GhostlockViewModel(
 
     fun onSelectBuiltinProfile(release: String?) {
         val snapshot = kernelSnapshot ?: return
-        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
         viewModelScope.launch(Dispatchers.IO) {
             /* The controller keeps a single active source: picking a builtin
              * also clears the external selection (last explicit choice wins). */
             val config = runCatching {
-                profileController.selectBuiltin(release, snapshot.kernelRelease, pair)
+                profileController.selectBuiltin(release, snapshot.kernelRelease)
             }.getOrNull()
             if (config == null) {
                 send(GhostlockEffect.Toast(R.string.load_builtin_failed))
@@ -1284,18 +1257,17 @@ class GhostlockViewModel(
                         activeBuiltinProfile = profileController.activeBuiltinRelease(),
                         importedProfilePresent = profileController.importedProfileExists(),
                         layers = config.layers,
+                        routeCandidates = config.routeCandidates,
+                        selectedRoute = config.selectedRoute,
+                        carrierCandidates = config.carrierCandidates,
+                        selectedCarrier = config.selectedCarrier,
+                        dirtyFragSelectable = config.dirtyFragSelectable,
+                        dirtyFragOn = config.dirtyFragOn,
+                        pipelineOrder = config.pipelineOrder,
                     ),
                 ),
             )
         }
-    }
-
-    fun selectCpuPair(index: Int) {
-        val snapshot = kernelSnapshot ?: return
-        if (index !in snapshot.cpuPairs.indices) return
-        selectCpuPairUseCase(index)
-        kernelSnapshot = snapshot.copy(selectedCpuPair = index)
-        mutableState.update { it.copy(session = it.session.copy(device = it.session.device.copy(cpuPairIndex = index))) }
     }
 
     fun toggleSafeMode(enabled: Boolean) {
@@ -1310,16 +1282,6 @@ class GhostlockViewModel(
         mutableState.update { it.copy(
             session = it.session.copy(runSettings = it.session.runSettings.copy(forceAttackTestEnabled = enabled)),
         ) }
-    }
-
-    /** Debug-only lab hook (`am start --ez second_way …`); no UI. */
-    fun toggleSecondWay(enabled: Boolean) {
-        repository.setSecondWay(enabled)
-    }
-
-    /** Debug-only: arm the one-shot pre-W1 fallback gate for the next run. */
-    fun setFallbackTest(enabled: Boolean) {
-        repository.setFallbackTest(enabled)
     }
 
     fun setVrKoTagClear(mode: VrKoMode) {
@@ -1339,15 +1301,227 @@ class GhostlockViewModel(
     fun toggleShizuku(enabled: Boolean) {
         repository.setShizukuEnabled(enabled)
         mutableState.update { it.copy(session = it.session.copy(access = it.session.access.copy(shizukuEnabled = enabled))) }
-        if (!enabled && kernelSnapshot?.recommendShizuku == true) {
-            send(GhostlockEffect.Toast(R.string.shizuku_recommended_hint))
-        }
         // The grant dialog lands in another app, so the status is re-read and
         // onResume() refreshes it again when the dialog closes.
         viewModelScope.launch { refreshSnapshot() }
     }
 
-    fun onRun() = runExploit()
+    fun onRun() {
+        if (resolvedProfile?.selectedRoute == Timer98260.BLOCK_KEY) {
+            onRunTimer()
+        } else {
+            runExploit()
+        }
+    }
+
+    /**
+     * The route picker: the viable routes only, in the profile's order. The
+     * chosen name is persisted by the controller; a stale name is cleared at
+     * the next load (self-healing, no migration).
+     */
+    fun chooseRoute() {
+        val profile = resolvedProfile ?: return
+        /* One entry on the home row; the sheet renders the backend banners and
+         * applies each choice as it is tapped. */
+        mutableState.update {
+            it.copy(overlay = it.overlay.copy(dialog = AppDialog.RouteMatrix))
+        }
+    }
+
+    /* ---- the route matrix sheet ---- */
+
+    /**
+     * Applies the sheet's draft on 保存. The GhostLock choices (syscall,
+     * carrier, DirtyFrag) are remembered even when the timer is the active
+     * backend, then the selected backend is written last so it wins.
+     */
+    fun onRouteMatrixSave(
+        backend: String,
+        syscall: String?,
+        carrier: String?,
+        dirtyFragOn: Boolean?,
+    ) {
+        val snapshot = kernelSnapshot ?: return
+        val release = snapshot.kernelRelease
+        val selected = if (backend == Timer98260.BLOCK_KEY) Timer98260.BLOCK_KEY else syscall
+        if (selected == null) return
+        viewModelScope.launch(Dispatchers.IO) {
+            var routeStored = true
+            if (syscall != null) {
+                routeStored = runCatching {
+                    profileController.selectRoute(release, syscall)
+                }.getOrDefault(false)
+                if (carrier != null) {
+                    runCatching { profileController.selectCarrier(release, syscall, carrier) }
+                }
+                if (dirtyFragOn != null) {
+                    runCatching { profileController.selectDirtyFrag(release, dirtyFragOn) }
+                }
+            }
+            runCatching { profileController.selectRoute(release, selected) }
+            withContext(Dispatchers.Main) {
+                if (!routeStored && syscall != null) {
+                    appendLog("route: $syscall is not viable; using the default")
+                }
+                appendLog("route: $selected")
+                if (syscall != null && carrier != null && selected != Timer98260.BLOCK_KEY) {
+                    appendLog("carrier: $syscall $carrier")
+                }
+                if (dirtyFragOn != null) {
+                    appendLog(
+                        "pipeline: dirtyfrag " +
+                            if (dirtyFragOn) "on" else "off (GhostLock only)",
+                    )
+                }
+                loadExecutionProfile()
+                dismissDialog()
+            }
+        }
+    }
+
+    /**
+     * The timer route's start path. Shizuku is mandatory and asked for here
+     * (independent of the native toggle); the boot contract refuses a second
+     * attempt on the same boot. There is no separate consent dialog (operator
+     * decision, 2026-11-22): the picker already names the timer route, and the
+     * reboot-bound risks are logged at the start of the run.
+     *
+     * A missing Shizuku is *not* auto-opened: switching to the Shizuku app
+     * would take the foreground and hide the explanation. The refusal is a
+     * notice that names the missing step (install / start / grant), with the
+     * project link when the app is not installed at all.
+     */
+    private fun onRunTimer() {
+        val snapshot = kernelSnapshot ?: return
+        val config = resolvedProfile
+        if (config == null || !config.hasProfile) {
+            appendLog("result: no profile is loaded; import or generate one")
+            return
+        }
+        /* The timer route is Shizuku-only, independent of the native toggle:
+         * read the live status rather than the snapshot's gated one, which
+         * reports NOT_REQUIRED while the toggle is off. */
+        val shizuku = if (snapshot.shizukuEnabled) {
+            snapshot.shizukuStatus
+        } else {
+            repository.shizukuShellStatus()
+        }
+        if (shizuku != ShizukuStatus.READY) {
+            appendLog("<s> Shizuku is required for the timer route")
+            val installed = runCatching { repository.shizukuInstalled() }.getOrDefault(false)
+            when (timerShizukuBlocker(shizuku, installed)) {
+                TimerShizukuBlocker.MISSING -> showTimerBlocker(
+                    titleRes = R.string.timer_shizuku_missing_title,
+                    messageRes = R.string.timer_shizuku_missing_message,
+                    docUrl = SHIZUKU_URL,
+                )
+
+                TimerShizukuBlocker.NOT_RUNNING -> showTimerBlocker(
+                    titleRes = R.string.timer_shizuku_not_running_title,
+                    messageRes = R.string.timer_shizuku_not_running_message,
+                )
+
+                TimerShizukuBlocker.PERMISSION -> showTimerBlocker(
+                    titleRes = R.string.timer_shizuku_permission_title,
+                    messageRes = R.string.timer_shizuku_permission_message,
+                )
+
+                null -> Unit
+            }
+            return
+        }
+        if (!repository.timerRunAllowed()) {
+            appendLog("<s> a timer attempt already ran on this boot; reboot before retrying")
+            mutableState.update {
+                it.copy(
+                    overlay = it.overlay.copy(
+                        dialog = AppDialog.Notice(
+                            titleRes = R.string.timer_reboot_first_title,
+                            messageRes = R.string.timer_reboot_first_message,
+                        ),
+                    ),
+                )
+            }
+            return
+        }
+        runTimerNow()
+    }
+
+    /** The timer refusal notice — the start path's only dialog. */
+    private fun showTimerBlocker(titleRes: Int, messageRes: Int, docUrl: String? = null) {
+        mutableState.update {
+            it.copy(
+                overlay = it.overlay.copy(
+                    dialog = AppDialog.Notice(
+                        titleRes = titleRes,
+                        messageRes = messageRes,
+                        docUrl = docUrl,
+                    ),
+                ),
+            )
+        }
+    }
+
+    /** The timer run, with the same operation/status plumbing as the native run. */
+    private fun runTimerNow() {
+        viewModelScope.launch {
+            if (!beginOperation()) return@launch
+            clearLog()
+            send(GhostlockEffect.KeepScreenAwake(true))
+            mutableState.update {
+                it.copy(session = it.session.copy(run = it.session.run.copy(status = RunStatus.Running)))
+            }
+            RunStatusService.start(
+                application,
+                application.getString(R.string.run_notif_running_text),
+            )
+            appendLog("==== start timer route ====")
+            /* The risks the old consent dialog carried now live in the log. */
+            appendLog(
+                "<s> a miss parks the tool and needs a reboot; " +
+                    "SELinux stays permissive until then",
+            )
+            withContext(Dispatchers.IO) {
+                try {
+                    val code = runCatching { repository.runTimerRoute(::appendLog) }
+                        .getOrElse { error ->
+                            appendLog("<s> error: ${error.message}")
+                            1
+                        }
+                    appendLog(
+                        if (code == 0) {
+                            "result: timer route completed"
+                        } else {
+                            "result: timer route failed (exit code=$code)"
+                        },
+                    )
+                    appendLog("exit code=$code")
+                    finishRunStatus(code)
+                    /* A non-start failure (parked miss, watchdog, early exit)
+                     * leaves the boot dirty; say so at once instead of only on
+                     * the next attempt. NotStarted means the tool never ran. */
+                    if (code != 0 && code != TimerVerdict.NotStarted) {
+                        mutableState.update {
+                            it.copy(
+                                overlay = it.overlay.copy(
+                                    dialog = AppDialog.Notice(
+                                        titleRes = R.string.timer_reboot_first_title,
+                                        messageRes = R.string.timer_reboot_first_message,
+                                    ),
+                                ),
+                            )
+                        }
+                    }
+                } finally {
+                    if (mutableState.value.session.run.status == RunStatus.Running) {
+                        finishRunStatus(-1)
+                    }
+                    endOperation()
+                    send(GhostlockEffect.KeepScreenAwake(false))
+                }
+            }
+        }
+    }
 
     /** Debug-only: run the DirtyFrag viability probe without an attack. */
     fun runDirtyfragProbeCheck() {
@@ -1366,6 +1540,40 @@ class GhostlockViewModel(
                 withContext(Dispatchers.IO) { repository.preflightDirtyfrag() }
             }.getOrElse { "preflight=NotRun error=$it" }
             appendLog("<b> $report")
+        }
+    }
+
+    /**
+     * Debug-only: deliver the timer tool (CVE-2026-98260) over Shizuku and
+     * run its safe `probe` mode. No root, no reboot risk; the run store holds
+     * the tool's document and log.
+     */
+    fun runTimerProbeCheck() {
+        viewModelScope.launch {
+            val code = runCatching {
+                withContext(Dispatchers.IO) { repository.runTimerProbe(::appendLog) }
+            }.getOrElse { error ->
+                appendLog("<s> error: ${error.message}")
+                1
+            }
+            appendLog("<b> timer probe exit=$code")
+        }
+    }
+
+    /**
+     * Debug-only: run the timer route's way-2 tool (`fake`). It can panic and
+     * reboot the device; one attempt per boot, and the parked tool must be
+     * left running until the reboot.
+     */
+    fun runTimerRouteCheck() {
+        viewModelScope.launch {
+            val code = runCatching {
+                withContext(Dispatchers.IO) { repository.runTimerRoute(::appendLog) }
+            }.getOrElse { error ->
+                appendLog("<s> error: ${error.message}")
+                1
+            }
+            appendLog("<b> timer run exit=$code")
         }
     }
 
@@ -1406,12 +1614,10 @@ class GhostlockViewModel(
             onStatusClick()
             return
         }
-        val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair) ?: return
-        val pairLabel = snapshot.cpuPairLabels.getOrElse(snapshot.selectedCpuPair) { pair.toString() }
         viewModelScope.launch {
             /* Run-start pre-flight: class-1 checks stop the run before the log
              * sheet opens, so no run-store entry and no native are created. */
-            when (val preflight = withContext(Dispatchers.IO) { repository.preflight(pair, useShizuku) }) {
+            when (val preflight = withContext(Dispatchers.IO) { repository.preflight(useShizuku) }) {
                 is PreflightResult.Blocked -> {
                     showPreflightNotice(preflight.failure)
                     return@launch
@@ -1434,10 +1640,9 @@ class GhostlockViewModel(
                 application.getString(R.string.run_notif_running_text),
             )
             appendLog("==== start ${if (useShizuku) "Shizuku/V20" else "base"} ====")
-            appendLog("cpu pair: $pairLabel")
             withContext(Dispatchers.IO) {
                 try {
-                    val code = runExploitUseCase(config, pair, useShizuku, ::appendLog)
+                    val code = runExploitUseCase(config, useShizuku, ::appendLog)
                     appendLog(if (code == 0) "result: exploit completed" else "result: exploit failed (exit code=$code)")
                     appendLog("exit code=$code")
                     finishRunStatus(code)
@@ -1454,7 +1659,14 @@ class GhostlockViewModel(
     private fun finishRunStatus(code: Int) {
         val text = mutableState.value.session.run.logLines.joinToString("\n") { it.text }
         val dirtyfrag = text.contains("pipeline=dirtyfrag")
-        val rooted = code == 0 && (text.contains("KernelSU ready") || text.contains("RESULT=OK"))
+        val rooted = code == 0 && (
+            text.contains("KernelSU ready") ||
+                text.contains("RESULT=OK") ||
+                /* The timer route's own success markers: the module loaded and
+                 * the tool parked holding the fake cred page. */
+                text.contains("KSU_LOADED") ||
+                text.contains("fake cred page held")
+            )
         val message = application.getString(
             when {
                 rooted && dirtyfrag -> R.string.run_notif_success_text_dirtyfrag
@@ -1562,10 +1774,6 @@ class GhostlockViewModel(
             PreflightFailure.ANCHOR_GRID_MISMATCH -> {
                 title = R.string.preflight_anchor_title
                 message = R.string.preflight_anchor_grid
-            }
-            PreflightFailure.CPU_PAIR_UNAVAILABLE -> {
-                title = R.string.preflight_cpu_title
-                message = R.string.preflight_cpu_message
             }
             PreflightFailure.NO_ROOT_MANAGER -> {
                 /* The same warning the picker used to show; the picker keeps
@@ -1809,28 +2017,6 @@ class GhostlockViewModel(
                 }
             }
 
-            is ParseStep.Route -> {
-                val choice = step.choices.getOrNull(index)
-                val route = choice?.route
-                val carrier = choice?.carrier
-                val options = step.options
-                parseStep = ParseStep.Idle
-                if (route != null) {
-                    val carrierLabel = carrier?.takeIf { it != "native" }
-                    appendLog("route chosen: $route" + (carrierLabel?.let { " ($it)" } ?: ""))
-                    appendLog("pipeline order: ${options?.pipelineOrder?.joinToString(", ") ?: "legacy default"}")
-                    /* Keep the sidecar re-run path; when the superset is
-                     * present the route choice itself needs no second pass. */
-                    pendingParse = step.request.copy(route = route)
-                    val synthetic = options?.let { parsedFromOptions(it, route, carrier) }
-                    if (synthetic != null) {
-                        viewModelScope.launch(Dispatchers.IO) { advancePhys(synthetic) }
-                    } else {
-                        launchParse()
-                    }
-                }
-            }
-
             is ParseStep.Plan -> {
                 val parse = step.parse
                 val options = parse.options
@@ -1843,14 +2029,14 @@ class GhostlockViewModel(
                     /* Page-based: the lock-source choice still applies when a
                      * safe anchor exists. */
                     if (plans.anchorOnly != null && showLockDialog(parse)) return
-                    val cut = options.cut(plans.route, plans.page, options.device, carrier = parse.carrier)
+                    val cut = options.cut(plans.route, plans.page, options.device)
                         ?: return
                     appendLog("option: page (no page-free)")
                     viewModelScope.launch { continueParsed(parse, cut) }
                     return
                 }
                 val plan = choices.getOrNull(index - if (pageOffered) 1 else 0) ?: return
-                val cut = options.cut(plans.route, plan, options.device, carrier = parse.carrier)
+                val cut = options.cut(plans.route, plan, options.device)
                     ?: return
                 appendLog(
                     "option: " + plan.label + if (plan.conditioned) " (needs review)" else "",
@@ -1938,7 +2124,6 @@ class GhostlockViewModel(
         when {
             selectUri != null -> selectExternalProfile(selectUri)
             dialog is AppDialog.Input -> parseUrl(value)
-            dialog is AppDialog.Confirm -> toggleShizuku(true)
             dialog is AppDialog.NotificationPermission ->
                 send(GhostlockEffect.RequestNotificationPermission)
 
@@ -1948,11 +2133,6 @@ class GhostlockViewModel(
 
     fun onDialogDismiss() {
         when (parseStep) {
-            is ParseStep.Route -> {
-                parseStep = ParseStep.Idle
-                appendLog("result: route choice cancelled")
-            }
-
             is ParseStep.Plan -> {
                 parseStep = ParseStep.Idle
                 appendLog("result: option choice cancelled")
@@ -2047,10 +2227,9 @@ class GhostlockViewModel(
         val snapshot = withContext(Dispatchers.IO) { loadKernelSnapshot() }
         /* Validate the resolved profile here so the run button can grey out. */
         val loaded = withContext(Dispatchers.IO) {
-            val pair = snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
-                ?: return@withContext null
-            runCatching { profileController.load(snapshot.kernelRelease, pair) }.getOrNull()
+            runCatching { profileController.load(snapshot.kernelRelease) }.getOrNull()
         }
+        val moduleState = withContext(Dispatchers.IO) { moduleFacts(loaded) }
         kernelSnapshot = snapshot
         loaded?.let { resolvedProfile = it }
         mutableState.update {
@@ -2060,9 +2239,6 @@ class GhostlockViewModel(
                         deviceName = snapshot.deviceName,
                         kernelRelease = snapshot.kernelRelease,
                         socName = snapshot.socName,
-                        cpuPairLabels = snapshot.cpuPairLabels,
-                        cpuPairIndex = snapshot.selectedCpuPair,
-                        customCpuPair = loaded?.let(::customCpuPairOf),
                     ),
                     runSettings = it.session.runSettings.copy(
                         safeModeEnabled = snapshot.safeModeEnabled,
@@ -2077,8 +2253,20 @@ class GhostlockViewModel(
                     ),
                     support = it.session.support.copy(
                         hasProfile = loaded?.hasProfile ?: false,
+                        route = loaded?.route,
+                        fallback = loaded?.fallbackTo,
                         layers = loaded?.layers,
                         importedProfilePresent = profileController.importedProfileExists(),
+                        routeCandidates = loaded?.routeCandidates.orEmpty(),
+                        selectedRoute = loaded?.selectedRoute,
+                        carrierCandidates = loaded?.carrierCandidates.orEmpty(),
+                        selectedCarrier = loaded?.selectedCarrier,
+                        dirtyFragSelectable = loaded?.dirtyFragSelectable ?: false,
+                        dirtyFragOn = loaded?.dirtyFragOn ?: false,
+                        pipelineOrder = loaded?.pipelineOrder.orEmpty(),
+                        module = loaded?.module,
+                        moduleAssetVerified = moduleState.first,
+                        magiskManager = moduleState.second,
                     ),
                 ),
                 report = it.report.copy(
@@ -2243,7 +2431,7 @@ class GhostlockViewModel(
                 val result = parseSourceUseCase(
                     request.input, request.xblPath, request.uefiPath,
                     request.vendorBootPath, request.dtboPath,
-                    request.overwrite, request.route, ::appendLog,
+                    request.overwrite, null, ::appendLog,
                 )
             ) {
                 is ParseResult.RequiresOverwrite -> {
@@ -2254,21 +2442,19 @@ class GhostlockViewModel(
                 is ParseResult.Ambiguous -> {
                     val feasible = result.routes.filter { it.verdict == "feasible" }
                     appendLog(
-                        "result: ${feasible.size} feasible routes: " +
+                        "result: ${feasible.size} feasible route(s): " +
                             feasible.joinToString(", ") { it.route },
                     )
-                    if (feasible.isEmpty()) {
-                        appendLog("result: route ambiguity without a usable route")
-                        showNotice(R.string.parse_result_title, R.string.parse_failed)
-                        markGenerationFailed()
-                    } else {
-                        val options = result.options
-                        appendLog(
-                            "result: pipeline order " +
-                                (options?.pipelineOrder?.joinToString(", ") ?: "legacy default"),
-                        )
-                        showRouteDialog(request, feasible, options)
-                    }
+                    /* The route picker is gone: the extractor writes the route
+                     * superset and the home picker chooses at run time. An
+                     * ambiguous parse now means the pipeline could not be
+                     * resolved. */
+                    appendLog(
+                        "result: the extractor could not resolve the profile " +
+                            "(no feasible pipeline)",
+                    )
+                    showNotice(R.string.parse_result_title, R.string.parse_failed)
+                    markGenerationFailed()
                 }
 
                 is ParseResult.Parsed -> advancePhys(result)
@@ -2293,52 +2479,6 @@ class GhostlockViewModel(
 
     /** The pipeline picker is retired: the extractor derives the order and the
      * run path resolves it before W1. Kept out of the UI deliberately. */
-
-    /** The route picker: every feasible route is derived from the image, and
-     * which one runs is a device fact. The labels carry the waiter shape and
-     * the ABI inline; the grade is the route's measured mechanism hint. */
-    private fun showRouteDialog(
-        request: ParseRequest,
-        feasible: List<RouteVerdict>,
-        options: OptionSuperset?,
-    ) {
-        val choices = feasible.flatMap { choice ->
-            val option = options?.route(choice.route)
-            if (option == null || option.verdict != OptionSuperset.Feasible) {
-                listOf(RouteChoice(choice.route, "native", emptyMap(), choice.reason))
-            } else {
-                buildList {
-                    add(RouteChoice(choice.route, option.carrier, option.geometry, choice.reason))
-                    option.alternatives
-                        .filter { it.verdict == OptionSuperset.Feasible }
-                        .forEach { alt ->
-                            add(RouteChoice(choice.route, alt.carrier, alt.geometry, alt.reason))
-                        }
-                }
-            }
-        }
-        parseStep = ParseStep.Route(request, choices, options)
-        /* The row is two fields — route and carrier — and nothing else. The
-         * derivation reason is technical detail for the generation log. */
-        choices.forEach { choice ->
-            appendLog(
-                "result: option ${RouteDisplay.optionLabel(choice.route, choice.carrier)}" +
-                    " — ${choice.reason}",
-            )
-        }
-        mutableState.update {
-            it.copy(
-                generation = it.generation.copy(step = GenerationStep.Confirm),
-                overlay = it.overlay.copy(dialog = AppDialog.ListDialog(
-                    titleRes = R.string.parse_route_title,
-                    items = choices.map { choice ->
-                        RouteDisplay.optionLabel(choice.route, choice.carrier)
-                    },
-                    grades = choices.map { choice -> RouteDisplay.grade(choice.route) },
-                )),
-            )
-        }
-    }
 
     /**
      * The platform's image advice: ask for the next recommended image while
@@ -2433,10 +2573,22 @@ class GhostlockViewModel(
         }
         appendLog("profile generated: ${result.releases.joinToString()}")
         appendLog("result: profile generated; export it to use it")
+        val options = result.options
+        /* Multi-route superset: export the document as generated. The route
+         * choice belongs to the home picker at run time, not to a generation
+         * cut. A single-route profile keeps the page/anchor plan step below. */
+        val feasibleRoutes = options?.routes?.count { it.verdict == OptionSuperset.Feasible } ?: 0
+        if (feasibleRoutes > 1) {
+            appendLog(
+                "result: route superset ($feasibleRoutes routes); " +
+                    "the home picker chooses at run time",
+            )
+            continueParsed(result, document)
+            return
+        }
         /* Page-free options first, per the operator rule: one safe option is
          * taken automatically, several are offered without a page row, and
          * page is offered only when no safe option exists. */
-        val options = result.options
         val plans = options?.let { superset ->
             val route = result.route
                 ?: superset.routes.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
@@ -2449,7 +2601,6 @@ class GhostlockViewModel(
                         plans.route,
                         decision.plan,
                         options.device,
-                        carrier = result.carrier,
                     )
                     if (cut != null) {
                         appendLog("option: ${decision.plan.label} (auto)")
@@ -2545,42 +2696,6 @@ class GhostlockViewModel(
     }
 
     /**
-     * A parse result synthesized from the superset: the route choice is a cut,
-     * not a second extractor run. The sidecar re-run path still applies when a
-     * physical source is missing.
-     */
-    private fun parsedFromOptions(
-        options: OptionSuperset,
-        route: String?,
-        carrier: String? = null,
-    ): ParseResult.Parsed? {
-        val chosenRoute = route
-            ?: options.routes.firstOrNull { it.verdict == OptionSuperset.Feasible }?.route
-            ?: return null
-        val plans = options.plansFor(chosenRoute) ?: return null
-        val plan = when (val decision = plans.decision()) {
-            is OptionDecision.Auto -> decision.plan
-            else -> plans.safeOptions.firstOrNull() ?: plans.anchorOnly ?: plans.page
-        }
-        val document = options.cut(chosenRoute, plan, options.device, carrier = carrier)
-            ?: return null
-        return ParseResult.Parsed(
-            releases = listOf(options.release),
-            missing = if (options.physLoad == null) setOf("kernel_phys_load") else emptySet(),
-            documentName = options.release.replace(Regex("[^A-Za-z0-9._-]"), "_") + ".conf",
-            route = chosenRoute,
-            anchor = plan.anchorName?.let { "info: plan anchor $it" },
-            hasAnchor = plan.anchor != null,
-            physSource = options.physSource,
-            physLoadPresent = options.physLoad != null,
-            physOffsetPresent = options.physOffset != null,
-            documentText = document,
-            options = options,
-            carrier = carrier,
-        )
-    }
-
-    /**
      * The stride probe and the export are shared by the no-anchor path and the
      * post-choice path: [document] is what will be exported (page mode has had
      * the `lock_anchor_*` triple removed in memory).
@@ -2589,10 +2704,14 @@ class GhostlockViewModel(
         /* The live stride probe only makes sense for the running kernel; a
          * profile generated for another image skips it. */
         val runningRelease = kernelSnapshot?.kernelRelease
-        val pair = kernelSnapshot?.let { snapshot ->
-            snapshot.cpuPairs.getOrNull(snapshot.selectedCpuPair)
-        }
-        val strideProbe = if (runningRelease != null && pair != null &&
+        /* The generated document may carry the optional timer block; a
+         * single-route cut rendered from the option superset does not. Carry
+         * the block into whatever this path exports (metadata only: the
+         * native wire never carries it). */
+        val exportDocument = result.documentText?.let { source ->
+            TimerBlockText.extract(source)?.let { TimerBlockText.append(document, it) }
+        } ?: document
+        val strideProbe = if (runningRelease != null &&
             runningRelease in result.releases
         ) {
             appendLog("stride: probing the mm_struct slab on the running kernel")
@@ -2618,7 +2737,7 @@ class GhostlockViewModel(
             send(GhostlockEffect.KeepScreenAwake(true))
             try {
                 runCatching {
-                    repository.probeStride(runningRelease, document, pair, ::appendLog)
+                    repository.probeStride(runningRelease, exportDocument, ::appendLog)
                 }.getOrNull()
             } finally {
                 send(GhostlockEffect.KeepScreenAwake(false))
@@ -2637,7 +2756,7 @@ class GhostlockViewModel(
         if (strideProbe != null && runningRelease != null) {
             pendingStrideParse = result
             pendingStrideProbe = strideProbe
-            pendingStrideDocument = document
+            pendingStrideDocument = exportDocument
             pendingStrideName = result.documentName
             pendingStrideRelease = runningRelease
             val recommendation = recommendStride(
@@ -2664,7 +2783,7 @@ class GhostlockViewModel(
              * sheet first so the SAF activity is not left behind a modal. */
             mutableState.update { it.copy(session = it.session.copy(run = it.session.run.copy(sheetVisible = false))) }
             finishGeneratedProfile(
-                document,
+                exportDocument,
                 result.documentName,
                 runningRelease ?: result.releases.firstOrNull() ?: "profile",
                 null,

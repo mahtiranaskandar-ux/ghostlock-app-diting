@@ -73,6 +73,51 @@ namespace ghostlock::session::dirtyfrag_verdict {
         return true;
     }
 
+    /* One `key=value` token from a report line; empty when absent. */
+    inline std::string field_value(std::string_view line, std::string_view key) noexcept {
+        const std::string needle = " " + std::string(key);
+        const std::size_t at = line.find(needle);
+        if (at == std::string_view::npos) return {};
+        const std::size_t first = at + needle.size();
+        std::size_t stop = first;
+        while (stop < line.size() && line[stop] != ' ' && line[stop] != '\r' &&
+               line[stop] != '\n') {
+            stop++;
+        }
+        return std::string(line.substr(first, stop - first));
+    }
+
+    /* The root script's Magisk handoff report (module pipeline):
+     *   MAGISK-SUMMARY magiskd=<pid|none> enforce=<0|1|unreadable> policy=<live|path>
+     *                  policy_rc=<n> su=...
+     * `magiskd=none` is the script's own failure sign (the daemon did not come
+     * up); a missing line means the block never reported. */
+    struct MagiskSummary {
+        bool present = false;
+        std::string magiskd;
+        std::string enforce;
+        std::string policy;
+        std::string policy_rc;
+
+        bool ready() const noexcept {
+            return present && !magiskd.empty() && magiskd != "none";
+        }
+    };
+
+    inline bool parse_magisk_summary(std::string_view output, MagiskSummary *result) noexcept {
+        const std::size_t marker = output.rfind("MAGISK-SUMMARY ");
+        if (marker == std::string_view::npos) return false;
+        std::size_t end = output.find('\n', marker);
+        if (end == std::string_view::npos) end = output.size();
+        const std::string_view line = output.substr(marker, end - marker);
+        result->present = true;
+        result->magiskd = field_value(line, "magiskd=");
+        result->enforce = field_value(line, "enforce=");
+        result->policy = field_value(line, "policy=");
+        result->policy_rc = field_value(line, "policy_rc=");
+        return true;
+    }
+
     /* What the script's report means for the device. A successful write is
      * enforcing. A denied read is enforcing too: SELinux checks are bypassed
      * while permissive, so only an enforcing device can refuse the read (the

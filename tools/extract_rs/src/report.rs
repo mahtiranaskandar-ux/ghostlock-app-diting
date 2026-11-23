@@ -365,11 +365,16 @@ pub fn conf_route_geometry_with_sigreturn(
                 geometry
             })
             .unwrap_or_default(),
-        // `tcp_zerocopy` carries only execution tuning in the wire schema; its
-        // section has no `compact_waiter` field and the runtime takes the
-        // global `waiter_layout.compact` fact. `multicast_waiter` has no
-        // release-keyed branch either: its block is built from the route
-        // verdict's own numbers (`conf_multicast_route_geometry`).
+        // `tcp_zerocopy`'s section carries only its stamp-shape flag; the
+        // runtime reads it from the route branch (`misc.compact_waiter` on the
+        // wire) and the app requires it, so the cut must emit the shared
+        // waiter-layout fact rather than an empty branch.
+        "tcp_zerocopy" if waiter_compact => {
+            vec![("compact_waiter", crate::family::SELECT_COMPACT_WAITER)]
+        }
+        // `multicast_waiter` has no release-keyed branch: its block is built
+        // from the route verdict's own numbers
+        // (`conf_multicast_route_geometry`).
         _ => Vec::new(),
     }
 }
@@ -476,13 +481,13 @@ pub fn render_conf_with_device(input: &ConfInputs<'_>, device: Option<&str>) -> 
         .split('.')
         .next()
         .and_then(|part| part.parse::<u32>().ok());
-    let schema_version = if device.is_some() { 2 } else { 1 };
+    /* Profile schema v3 is the only accepted document format (2026-11-22). */
+    let schema_version = 3;
     let mut lines = vec![
         format!("# GhostLock kernel profile: {release} (HOCON, self-contained)."),
         format!("release = \"{release}\""),
         format!("schema_version = {schema_version}"),
         format!("kernel_major = {}", major.unwrap_or(0)),
-        "recommend_shizuku = 0".to_string(),
     ];
     if input.kdp == Some(true) {
         lines.push("kdp = 1".to_string());
@@ -882,12 +887,12 @@ mod tests {
             phys_source: "vendor_boot header (MediaTek)",
         };
         let device = render_conf_with_device(&inputs, Some("yunluo"));
-        assert!(device.contains("schema_version = 2"));
+        assert!(device.contains("schema_version = 3"));
         assert!(device.contains("kernel_phys_load = { yunluo = 1073741824 }"));
         assert!(device.contains("kernel_phys_offset = { yunluo = 1073741824 }"));
         assert!(device.contains("device=yunluo;"));
         let neutral = render_conf(&inputs);
-        assert!(neutral.contains("schema_version = 1"));
+        assert!(neutral.contains("schema_version = 3"));
         assert!(neutral.contains("kernel_phys_load = 1073741824"));
         assert!(!neutral.contains("device="));
     }
@@ -1352,10 +1357,12 @@ mod tests {
             conf_route_geometry("select_stack", "5.15.194-android13-8", Some(2), true),
             vec![("waiter_shift", 2), ("compact_waiter", 1)]
         );
-        // tcp_zerocopy has no geometry keys in the wire schema; the old
-        // release-keyed emission was never read by the decoder.
-        assert!(
-            conf_route_geometry("tcp_zerocopy", "6.1.118-android14-11", Some(1), true).is_empty()
+        // tcp_zerocopy's stamp-shape flag comes from the same per-image waiter
+        // layout fact; its branch must carry it or the app cannot resolve the
+        // route (the native reads `misc.compact_waiter` from the branch).
+        assert_eq!(
+            conf_route_geometry("tcp_zerocopy", "6.1.118-android14-11", Some(1), true),
+            vec![("compact_waiter", 1)]
         );
         assert!(
             conf_route_geometry("tcp_zerocopy", "6.6.89-android15-8", Some(-2), false).is_empty()
@@ -1731,22 +1738,21 @@ mod tests {
         let bundled = flatten_conf(&bundled);
 
         assert!(generated.contains_key("route.multicast_waiter.waiter_off"));
-        // The one intentional difference: shizuku defaults to off in generated
-        // confs, the bundled profile recommends it.
-        assert_eq!(
-            generated.get("recommend_shizuku").map(String::as_str),
-            Some("0")
-        );
+        // `recommend_shizuku` is retired from the authored schema (2026-11-23):
+        // the generated profile no longer emits it, while the older bundled
+        // fixture still carries it, which proves the retired key is the only
+        // document-shape difference left.
+        assert_eq!(generated.get("recommend_shizuku"), None);
         assert_eq!(
             bundled.get("recommend_shizuku").map(String::as_str),
             Some("1")
         );
 
         for key in bundled.keys() {
-            // Two intentional differences: shizuku defaults to off in generated
-            // confs, and the slab stride is a runtime measurement (QEMU/device
-            // /proc/slabinfo, restored into the bundles by 91ceeea) that an
-            // image-only generation cannot supply.
+            // Two intentional differences: `recommend_shizuku` is retired from
+            // generated profiles, and the slab stride is a runtime measurement
+            // (QEMU/device /proc/slabinfo, restored into the bundles by 91ceeea)
+            // that an image-only generation cannot supply.
             if key == "recommend_shizuku" || key == "kernelsnitch.mm_struct_sz" {
                 continue;
             }

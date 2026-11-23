@@ -25,9 +25,11 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{Feasibility, RouteVerdict};
-use crate::derive::{RelSymbols, disassemble_symbol, unique_offset_optional};
-use crate::disasm::{has_call_or_tail_branch, has_direct_call};
+use crate::derive::RelSymbols;
+use crate::disasm::{disassemble_range, has_call_or_tail_branch, has_direct_call};
+use crate::error::Result;
 use crate::ikconfig::KernelConfig;
+use crate::kallsyms::unique_with_lto_clones;
 
 /// Presence of the ESP shared-frag half of upstream `f4c50a4034e6`
 /// (5.10 backport `a6cb440f2`, first in v5.10.255): the `skb_has_shared_frag`
@@ -232,19 +234,43 @@ fn kdp(config: Option<&KernelConfig>, symbols: &BTreeMap<String, BTreeSet<u64>>)
     config.map(|config| config.value("CONFIG_KDP") == "y")
 }
 
+/// The pipeline's symbols are the ESP entry points and the UDP send helpers.
+/// An LTO build may internalize a static function under a clone suffix — the
+/// 5.4 vendor images carry `esp_input$<hash>` and `esp6_input$<hash>` — so
+/// this module resolves through the clone-aware lookup. The shared resolver
+/// is used here rather than in every derivation: these are the names whose
+/// exact form an LTO build actually rewrites on the measured images.
+fn pipeline_symbol(symbols: &RelSymbols, name: &str) -> Option<u64> {
+    unique_with_lto_clones(symbols, name).ok()
+}
+
+fn disassemble_pipeline_symbol(
+    kernel: &[u8],
+    symbols: &RelSymbols,
+    sorted_offsets: &[u64],
+    name: &str,
+    cap: usize,
+) -> Result<Vec<String>> {
+    let start = unique_with_lto_clones(symbols, name)? as usize;
+    let higher = sorted_offsets.iter().find(|off| **off as usize > start);
+    let stop = (start + cap).min(higher.map_or(start + cap, |off| *off as usize));
+    disassemble_range(kernel, start, stop)
+}
+
 /// Both `esp_input` and `esp6_input` must carry the shared-frag test for the
 /// fix to be present. A function that is absent (the corresponding ESP family
 /// is not built) is skipped; a function that is present but whose
 /// `skb_cow_data` call cannot be found makes the answer unknown.
 fn esp_guard(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) -> EspFix {
-    let Some(cow) = unique_offset_optional(rel_symbols, "skb_cow_data") else {
+    let Some(cow) = pipeline_symbol(rel_symbols, "skb_cow_data") else {
         return EspFix::Unknown;
     };
     let mut fixed = 0u32;
     let mut vulnerable = 0u32;
     let mut unknown = 0u32;
     for name in ["esp_input", "esp6_input"] {
-        let Ok(dis) = disassemble_symbol(kernel, rel_symbols, sorted_offsets, name, 0x800) else {
+        let Ok(dis) = disassemble_pipeline_symbol(kernel, rel_symbols, sorted_offsets, name, 0x800)
+        else {
             continue;
         };
         match shared_frag_test(&dis, cow) {
@@ -294,7 +320,9 @@ fn send_marking(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64])
     let mut marked = 0u32;
     let mut unmarked = 0u32;
     for name in ["__ip_append_data", "__ip6_append_data"] {
-        let Ok(dis) = disassemble_symbol(kernel, rel_symbols, sorted_offsets, name, 0x4000) else {
+        let Ok(dis) =
+            disassemble_pipeline_symbol(kernel, rel_symbols, sorted_offsets, name, 0x4000)
+        else {
             continue;
         };
         if dis.iter().any(|line| send_mark_line(line)) {
@@ -386,12 +414,13 @@ fn send_path(kernel: &[u8], rel_symbols: &RelSymbols, sorted_offsets: &[u64]) ->
             SendPath::IpAppendPage,
         ),
     ] {
-        let Some(target) = unique_offset_optional(rel_symbols, symbol) else {
+        let Some(target) = pipeline_symbol(rel_symbols, symbol) else {
             continue;
         };
         let mut caller_seen = false;
         for caller in callers {
-            let Ok(dis) = disassemble_symbol(kernel, rel_symbols, sorted_offsets, caller, 0x2000)
+            let Ok(dis) =
+                disassemble_pipeline_symbol(kernel, rel_symbols, sorted_offsets, caller, 0x2000)
             else {
                 continue;
             };

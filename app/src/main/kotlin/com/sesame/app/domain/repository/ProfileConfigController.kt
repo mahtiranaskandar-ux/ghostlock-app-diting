@@ -1,6 +1,5 @@
 package com.sesame.app.domain.repository
 
-import com.sesame.app.domain.model.CpuPair
 import com.sesame.app.domain.model.ProfileConfig
 import com.sesame.app.domain.model.ProfileImportResult
 import com.sesame.app.domain.model.ProfileDiffRow
@@ -14,19 +13,38 @@ import com.sesame.app.domain.model.ProfileDiffRow
  */
 interface ProfileConfigController {
     /** Resolves the active source (external > builtin > bundled) for [release]. */
-    suspend fun load(release: String, pair: CpuPair): ProfileConfig
+    suspend fun load(release: String): ProfileConfig
+
+    /**
+     * Stores the picker's route choice for [release]. Returns false when the
+     * route is not in the current viable set; the stale choice is cleared and
+     * the default applies.
+     */
+    fun selectRoute(release: String, route: String): Boolean
+
+    /**
+     * Stores the carrier choice for one native route. Returns false when the
+     * carrier is not in that branch's `carriers`; the stale choice is cleared.
+     */
+    fun selectCarrier(release: String, route: String, carrier: String): Boolean
+
+    /**
+     * Stores the DirtyFrag on/off choice. Returns false when the profile's
+     * pipeline does not offer the choice (it must list both entries).
+     */
+    fun selectDirtyFrag(release: String, on: Boolean): Boolean
 
     /** Renders the active document as the HOCON an export writes. */
-    fun renderResolved(release: String, pair: CpuPair): String?
+    fun renderResolved(release: String): String?
 
     /** Renders the resolved document verbatim (no trimming) for debug dumps. */
-    fun renderResolvedForDebug(release: String, pair: CpuPair): String?
+    fun renderResolvedForDebug(release: String): String?
 
     /** Fields where this source differs from the bundled profile for [release]. */
-    fun diffAgainstBundle(release: String, pair: CpuPair): List<ProfileDiffRow>
+    fun diffAgainstBundle(release: String): List<ProfileDiffRow>
 
     /** Makes the bundle the session's base. */
-    suspend fun rebaseToBundle(release: String, pair: CpuPair): ProfileConfig
+    suspend fun rebaseToBundle(release: String): ProfileConfig
 
     /** Releases listed by the bundled kernel_profiles/index.conf. */
     suspend fun builtinReleases(): List<String>
@@ -53,11 +71,10 @@ interface ProfileConfigController {
     suspend fun selectExternalProfile(
         uri: String,
         deviceRelease: String,
-        pair: CpuPair,
     ): ProfileImportResult
 
     /** Drops the external selection; the bundle (or builtin) applies again. */
-    suspend fun clearExternalProfile(deviceRelease: String, pair: CpuPair): ProfileConfig
+    suspend fun clearExternalProfile(deviceRelease: String): ProfileConfig
 
     /**
      * Dangerous escape hatch: use another built-in profile as the source for
@@ -67,7 +84,6 @@ interface ProfileConfigController {
     suspend fun selectBuiltin(
         release: String?,
         deviceRelease: String,
-        pair: CpuPair,
     ): ProfileConfig
 
     /**

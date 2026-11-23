@@ -17,15 +17,14 @@ object ProfileMerger {
     private val RouteNames: List<String> = RouteKind.entries.map { it.token }
 
     /**
-     * common execution preset -> built-in -> imported, then the session CPU
-     * pair is forced in and the selected route groups are filled.
+     * common execution preset -> built-in -> imported, then the selected route
+     * groups are filled.
      */
     fun resolveMerged(
         deviceRelease: String,
         builtin: ValueMap?,
         imported: ValueMap?,
         tuningExecution: ValueMap?,
-        pair: CpuPairView,
         routePresets: Map<String, ValueMap>,
     ): ValueMap {
         /* Identity before the merge. The merge stamps the device's release over
@@ -42,25 +41,20 @@ object ProfileMerger {
          * profile inherited its route_wait_ms (30 instead of the tuning's 1000),
          * and the exporter and the app disagreed. Copy before merging. */
         val defaults = valueMapOf("release" to deviceRelease).apply {
-            if (tuningExecution != null) put("execution", tuningExecution.copyValue().asValueMap())
+            /* The native wire always carries an execution block (its schema
+             * requires it); an absent tuning leaves it empty, which resolves
+             * every knob to its shipped default. */
+            put("execution", tuningExecution?.copyValue()?.asValueMap() ?: valueMapOf())
         }
         val resolved = mergeSource(
             if (builtin == null) defaults else deepMergeValues(defaults, builtin),
             imported,
         )
-        resolved["schema_version"] = 1
+        resolved["schema_version"] = ProfileResolver.ProfileSchemaVersion.toLong()
         resolved["release"] = deviceRelease
-        applySelectedCpus(resolved, pair)
         fillRouteExecutionDefaults(resolved, routePresets)
         validateResolved(resolved, deviceRelease)
         return resolved
-    }
-
-    private fun applySelectedCpus(resolved: ValueMap, pair: CpuPairView) {
-        resolved.mutableChild("execution")["selected_cpus"] = valueMapOf(
-            "main" to pair.main.toLong(),
-            "consumer" to pair.consumer.toLong(),
-        )
     }
 
     /** Fills the route-tuning groups absent from the profile from the presets. */
@@ -138,6 +132,3 @@ object ProfileMerger {
         require(profile.containsKey("execution")) { "missing execution tuning" }
     }
 }
-
-/** Minimal CPU pair the merger needs; keeps the app's domain type out of core. */
-data class CpuPairView(val main: Int, val consumer: Int)

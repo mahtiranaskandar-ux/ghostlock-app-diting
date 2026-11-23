@@ -94,6 +94,45 @@ int32_t main(void) {
               "restore state", vector.output);
     }
 
+    /* The module pipeline's handoff report: the stage turns it into the
+     * MAGISK-HANDOFF verdict line. `magiskd=none` is the script's own failure
+     * sign, and a missing summary means the block never reported. */
+    using ghostlock::session::dirtyfrag_verdict::MagiskSummary;
+    using ghostlock::session::dirtyfrag_verdict::parse_magisk_summary;
+    struct MagiskVector {
+        const char *output;
+        bool present;
+        bool ready;
+        const char *magiskd;
+        const char *policy;
+        const char *policy_rc;
+        const char *enforce;
+    } magisks[] = {
+        {"[*] magisk: bin=/data/user/0/com.sesame.app/files/magiskbin tmp=/debug_ramdisk "
+         "module=/vendor/lib64/libbinderdebug.so\n"
+         "MAGISK-PHASE policy rc=0 source=live\n"
+         "MAGISK-SUMMARY magiskd=15371 enforce=0 policy=live policy_rc=0 su=\n"
+         "ENFORCE-RESTORE reason=magisk-handoff before=0 wrote=1 readback=unreadable\n"
+         "DFRC=0\n",
+         true, true, "15371", "live", "0", "0"},
+        {"MAGISK-SUMMARY magiskd=none enforce=0 policy=live policy_rc=1 su=\n",
+         true, false, "none", "live", "1", "0"},
+        {"MAGISK-SUMMARY magiskd= enforec=0 policy=live policy_rc=0\n",
+         true, false, "", "live", "0", ""},
+        {"no summary here\nDFRC=1\n", false, false, "", "", "", ""},
+    };
+    for (const auto &vector : magisks) {
+        MagiskSummary summary;
+        const bool present = parse_magisk_summary(vector.output, &summary);
+        check(present == vector.present, "magisk parse status", vector.output);
+        check(!present || summary.ready() == vector.ready, "magisk ready", vector.output);
+        check(!present || summary.magiskd == vector.magiskd, "magiskd", vector.output);
+        check(!present || summary.policy == vector.policy, "magisk policy", vector.output);
+        check(!present || summary.policy_rc == vector.policy_rc,
+              "magisk policy_rc", vector.output);
+        check(!present || summary.enforce == vector.enforce, "magisk enforce", vector.output);
+    }
+
     if (failures == 0) std::printf("dirtyfrag_verdict_test: ok\n");
     return failures == 0 ? 0 : 1;
 }

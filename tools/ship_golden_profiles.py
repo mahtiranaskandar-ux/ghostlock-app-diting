@@ -256,7 +256,10 @@ MISSING = object()
 # `kernel_phys_*` is the extractor's render-time output with the device sidecars
 # (the asset's per-device map); the store's scalar can lag that derivation, so it
 # is not a fact the asset is compared on.
-FACT_SKIP = {"schema_version", "kernel_phys_load", "kernel_phys_offset"}
+# `recommend_shizuku` is retired from the authored schema (2026-11-23): old
+# store supersets still carry it, but no shipped asset does, and the check must
+# not ask for it back.
+FACT_SKIP = {"schema_version", "kernel_phys_load", "kernel_phys_offset", "recommend_shizuku"}
 WAITER_LAYOUT_ORDER = ("compact", "pi_tree", "task", "lock", "wake_state")
 
 
@@ -490,6 +493,139 @@ def fact_mismatches(entry, asset_path):
     return mismatched
 
 
+TIMER_BLOCK = "timer_98260"
+TIMER_TOP_KEYS = [
+    "version",
+    "trigger",
+    "timer_site_lower_21bit", "timer_object_size", "cred_request_size", "cred_alloc_size", "cred_uid_offset",
+    "static_timer_site", "task_alloc_site_lower_21bit", "task_alloc_size", "task_cred_offset",
+    "selinux_state", "panic_on_warn", "root_user", "init_user_ns",
+    "init_ucounts", "init_groups",
+    "cred_usage_size", "cred_caps_offset", "cred_caps_count", "cred_security_offset",
+    "cred_user_offset", "cred_user_ns_offset", "cred_ucounts_offset",
+    "cred_group_info_offset", "security_sid_offset",
+    "timer_node_offset", "page_alloc_gfp_offset", "page_alloc_gfp_size",
+]
+TIMER_COMMENT = (
+    "# Timer route (CVE-2026-98260): the Shizuku-delivered shell tool's per-image\n"
+    "# constants. Not a native route; the native wire never carries this block.\n"
+)
+
+
+def timer_block(options):
+    """The store's shipped timer block (a dict) or None."""
+    timer = options.get(TIMER_BLOCK)
+    if not isinstance(timer, dict):
+        return None
+    block = timer.get("block")
+    return block if isinstance(block, dict) else None
+
+
+def _hocon_value(value):
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, bool):  # pragma: no cover - bool handled above
+        return "true" if value else "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    if isinstance(value, str):
+        return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    raise ValueError(f"unsupported timer value {value!r}")
+
+
+def render_timer_block(block):
+    """The `timer_98260` block as HOCON text (numbers stay numbers, 64-bit
+    kernel addresses stay quoted hex strings)."""
+    lines = [f"{TIMER_BLOCK} {{"]
+    for key in TIMER_TOP_KEYS:
+        if key in block:
+            lines.append(f"  {key} = {_hocon_value(block[key])}")
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def timer_block_facts(block):
+    """The block's fields as dotted facts, for the asset comparison."""
+    facts = {}
+    for key in TIMER_TOP_KEYS:
+        if key in block:
+            facts[f"{TIMER_BLOCK}.{key}"] = block[key]
+    return facts
+
+
+def timer_block_mismatches(entry, asset_path):
+    """The asset's timer_98260 fields that are absent or differ from the store."""
+    block = timer_block(entry["options"])
+    if block is None:
+        return []
+    expected = timer_block_facts(block)
+    actual = flatten_facts(load_conf_facts(asset_path))
+    mismatched = []
+    for key in sorted(expected):
+        wanted = expected[key]
+        got = actual.get(key, MISSING)
+        if got is MISSING:
+            mismatched.append((key, wanted, "<absent>"))
+        elif got != wanted:
+            mismatched.append((key, wanted, got))
+    return mismatched
+
+
+def sync_timer_block(entry, asset_path):
+    """Insert the timer block into an existing asset, or the block's missing
+    keys; never overwrite a value."""
+    block = timer_block(entry["options"])
+    if block is None:
+        return [], []
+    mismatched = timer_block_mismatches(entry, asset_path)
+    if not mismatched:
+        return [], []
+    text = open(asset_path, encoding="utf-8").read()
+    start = re.search(rf"(?m)^\s*{re.escape(TIMER_BLOCK)}\s*\{{", text)
+    if not start:
+        text = text.rstrip("\n") + "\n\n" + TIMER_COMMENT + render_timer_block(block) + "\n"
+        open(asset_path, "w", encoding="utf-8").write(text)
+        return [f"added {TIMER_BLOCK} block"], []
+    # The block exists: add its missing keys in the canonical order, keep every
+    # existing line, and report value differences as manual.
+    lines = text.splitlines(keepends=True)
+    start_line = text[: start.start()].count("\n")
+    end_line = None
+    for index in range(start_line + 1, len(lines)):
+        if lines[index].strip() == "}":
+            end_line = index
+            break
+    if end_line is None:
+        return [], mismatched
+    present = {}
+    unknown = []
+    for index in range(start_line + 1, end_line):
+        match = re.match(r"\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", lines[index])
+        if match:
+            present[match.group(1)] = index
+        elif lines[index].strip():
+            unknown.append(lines[index])
+    added = []
+    body = []
+    for key in TIMER_TOP_KEYS:
+        if key in present:
+            body.append(lines[present[key]])
+        elif key in block:
+            body.append(f"  {key} = {_hocon_value(block[key])}\n")
+            added.append(key)
+    body.extend(unknown)
+    if not added:
+        return [], mismatched
+    new_lines = lines[: start_line + 1] + body + lines[end_line:]
+    open(asset_path, "w", encoding="utf-8").write("".join(new_lines))
+    manual = [item for item in mismatched if item[0].rsplit(".", 1)[-1] not in added]
+    return [f"completed {TIMER_BLOCK}: added {len(added)} keys ({', '.join(added)})"], manual
+
+
 def _render_literal(value):
     if value is None:
         return "null"
@@ -702,6 +838,42 @@ def candidates(store):
     return found, exempt
 
 
+def feasible_route_names(options):
+    return sorted(
+        route.get("route")
+        for route in options.get("routes", [])
+        if route.get("verdict") == "feasible"
+    )
+
+
+def asset_route_names(path):
+    """The route branch names inside the asset's `route { ... }` parent."""
+    names = []
+    in_route = False
+    depth = 0
+    for raw in open(path, encoding="utf-8", errors="replace"):
+        line = raw.split("#", 1)[0].rstrip()
+        if not line.strip():
+            continue
+        if not in_route:
+            if line.strip() == "route {":
+                in_route = True
+                depth = 0
+            continue
+        stripped = line.strip()
+        if stripped.endswith("{"):
+            if depth == 0:
+                names.append(stripped[:-1].strip())
+            depth += 1
+            continue
+        if stripped == "}":
+            if depth == 0:
+                in_route = False
+            else:
+                depth -= 1
+    return sorted(names)
+
+
 def validate(entry):
     options = read_options(entry["directory"])
     devices = entry_devices(entry["meta"], entry["directory"])
@@ -713,6 +885,7 @@ def validate(entry):
         devices=devices,
         primary=devices[0],
         route=choose_route(options),
+        routes=feasible_route_names(options),
         maps=phys_map_lines(options),
         stride=mm_struct_stride(entry["directory"], entry["meta"]),
     )
@@ -751,7 +924,6 @@ def render(extract, entry, out_path):
     command += sidecar_args(entry["directory"], entry["primary"])
     command += [
         "--format", "conf",
-        "--route", entry["route"],
         "--anchor",
         "--device", entry["primary"],
         "--pipeline-order", ",".join(entry["choice_pipeline_order"]),
@@ -773,10 +945,13 @@ def asset_text(entry, rendered):
         text = replace_line(text, "kernel_phys_offset", entry["maps"][1])
     if entry.get("stride"):
         text = set_mm_struct_stride(text, entry["stride"])
-    route_label = entry["route"]
+    block = timer_block(entry["options"])
+    if block is not None:
+        text = text.rstrip("\n") + "\n\n" + TIMER_COMMENT + render_timer_block(block) + "\n"
+    route_label = ", ".join(entry["routes"])
     header = (
         "# SHIPPED GOLDEN -- test-kernels golden (QEMU tier); generated, do not edit.\n"
-        f"# store: {entry['release']}; route: {route_label}; "
+        f"# store: {entry['release']}; routes: {route_label}; "
         f"devices: {', '.join(entry['devices'])}\n"
         "# maintained by external/ghostlock-app/tools/ship_golden_profiles.py\n"
     )
@@ -788,6 +963,7 @@ def main():
     parser.add_argument("--check", action="store_true", help="report only, exit 1 on a missing or mismatched golden")
     parser.add_argument("--apply", action="store_true", help="render and index the missing goldens")
     parser.add_argument("--refresh", action="store_true", help="rewrite existing SHIPPED GOLDEN assets whose pipeline line or measured mm_struct_sz is missing/infeasible")
+    parser.add_argument("--refresh-all", action="store_true", help="re-render every shipped golden from the store as the route superset")
     parser.add_argument("--sync-facts", action="store_true", help="insert missing derived facts (layout/route/offset blocks) into existing assets; report value differences as manual")
     parser.add_argument("--store", default=DEFAULT_STORE)
     parser.add_argument("--assets", default=DEFAULT_ASSETS)
@@ -797,10 +973,10 @@ def main():
         help="limit to releases matching any given substring (debugging)",
     )
     args = parser.parse_args()
-    if args.check and (args.apply or args.refresh or args.sync_facts):
-        parser.error("--check is mutually exclusive with --apply/--refresh/--sync-facts")
-    if args.sync_facts and (args.apply or args.refresh):
-        parser.error("--sync-facts is mutually exclusive with --apply/--refresh")
+    if args.check and (args.apply or args.refresh or args.refresh_all or args.sync_facts):
+        parser.error("--check is mutually exclusive with --apply/--refresh/--refresh-all/--sync-facts")
+    if args.sync_facts and (args.apply or args.refresh or args.refresh_all):
+        parser.error("--sync-facts is mutually exclusive with --apply/--refresh/--refresh-all")
 
     found, exempt = candidates(args.store)
     index = index_releases(args.assets)
@@ -808,6 +984,48 @@ def main():
         os.path.basename(path)[:-5]
         for path in glob.glob(os.path.join(args.assets, "*.conf"))
     }
+
+    if args.refresh_all:
+        if not os.path.isfile(args.extract):
+            parser.error(f"extractor not found: {args.extract} (build tools/extract_rs)")
+        refreshed, failed = [], []
+        for entry in found:
+            release = entry["release"]
+            if args.only and not any(needle in release for needle in args.only):
+                continue
+            asset_path = os.path.join(args.assets, release + ".conf")
+            if not os.path.isfile(asset_path):
+                continue
+            try:
+                validate(entry)
+                entry["choice_pipeline_order"] = choose_pipeline_order(
+                    entry["options"], entry["meta"]
+                )
+            except NotShippable:
+                continue
+            except PipelineChoiceRequired as error:
+                failed.append((release, str(error)))
+                continue
+            with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as handle:
+                temp_path = handle.name
+            try:
+                render(args.extract, entry, temp_path)
+                rendered = open(temp_path, encoding="utf-8").read()
+            except Exception as error:  # noqa: BLE001 - report each entry, keep going
+                failed.append((release, str(error)))
+                continue
+            finally:
+                if os.path.exists(temp_path):
+                    os.unlink(temp_path)
+            with open(asset_path, "w", encoding="utf-8") as handle:
+                handle.write(asset_text(entry, rendered))
+            refreshed.append(release)
+        for release in refreshed:
+            print(f"refreshed {release}")
+        for release, error in failed:
+            print(f"FAILED  {release}: {error}", file=sys.stderr)
+        print(f"refreshed {len(refreshed)}, failed {len(failed)}")
+        return 1 if failed else 0
 
     bundled = 0
     missing = []
@@ -863,6 +1081,13 @@ def main():
                 ]
                 missing.append(entry)
                 continue
+            asset_routes = asset_route_names(asset_path)
+            if asset_routes != entry["routes"]:
+                entry["reasons"] = [
+                    f"asset routes {asset_routes} != derived {entry['routes']}"
+                ]
+                mismatched_entries.append(entry)
+                continue
             if release not in index:
                 entry["reasons"] = ["asset present but not in index.conf"]
                 missing.append(entry)
@@ -875,6 +1100,7 @@ def main():
                 missing.append(entry)
                 continue
             facts = fact_mismatches(entry, asset_path)
+            facts += timer_block_mismatches(entry, asset_path)
             if facts:
                 entry["reasons"] = [
                     f"{key}: expected {wanted!r}, got {got!r}"
@@ -907,6 +1133,9 @@ def main():
         for entry in mismatched_entries:
             asset_path = os.path.join(args.assets, entry["release"] + ".conf")
             applied, manual = sync_facts(entry, asset_path)
+            block_applied, block_manual = sync_timer_block(entry, asset_path)
+            applied += block_applied
+            manual += block_manual
             print(f"SYNC {entry['release']}: {len(applied)} inserted, {len(manual)} manual")
             for item in applied:
                 print(f"   + {item}")
@@ -916,6 +1145,7 @@ def main():
         for entry in mismatched_entries:
             asset_path = os.path.join(args.assets, entry["release"] + ".conf")
             left = fact_mismatches(entry, asset_path)
+            left += timer_block_mismatches(entry, asset_path)
             if left:
                 remaining += 1
                 print(f"REMAINING {entry['release']}: {len(left)}")

@@ -137,14 +137,33 @@ tasks.register<Exec>("buildDirtyfragProbe") {
     outputs.file(file("build/native/libdfprobe.so"))
 }
 
+/* The timer route tool (CVE-2026-98260): a standalone static aarch64
+ * executable delivered over Shizuku and exec'd from nativeLibraryDir. It is
+ * never loaded as a library (docs/analysis/timer-w3-app-delivery-plan.md). */
+tasks.register<Exec>("buildTimerTool") {
+    description = "buildTimerTool"
+    workingDir(file("src"))
+    commandLine("make", "timer")
+    val ndk = resolveNdkDir()
+    environment("ANDROID_NDK_HOME", ndk)
+    environment("NDK_ROOT", ndk)
+    inputs.files(
+        fileTree("src/timer") { include("**/*.c", "**/*.h") },
+        file("src/Makefile"),
+    )
+    outputs.file(file("build/native/timer"))
+}
+
 tasks.register<Copy>("prepareGhostlockJniLibs") {
     description = "prepareGhostlockJniLibs"
     dependsOn("buildGhostlockNative")
     dependsOn("buildGhostlockCompatHelper")
     dependsOn("buildDirtyfragProbe")
+    dependsOn("buildTimerTool")
     from("build/native/ghostlock") { rename { "libghostlock.so" } }
     from("build/native/ghostlock32") { rename { "libghostlock32.so" } }
     from("build/native/libdfprobe.so") { rename { "libdfprobe.so" } }
+    from("build/native/timer") { rename { "libtimer.so" } }
     into("app/src/main/jniLibs/arm64-v8a")
     /* Strip only the packaged copies: static libc++ carries its DWARF into the
      * binary, while the top-level ghostlock keeps its symbols for the
@@ -154,7 +173,7 @@ tasks.register<Copy>("prepareGhostlockJniLibs") {
         .resolveSibling("llvm-strip").absolutePath
     val packagedDir = File(rootDir, "app/src/main/jniLibs/arm64-v8a")
     doLast {
-        for (name in listOf("libghostlock.so", "libghostlock32.so", "libdfprobe.so")) {
+        for (name in listOf("libghostlock.so", "libghostlock32.so", "libdfprobe.so", "libtimer.so")) {
             val code = ProcessBuilder(stripPath, "--strip-all", File(packagedDir, name).absolutePath)
                 .inheritIO()
                 .start()
@@ -197,4 +216,37 @@ tasks.register<Copy>("prepareGhostlockExtractJniLibs") {
     from("build/extract/aarch64-linux-android/release/ghostlock-extract")
     into("app/src/main/jniLibs/arm64-v8a")
     rename { "libextract.so" }
+}
+
+/* The timer route's generation-side analyzer (CVE-2026-98260): a standalone
+ * aarch64 executable packaged like the extractor and exec'd from
+ * nativeLibraryDir (docs/analysis/timer-block-generation-plan.md). The
+ * vendored crate needs the host Rust toolchain (edition 2024), so unlike the
+ * extractor this task does not use the ONDK +ondk/build-std path; the NDK
+ * linker settings are the same. */
+tasks.register<Exec>("buildTimerExtract") {
+    description = "buildTimerExtract"
+    val tools = extractNdkTools()
+    val command = mutableListOf(resolveCargoExecutable())
+    command += listOf("build", "--release", "--target", "aarch64-linux-android")
+    workingDir(rootProject.file("tools/timer_extract"))
+    commandLine(command)
+    environment("CC_aarch64_linux_android", tools.clang)
+    environment("AR_aarch64_linux_android", tools.ar)
+    environment("CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER", tools.clang)
+    environment("RUSTFLAGS", "-C force-unwind-tables=no -C link-arg=-Wl,--icf=all")
+    inputs.files(
+        fileTree("tools/timer_extract/src") { include("**/*.rs") },
+        file("tools/timer_extract/Cargo.toml"),
+        file("tools/timer_extract/Cargo.lock"),
+    )
+    outputs.file(file("build/timer-extract/aarch64-linux-android/release/timer-extract"))
+}
+
+tasks.register<Copy>("prepareTimerExtractJniLibs") {
+    description = "prepareTimerExtractJniLibs"
+    dependsOn("buildTimerExtract")
+    from("build/timer-extract/aarch64-linux-android/release/timer-extract")
+    into("app/src/main/jniLibs/arm64-v8a")
+    rename { "libtimerextract.so" }
 }

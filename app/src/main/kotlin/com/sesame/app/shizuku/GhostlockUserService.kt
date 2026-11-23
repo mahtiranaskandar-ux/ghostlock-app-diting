@@ -14,8 +14,10 @@ import com.sesame.app.data.ManagerScanner
 import com.sesame.app.data.NativeProfileDocument
 import java.io.File
 import java.io.RandomAccessFile
+import java.nio.charset.StandardCharsets
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 @Keep
 class GhostlockUserService(private val context: Context) : IGhostlockUserService.Stub() {
@@ -34,11 +36,13 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
         /* A full bugreport takes ~2 minutes on the rigs; 10 is the ceiling
          * before the subprocess is killed and the app gets an empty stream. */
         const val REPORT_TIMEOUT_MINUTES = 10L
+        /* A timer attempt is tens of seconds; a hit parks. The watchdog only
+         * bounds a wedged run, it never bounds a legitimate park (the park
+         * has already produced its marker by then). */
+        const val TIMER_TIMEOUT_MS = 10L * 60 * 1000
     }
 
     override fun runExploit(
-        primaryCpu: Int,
-        consumerCpu: Int,
         safeMode: Boolean,
         forceAttack: Boolean,
         anchorTrusted: Boolean,
@@ -64,12 +68,6 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 }
                 val release = System.getProperty("os.version", "").orEmpty()
                 require(profileBlob.size >= 16) { "profile blob is too short" }
-                // PROFILE-SUGGEST-01: recommend_shizuku is a suggestion; the
-                // blob's meta section carries it, and the app already chose the
-                // Shizuku path, so it is logged, never a gate.
-                if (NativeProfileDocument.fromBinary(profileBlob)?.recommendShizuku != 1u) {
-                    callback.onLog("<s> kernel does not require Shizuku; running on user request")
-                }
 
                 val binary = File(context.applicationInfo.nativeLibraryDir, "libghostlock.so")
                 require(binary.isFile) { "missing GhostLock binary: ${binary.absolutePath}" }
@@ -172,6 +170,170 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
             running.set(false)
             runCatching { callback.onComplete(exitCode) }
         }, "ghostlock-shizuku-runner").start()
+    }
+
+    /**
+     * The timer route (CVE-2026-98260). The tool is a standalone static
+     * executable shipped as `libtimer.so`; it is copied out, given the
+     * canonical profile document, and run as the shell. The endgame is
+     * reported from log markers because a hit and several misses park
+     * forever: the parked parent holds the fake cred page (or the failed
+     * plants' zombies), and the process must outlive this service call.
+     */
+    override fun runTimer(
+        profileJson: String,
+        mode: String,
+        managerPackage: String?,
+        callback: IGhostlockCallback,
+    ) {
+        if (!running.compareAndSet(false, true)) {
+            callback.onLog("<s> error: another GhostLock process is already running")
+            callback.onComplete(1)
+            return
+        }
+        Thread({
+            val outcome = runCatching { runTimerBlocking(profileJson, mode, managerPackage, callback) }
+                .getOrElse { error ->
+                    runCatching { callback.onLog("<s> error: ${error.message}") }
+                    1
+                }
+            running.set(false)
+            runCatching { callback.onComplete(outcome) }
+        }, "ghostlock-shizuku-timer").start()
+    }
+
+    private fun runTimerBlocking(
+        profileJson: String,
+        mode: String,
+        managerPackage: String?,
+        callback: IGhostlockCallback,
+    ): Int {
+        require(Process.myUid() == Process.SHELL_UID) {
+            "Shizuku UserService uid=${Process.myUid()}, expected ${Process.SHELL_UID}"
+        }
+        val status = File("/proc/self/status").readText()
+        require(Regex("(?m)^Seccomp:\\s*0$").containsMatchIn(status)) {
+            "Shizuku UserService is still seccomp-filtered"
+        }
+        require(profileJson.isNotBlank()) { "timer profile document is empty" }
+        require(mode == "probe" || mode == "fake" || mode == "zero") {
+            "unknown timer mode: $mode"
+        }
+        val binary = File(context.applicationInfo.nativeLibraryDir, "libtimer.so")
+        require(binary.isFile) { "missing timer binary: ${binary.absolutePath}" }
+        val workDir = File("/data/local/tmp/ghostlock-app").apply {
+            require(isDirectory || mkdirs()) { "cannot create $absolutePath" }
+        }
+        val timer = File(workDir, "timer")
+        timer.delete()
+        binary.inputStream().use { input -> timer.outputStream().use { input.copyTo(it) } }
+        runCatching { Os.chmod(timer.absolutePath, 448) }
+        val profileFile = File(workDir, "timer-profile.json")
+        profileFile.writeBytes(profileJson.toByteArray(StandardCharsets.UTF_8))
+        runCatching { Os.chmod(profileFile.absolutePath, 384) }
+        callback.onLog("<s> Shizuku ready: uid=${Process.myUid()} Seccomp=0")
+        callback.onLog(
+            "<s> timer: ${timer.absolutePath} mode=$mode document=${profileJson.length}B",
+        )
+        /* probe reads and validates the document; it never reaches the root
+         * handoff, so a missing manager must not block the delivery gate. */
+        if (mode != "probe") {
+            val candidates = ManagerScanner.scan(context)
+            val suitable = candidates.count { it.suitable }
+            val chosen = ManagerScanner.resolve(candidates, managerPackage)
+                ?: error("no suitable ksud found; refusing to start the timer route")
+            val bytes = File(chosen.path).readBytes()
+            /* The tool's own handoff script probes /data/local/tmp/ksud when
+             * the installed manager's libksud.so has no late-load (e.g.
+             * com.sukisu.ultra); stage the app's choice there and in the work
+             * directory. */
+            for (target in listOf(File(workDir, "ksud"), File("/data/local/tmp/ksud"))) {
+                target.writeBytes(bytes)
+                runCatching { Os.chmod(target.absolutePath, 448) }
+            }
+            callback.onLog("<s> ksud scan: ${candidates.size} candidate(s), $suitable suitable")
+            callback.onLog("<s> ksud selected: ${chosen.packageName} ${chosen.path} [${chosen.verdict}]")
+        }
+        val logFile = File(workDir, "timer-${System.currentTimeMillis()}.log")
+        val argv = listOf(timer.absolutePath, "--profile", profileFile.absolutePath, mode)
+        callback.onLog("<b> starting timer: ${argv.joinToString(" ")}")
+        val process = ProcessBuilder(argv)
+            .directory(workDir)
+            .redirectErrorStream(true)
+            .redirectOutput(logFile)
+            .apply {
+                environment()["HOME"] = workDir.absolutePath
+                environment()["TMPDIR"] = workDir.absolutePath
+            }
+            .start()
+        val verdict = AtomicInteger(Int.MIN_VALUE)
+        val logOffset = java.util.concurrent.atomic.AtomicLong(0)
+        val onLine: (String) -> Unit = { line ->
+            TimerVerdict.of(line)?.let { verdict.compareAndSet(Int.MIN_VALUE, it) }
+        }
+        val tailer = Thread({
+            tailTimerLog(logFile, callback, logOffset, onLine)
+        }, "ghostlock-shizuku-timer-tailer").apply {
+            isDaemon = true
+            start()
+        }
+        val deadline = System.currentTimeMillis() + TIMER_TIMEOUT_MS
+        while (System.currentTimeMillis() < deadline && verdict.get() == Int.MIN_VALUE) {
+            if (!process.isAlive) {
+                verdict.compareAndSet(Int.MIN_VALUE, process.exitValue())
+                break
+            }
+            Thread.sleep(100)
+        }
+        tailer.interrupt()
+        tailer.join(1000)
+        /* The tool's last lines can land after the tailer's final poll (a
+         * probe exits in ~100 ms); drain them before reading the verdict so
+         * the log and the marker are never lost. */
+        if (!tailer.isAlive) drainTimerLog(logFile, callback, logOffset, onLine)
+        val outcome = verdict.get()
+        if (outcome == Int.MIN_VALUE) {
+            callback.onLog("<s> error: timer produced no verdict in ${TIMER_TIMEOUT_MS / 1000}s")
+            return TimerVerdict.NoVerdict
+        }
+        /* A parked process is left running on purpose: it is what keeps the
+         * fake cred page (or the failed-plant zombies) alive until reboot. */
+        callback.onLog("<b> timer verdict=$outcome (a parked tool is left running)")
+        return outcome
+    }
+
+    /** Forwards the growing timer log file; the tool is never backpressured. */
+    private fun tailTimerLog(
+        logFile: File,
+        callback: IGhostlockCallback,
+        offset: java.util.concurrent.atomic.AtomicLong,
+        onLine: (String) -> Unit,
+    ) {
+        while (!Thread.currentThread().isInterrupted) {
+            TimerLogTail.read(logFile, offset, includeTrailingPartial = false) { line ->
+                onLine(line)
+                runCatching { callback.onLog(line) }
+            }
+            try {
+                Thread.sleep(100)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return
+            }
+        }
+    }
+
+    /** One final read after the tailer stopped; includes a trailing partial line. */
+    private fun drainTimerLog(
+        logFile: File,
+        callback: IGhostlockCallback,
+        offset: java.util.concurrent.atomic.AtomicLong,
+        onLine: (String) -> Unit,
+    ) {
+        TimerLogTail.read(logFile, offset, includeTrailingPartial = true) { line ->
+            onLine(line)
+            runCatching { callback.onLog(line) }
+        }
     }
 
     /** Forward complete native log lines without ever blocking the native

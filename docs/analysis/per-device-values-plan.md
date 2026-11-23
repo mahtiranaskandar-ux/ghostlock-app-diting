@@ -164,11 +164,10 @@ The device-scoped values must be selectable by device; the kernel-scoped values 
   `execution-tuning.conf`; the diting preset becomes a data table keyed by `Build.DEVICE`
   (`device_defaults`). `isDitingDevice()` and the codename branch in `readExecutionTuning()` are
   deleted.
-- **`selected_cpus` is not a profile fact.** The app derives the pair from the device’s clusters and
-  forces it at resolve time; the profile’s copy is a hint and is not authoritative. A wrong hint
-  (e.g. CPU 8 on an 8-core device) is inert: the merger overwrites it, the wire’s `recommended_cpus`
-  is filled from the forced pair, the native validates the pair and reverts on failure
-  (`runtime_config.cpp:25-64`), and the editor drops it on export. Add a unit test for this.
+- **`selected_cpus` is not a profile fact.** *(Superseded 2026-11-23: the field
+  was removed from the schema and from the app. The native chooses the pair at
+  run time and the wire's `recommended_cpus` is a neutral `0/1`; see
+  [`manual-shizuku-and-native-cpu-pair-plan.md`](manual-shizuku-and-native-cpu-pair-plan.md).)*
 - The wire is unchanged: after resolution the phys fields are scalars (or null) and the timing is an
   integer, exactly as today. The wire digest and native golden stay frozen.
 
@@ -265,7 +264,7 @@ asset comments; the table carries the same rationale as a comment.
 
 | profiles | change |
 |---|---|
-| 5.10.81/101/136/177/198/209/226/236 | v2: phys maps with the `diting` entry; the three diting-measured timing keys set to `null` (the device table supplies 30 / 10000 / 5000 on a diting; generic elsewhere). `selected_cpus` may stay as a hint. |
+| 5.10.81/101/136/177/198/209/226/236 | v2: phys maps with the `diting` entry; the three diting-measured timing keys set to `null` (the device table supplies 30 / 10000 / 5000 on a diting; generic elsewhere). `selected_cpus` was removed from the authored profiles on 2026-11-23. |
 | 6.1.145 g9b69cc (Motorola Edge 60 Fusion) | v2: phys maps with its device entry |
 | 6.1.157 a8b0b54 (Infinix X6879/X6873, MT6788) | v2: same |
 | 6.6.89 5a0ffb4 (`dew`, Redmi 15C / POCO C85) | v2: phys maps with `dew` |
@@ -310,7 +309,9 @@ entry). `dew` is known from the OTA name. Do not migrate those two until `Build.
 - Editor per-device entry editing (write-back rules and UI cues) if users need it.
 - Legacy v1 external profiles with a top-level scalar pair keep today’s behaviour; consider a run-log
   notice when the pair equals another platform’s compiled default.
-- Remove `selected_cpus` from the profiles once the UI no longer uses it as a hint.
+- ~~Remove `selected_cpus` from the profiles once the UI no longer uses it as a hint.~~ Done
+  2026-11-23, with the picker: see
+  [`manual-shizuku-and-native-cpu-pair-plan.md`](manual-shizuku-and-native-cpu-pair-plan.md).
 
 ## Rollout order
 

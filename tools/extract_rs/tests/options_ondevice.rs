@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 fn check_entry(binary: &str, meta: &common::Meta, checked: &AtomicUsize) {
     let release = &meta.release;
     let golden = options_path(meta);
-    let want: serde_json::Value = serde_json::from_str(
+    let mut want: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&golden).unwrap_or_else(|err| {
             panic!(
                 "{release}: cannot read {}: {err}",
@@ -45,10 +45,19 @@ fn check_entry(binary: &str, meta: &common::Meta, checked: &AtomicUsize) {
         run.exit,
         run.stderr
     );
-    let got: serde_json::Value =
+    let mut got: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out).expect("read produced superset"))
             .expect("parse produced superset");
     let _ = std::fs::remove_file(&out);
+
+    /* `timer_98260` is the timer tool's overlay, not this extractor's output:
+     * the store carries it for the two timer entries while a fresh run of this
+     * binary cannot. Compare every section the extractor owns. */
+    for value in [&mut want, &mut got] {
+        if let Some(map) = value.as_object_mut() {
+            map.remove("timer_98260");
+        }
+    }
 
     /* Section-first so a failure names the part that moved. */
     for key in ["schema_version", "release", "kernel_major", "kernel_phys_load",

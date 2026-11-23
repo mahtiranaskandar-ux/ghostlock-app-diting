@@ -18,9 +18,6 @@ enum class PreflightFailure {
     /** The state file's slot grid is not this profile's grid (or its count is invalid). */
     ANCHOR_GRID_MISMATCH,
 
-    /** The selected CPU pair refuses sched_setaffinity (paused core / cpuset). */
-    CPU_PAIR_UNAVAILABLE,
-
     /** No late-load-capable KernelSU-family manager is installed. */
     NO_ROOT_MANAGER,
 }

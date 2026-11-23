@@ -1,48 +1,21 @@
 package com.sesame.app.domain.model
 
 import com.sesame.app.data.OptionSuperset
+import com.sesame.app.data.profile.ModuleConfig
 import java.util.Locale
-
-data class CpuPair(val primary: Int, val consumer: Int) {
-    override fun toString(): String = "$primary,$consumer"
-}
-
-/**
- * The profile's CPU hint, accepted only when it names one of the device's own
- * candidate pairs. A hint from another device (8/9 on an 8-core phone, a
- * negative value, or a value that overflows an Int) is ignored rather than
- * displayed or acted on; the session pair remains the only pinning input.
- */
-internal fun customCpuPairHint(
-    primary: Long,
-    consumer: Long,
-    candidates: List<CpuPair>,
-    devicePair: CpuPair?,
-): CpuPair? {
-    if (primary !in 0L..Int.MAX_VALUE.toLong() || consumer !in 0L..Int.MAX_VALUE.toLong()) return null
-    val pair = CpuPair(primary.toInt(), consumer.toInt())
-    return pair.takeIf { it in candidates && it != devicePair }
-}
 
 data class KernelSnapshot(
     val deviceName: String,
     val kernelRelease: String,
     val socName: String = "",
-    val cpuPairs: List<CpuPair>,
-    val cpuPairLabels: List<String>,
-    val selectedCpuPair: Int,
     val safeModeEnabled: Boolean,
     /** Skip the pre-attack KernelSU check and run the exploit as a test. */
     val forceAttackTest: Boolean = false,
-    /** Second way: stop after W1 and run the DirtyFrag page-cache stage. */
-    val secondWay: Boolean = false,
     /** Clear the vendor vr.ko task tags before W2; Auto follows the probe/version recommendation. */
     val vrKoTagClear: VrKoMode = VrKoMode.AUTO,
     /** Block the vr.ko SELinux 0/1 enforce write; Auto targets the 5.10.198 class only. */
     val vrKoSelinuxBlock: VrKoMode = VrKoMode.AUTO,
-    /** Profile/imported offsets force the Shizuku path. */
-    val recommendShizuku: Boolean,
-    /** User-selected Shizuku path for kernels that do not require it. */
+    /** User-selected Shizuku path; opt-in only, never seeded from a profile. */
     val shizukuEnabled: Boolean = false,
     val shizukuStatus: ShizukuStatus,
 )
@@ -265,14 +238,25 @@ data class AnchorGeometry(
     val stride: Long? = null,
 )
 
+/**
+ * A route the resolved profile can run on this device. Viability is a pure
+ * profile parse (the block is present and passes the static guards); the picker
+ * displays exactly these, with no ranking.
+ */
+data class RouteCandidate(
+    val name: String,
+    /** The Shizuku-delivered timer backend rather than a native route. */
+    val timer: Boolean = false,
+    /**
+     * The carriers this route's branch lists (`native`/`compat`), primary
+     * first. Empty for the timer and for the legacy single-carrier flag form.
+     */
+    val carriers: List<String> = emptyList(),
+)
+
 data class ProfileConfig(
     val release: String,
     val hasProfile: Boolean,
-    /**
-     * CPU pair this config was resolved for. The native document is resolved on
-     * demand rather than cached, so it needs the pair the caller resolved with.
-     */
-    val pair: CpuPair = CpuPair(0, 0),
     /** Resolved physical pair; null when the profile carries none for this device. */
     val physLoad: Long? = null,
     val physOffset: Long? = null,
@@ -288,8 +272,32 @@ data class ProfileConfig(
     val route: String? = null,
     /** Declared fallback route ("none"/"<route>"); null means unset. */
     val fallbackTo: String? = null,
+    /**
+     * The routes this profile can run on the device, in the profile's order.
+     * A native branch plus the timer block is already a two-candidate profile.
+     */
+    val routeCandidates: List<RouteCandidate> = emptyList(),
+    /**
+     * The picker's choice — a native route name or `timer_98260`. Null when no
+     * route resolved. The default is the first candidate; a stored choice that
+     * is no longer viable is cleared at load.
+     */
+    val selectedRoute: String? = null,
+    /**
+     * The carriers the active native route lists, and the remembered choice
+     * among them. Empty/null for the legacy single-carrier form (the branch's
+     * `compat_carrier` flag decides) and for the timer selection.
+     */
+    val carrierCandidates: List<String> = emptyList(),
+    val selectedCarrier: String? = null,
+    /** True when the profile's pipeline names both DirtyFrag and GhostLock. */
+    val dirtyFragSelectable: Boolean = false,
+    /** The remembered DirtyFrag choice; false = GhostLock only for this run. */
+    val dirtyFragOn: Boolean = false,
     /** The profile's ordered pipeline preference; empty = legacy ghostlock. */
     val pipelineOrder: List<String> = emptyList(),
+    /** The module chain's pair manifest, when the pipeline selects `module`. */
+    val module: ModuleConfig? = null,
     /** Dotted paths whose resolved value violates the geometry rules. */
     val invalidPaths: Set<String> = emptySet(),
 ) {
@@ -304,8 +312,6 @@ data class ProfileConfig(
          * profile never shows another route's knobs.
          */
         val GeneralPaths = listOf(
-            "execution.selected_cpus.main",
-            "execution.selected_cpus.consumer",
             "execution.heap.prepare_max_attempts",
             "execution.heap.prepare_timeout_ms",
             "execution.heap.kernelsnitch_timeout_ms",

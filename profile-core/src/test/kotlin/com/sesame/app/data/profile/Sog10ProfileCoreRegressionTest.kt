@@ -53,7 +53,6 @@ class Sog10ProfileCoreRegressionTest {
             builtin = profile,
             imported = null,
             tuningExecution = tuning,
-            pair = CpuPairView(0, 1),
             routePresets = presets,
         )
         val merged = resolve(builtin)

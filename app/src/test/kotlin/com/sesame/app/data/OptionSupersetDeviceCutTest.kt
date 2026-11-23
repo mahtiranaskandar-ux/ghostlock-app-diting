@@ -8,7 +8,7 @@ import org.junit.Test
 /**
  * The on-device extractor records one full derivation per device sidecar set.
  * The ambiguous-route cut must select the running device's entry and emit a
- * schema-v2 map; a legacy superset without devices keeps the scalar.
+ * schema-v3 map; a legacy superset without devices keeps the scalar.
  */
 class OptionSupersetDeviceCutTest {
     private val json = """
@@ -33,7 +33,6 @@ class OptionSupersetDeviceCutTest {
               "release": "5.10.198-android12-9-00085-g226a9632f13d-ab11136126",
               "schema_version": "1",
               "kernel_major": "5",
-              "recommend_shizuku": "0",
               "kernel_phys_load": "2818572288",
               "kernel_phys_offset": "null"
             }
@@ -55,12 +54,12 @@ class OptionSupersetDeviceCutTest {
         HoconSupport.parseValue(text).asValueMap() ?: error("cut is not an object")
 
     @Test
-    fun `the cut selects the device pair and emits a v2 map`() {
+    fun `the cut selects the device pair and emits a v3 map`() {
         val superset = superset()
         assertEquals("diting", superset.device)
         val plans = superset.plansFor("select_stack") ?: error("no plans")
         val document = cutDocument(superset.cut("select_stack", plans.page)!!)
-        assertEquals(2, (document["schema_version"] as Number).toInt())
+        assertEquals(3, (document["schema_version"] as Number).toInt())
         val resolved = PerDevicePhys.resolveFor(document, listOf("diting")).document
         assertEquals(2818572288L, resolved["kernel_phys_load"])
         assertNull(resolved["kernel_phys_offset"])
@@ -81,7 +80,7 @@ class OptionSupersetDeviceCutTest {
         val superset = superset().copy(devices = emptyList())
         val plans = superset.plansFor("select_stack") ?: error("no plans")
         val document = cutDocument(superset.cut("select_stack", plans.page)!!)
-        assertEquals(1, (document["schema_version"] as Number).toInt())
+        assertEquals(3, (document["schema_version"] as Number).toInt())
         val resolved = PerDevicePhys.resolveFor(document, listOf("diting")).document
         assertEquals(2818572288L, resolved["kernel_phys_load"])
         assertNull(resolved["kernel_phys_offset"])

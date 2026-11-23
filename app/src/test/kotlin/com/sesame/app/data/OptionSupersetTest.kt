@@ -80,7 +80,6 @@ class OptionSupersetTest {
           "profile": {
             "": { "release": "\"6.1.138-android14-11-g44bda9e8f6e9-ab13792638\"",
                   "schema_version": "1", "kernel_major": "6",
-                  "recommend_shizuku": "0",
                   "kernel_phys_load": "1073741824",
                   "kernel_phys_offset": "null" },
             "fallback": { "to": "\"none\"" },

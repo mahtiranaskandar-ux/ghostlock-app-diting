@@ -36,7 +36,15 @@ namespace ghostlock::session {
         int32_t ever_rooted = 0;
     };
 
+    /* Stage verify result: > 0 success, 0 "retry", < 0 "do not retry" (the
+     * target is gone, so another attempt cannot succeed). The retry ladder
+     * treats < 0 as terminal. */
     using write_stage_verify_fn = int32_t (*)(void *context);
+
+    /* Optional hook called immediately before each stage write. The W2
+     * credential stage uses it to put the victim into its user-space spin
+     * (session/victim_spin.h); the return value is advisory and logged only. */
+    using write_stage_pre_write_fn = int32_t (*)(void *context);
 } // namespace ghostlock::session
 
 #endif

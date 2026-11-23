@@ -5,7 +5,7 @@ import com.sesame.app.data.asValueMap
 import com.sesame.app.data.copyValue
 
 /**
- * Resolves the schema-v2 per-device physical pair.
+ * Resolves the schema-v3 per-device physical pair.
  *
  * A v2 document may write `kernel_phys_load` / `kernel_phys_offset` as maps
  * keyed by a device identity (`{ diting = 2818572288 }`). This selects the
@@ -58,15 +58,15 @@ object PerDevicePhys {
         requireMatch: Boolean = true,
     ): PhysResolution {
         val schema = (document["schema_version"] as? Number)?.toInt()
-        if (schema != null && schema !in 1..2) {
-            throw IllegalArgumentException("unsupported profile schema $schema")
+        if (schema != ProfileResolver.ProfileSchemaVersion) {
+            throw IllegalArgumentException(
+                "unsupported profile schema ${schema ?: "absent"}; " +
+                    "this build reads schema ${ProfileResolver.ProfileSchemaVersion}",
+            )
         }
         val resolved = document.copyValue().asValueMap() ?: ValueMap()
         val maps = Keys.map { key -> key to (resolved[key] as? Map<*, *>) }
         if (maps.all { it.second == null }) return PhysResolution(resolved, null)
-        if (schema != 2) {
-            throw IllegalArgumentException("per-device physical maps require schema_version = 2")
-        }
         val entriesByKey = LinkedHashMap<String, ValueMap>()
         val keySets = mutableListOf<Set<String>>()
         for ((key, rawMap) in maps) {

@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdint>
+#include <algorithm>
 
 namespace {
     using ghostlock::host::script;
@@ -110,6 +111,36 @@ namespace {
                      "selinux: verify_selinux retried twice");
         return ok;
     }
+    bool test_w2_victim_gone_stops() {
+        reset_script();
+        /* A fatal verify (-1) is "the victim is gone": the stage must stop after
+         * that attempt instead of routing more writes at a dead task. */
+        script().verify_w2 = {-1};
+        script().verify_w2_default = 1;
+        const auto result = run_once();
+        bool ok = true;
+        ok &= expect(result.code == ghostlock::runtime::RunCode::Failed,
+                     "gone: pipeline fails");
+        ok &= expect(count_calls("verify_w2") == 1, "gone: exactly one verify");
+        ok &= expect(count_calls("arm_w2_spin") == 1, "gone: one spin arm for the W2 attempt");
+        return ok;
+    }
+
+    bool test_w2_arms_spin_before_the_write() {
+        reset_script();
+        const auto result = run_once();
+        bool ok = true;
+        ok &= expect(result.code == ghostlock::runtime::RunCode::Completed,
+                     "arm: pipeline completes");
+        ok &= expect(count_calls("arm_w2_spin") == 1, "arm: one W2 spin arm");
+        /* The arm is recorded before the first W2 verify. */
+        const auto &calls = script().calls;
+        const auto arm = std::find(calls.begin(), calls.end(), "arm_w2_spin");
+        const auto first_verify = std::find(calls.begin(), calls.end(), "verify_w2");
+        ok &= expect(arm != calls.end() && first_verify != calls.end() && arm < first_verify,
+                     "arm: spin armed before the first W2 verify");
+        return ok;
+    }
 } // namespace
 
 int main() {
@@ -118,6 +149,8 @@ int main() {
     ok &= test_w2_retry_until_success();
     ok &= test_w2_exhausts_attempts();
     ok &= test_selinux_retry_then_w2();
+    ok &= test_w2_victim_gone_stops();
+    ok &= test_w2_arms_spin_before_the_write();
     if (ok) {
         std::puts("backend_dataflow_test: ok");
         return 0;

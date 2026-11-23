@@ -43,4 +43,7 @@ namespace ghostlock::attack {
     void timer_reset(void) {}
 
     void timer_mark(const char *label) { (void) label; }
+
+    /* The backend's stage logs call this; the host harness has no clock. */
+    double timer_ms(void) { return 0.0; }
 } // namespace ghostlock::attack

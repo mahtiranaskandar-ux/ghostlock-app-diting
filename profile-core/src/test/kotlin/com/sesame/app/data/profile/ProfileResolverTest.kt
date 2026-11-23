@@ -3,10 +3,24 @@ package com.sesame.app.data.profile
 import com.sesame.app.data.asValueMap
 import com.sesame.app.data.valueMapOf
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProfileResolverTest {
+    private val moduleRelease = "5.4.233-qgki-gbb70cde46897"
+
+    private fun moduleBlock(
+        release: String = moduleRelease,
+        overrides: Map<String, Any?> = emptyMap(),
+    ): Map<String, Any?> = valueMapOf(
+        "version" to 1L,
+        "asset" to "modules/$release.ko",
+        "asset_sha256" to "a".repeat(64),
+        "vendor_files" to listOf("/vendor/lib64/libbinderdebug.so"),
+    ) + overrides
+
     @Test
     fun `a KDP profile requires the strict dirtyfrag order`() {
         fun pipelineErrors(profile: Map<String, Any?>) =
@@ -23,18 +37,149 @@ class ProfileResolverTest {
         )
         assertTrue(pipelineErrors(valueMapOf("kdp" to 1L)).isNotEmpty())
         assertTrue(pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to listOf("DIRTYFRAG"))).isEmpty())
+        assertTrue(pipelineErrors(valueMapOf("kdp" to 1L, "pipeline" to listOf("module"))).isEmpty())
         assertTrue(pipelineErrors(valueMapOf("kdp" to 0L, "pipeline" to listOf("ghostlock"))).isEmpty())
         assertTrue(pipelineErrors(valueMapOf("pipeline" to listOf("ghostlock"))).isEmpty())
         assertTrue(pipelineErrors(valueMapOf("pipeline" to listOf("bogus"))).isNotEmpty())
     }
 
     @Test
-    fun `nativeValue folds selected cpus into the recommended slots`() {
+    fun `the optional routes order is validated`() {
+        fun routeErrors(profile: Map<String, Any?>) =
+            ProfileResolver.validateMerged(profile, "select_stack", "none")
+                .filter { it.fieldPath == "routes" }
+
+        assertTrue(routeErrors(valueMapOf("routes" to listOf("select_stack", "timer_98260"))).isEmpty())
+        assertTrue(routeErrors(valueMapOf("routes" to listOf("select_stack", "bogus"))).isNotEmpty())
+        assertTrue(routeErrors(valueMapOf("routes" to "select_stack")).isNotEmpty())
+        assertTrue(routeErrors(valueMapOf()).isEmpty())
+    }
+
+    @Test
+    fun `the carriers list is validated and the legacy flag still resolves`() {
+        fun carrierErrors(profile: Map<String, Any?>) =
+            ProfileResolver.validateMerged(profile, "select_stack", "none")
+                .filter { it.fieldPath == "route.select_stack.carriers" }
+
+        fun branch(carriers: Any?): Map<String, Any?> = valueMapOf(
+            "route" to valueMapOf("select_stack" to valueMapOf("carriers" to carriers)),
+        )
+
+        assertTrue(carrierErrors(branch(listOf("native", "compat"))).isEmpty())
+        assertTrue(carrierErrors(branch(listOf("native", "bogus"))).isNotEmpty())
+        assertTrue(carrierErrors(branch(emptyList<String>())).isNotEmpty())
+        assertTrue(carrierErrors(branch("native")).isNotEmpty())
+        assertTrue(carrierErrors(valueMapOf()).isEmpty())
+
+        assertEquals(
+            listOf("native", "compat"),
+            RouteCarriers.of(branch(listOf("native", "compat")), "select_stack"),
+        )
+        assertEquals(
+            listOf("compat"),
+            RouteCarriers.of(
+                valueMapOf(
+                    "route" to valueMapOf(
+                        "select_stack" to valueMapOf("compat_carrier" to 1),
+                    ),
+                ),
+                "select_stack",
+            ),
+        )
+        assertEquals(emptyList<String>(), RouteCarriers.of(valueMapOf(), "select_stack"))
+    }
+
+    @Test
+    fun `a bundled module profile needs no route or w1 geometry`() {
+        val profile = valueMapOf(
+            "release" to moduleRelease,
+            "schema_version" to 3,
+            "kernel_major" to 5,
+            "pipeline" to listOf("module"),
+            "module" to moduleBlock(),
+        )
+        assertEquals(emptyList<Any>(), ProfileResolver.validateMerged(profile, null, null))
+    }
+
+    @Test
+    fun `the module entry and the block imply each other`() {
+        fun fields(profile: Map<String, Any?>) =
+            ProfileResolver.validateMerged(profile, null, null).map { it.fieldPath }
+
+        val entryOnly = valueMapOf(
+            "release" to moduleRelease,
+            "schema_version" to 3,
+            "kernel_major" to 5,
+            "pipeline" to listOf("module"),
+        )
+        assertTrue("module" in fields(entryOnly))
+
+        val blockOnly = valueMapOf(
+            "release" to moduleRelease,
+            "schema_version" to 3,
+            "kernel_major" to 5,
+            "module" to moduleBlock(),
+        )
+        assertTrue("pipeline" in fields(blockOnly))
+
+        val nullBlock = valueMapOf(
+            "release" to moduleRelease,
+            "schema_version" to 3,
+            "kernel_major" to 5,
+            "pipeline" to listOf("module"),
+            "module" to null,
+        )
+        assertTrue("module" in fields(nullBlock))
+    }
+
+    @Test
+    fun `a w1 chain in the list keeps the w1 requirements`() {
+        val profile = valueMapOf(
+            "release" to "test",
+            "schema_version" to 3,
+            "kernel_major" to 6,
+            "pipeline" to listOf("module", "ghostlock"),
+            "module" to moduleBlock(release = "test"),
+        )
+        val fields = ProfileResolver.validateMerged(profile, null, null)
+            .map { it.fieldPath }.toSet()
+        for (required in listOf("route", "task_struct", "cred", "offset")) {
+            assertTrue("missing $required", required in fields)
+        }
+    }
+
+    @Test
+    fun `the legacy default still requires w1`() {
+        val profile = valueMapOf(
+            "release" to "test",
+            "schema_version" to 3,
+            "kernel_major" to 6,
+        )
+        val fields = ProfileResolver.validateMerged(profile, null, null)
+            .map { it.fieldPath }.toSet()
+        assertTrue("route" in fields)
+        assertTrue("task_struct" in fields)
+    }
+
+    @Test
+    fun `pipeline helpers read the order and the w1 need`() {
+        assertEquals(
+            listOf("module"),
+            ProfileResolver.pipelineOrder(valueMapOf("pipeline" to listOf("MODULE"))),
+        )
+        assertFalse(ProfileResolver.requiresW1(listOf("module")))
+        assertTrue(ProfileResolver.requiresW1(listOf("module", "ghostlock")))
+        assertTrue(ProfileResolver.requiresW1(emptyList()))
+    }
+
+    @Test
+    fun `nativeValue no longer folds selected cpus into the recommended slots`() {
+        /* The app injects the neutral pair at the transport boundary; the
+         * document's selected_cpus (a retired field) is not a wire source. */
         val profile = valueMapOf(
             "execution" to valueMapOf("selected_cpus" to valueMapOf("main" to 3)),
         )
-        assertEquals(
-            3L,
+        assertNull(
             ProfileResolver.nativeValue(profile, "tcp_zerocopy", "none", "execution.recommended_cpus.main"),
         )
     }
@@ -119,6 +264,21 @@ class ProfileResolverTest {
     fun `validateMerged rejects an unknown top level key`() {
         val errors = ProfileResolver.validateMerged(validProfile() + ("bogus" to 1L), "select_stack", "none")
         assertTrue(errors.any { it.fieldPath == "bogus" })
+    }
+
+    @Test
+    fun `validateMerged still accepts the retired recommend_shizuku key`() {
+        /* Every schema-v3 external profile generated before 2026-11-23 carries
+         * the key; refusing it would invalidate all of them on an upgrade. It
+         * is retired from the authored schema and ignored, not rejected. */
+        assertEquals(
+            emptyList<ConfigError>(),
+            ProfileResolver.validateMerged(
+                validProfile() + ("recommend_shizuku" to 0L),
+                "select_stack",
+                "none",
+            ),
+        )
     }
 
     @Test
@@ -368,9 +528,25 @@ class ProfileResolverTest {
         assertTrue(ProfileResolver.validateMerged(release66, "select_stack", "none").isEmpty())
     }
 
+    @Test
+    fun `an older schema is refused`() {
+        for (version in listOf(1L, 2L)) {
+            val profile = validProfile().also { it["schema_version"] = version }
+            assertTrue(
+                ProfileResolver.validateMerged(profile, "select_stack", "none")
+                    .any { it.fieldPath == "schema_version" },
+            )
+        }
+        val unversioned = validProfile().also { it.remove("schema_version") }
+        assertTrue(
+            ProfileResolver.validateMerged(unversioned, "select_stack", "none")
+                .any { it.fieldPath == "schema_version" },
+        )
+    }
+
     private fun validProfile(): MutableMap<String, Any?> = valueMapOf(
         "release" to "test",
-        "schema_version" to 1,
+        "schema_version" to 3,
         "kernel_major" to 6,
         "route" to valueMapOf("select_stack" to valueMapOf("waiter_shift" to 0)),
         "task_struct" to valueMapOf(

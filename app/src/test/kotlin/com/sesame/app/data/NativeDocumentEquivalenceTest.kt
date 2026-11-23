@@ -2,7 +2,6 @@ package com.sesame.app.data
 
 import android.app.Application
 import androidx.core.content.edit
-import com.sesame.app.domain.model.CpuPair
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -24,7 +23,6 @@ import java.security.MessageDigest
 @Config(sdk = [35])
 class NativeDocumentEquivalenceTest {
     private val context: Application = RuntimeEnvironment.getApplication()
-    private val pair = CpuPair(primary = 0, consumer = 1)
 
     @Test
     fun `builtin native documents match the frozen golden`() = runBlocking {
@@ -67,7 +65,7 @@ class NativeDocumentEquivalenceTest {
             }
             val computed = LinkedHashMap<String, String>()
             for ((release, _) in golden) {
-                val config = controllerFor(release).load(release, pair)
+                val config = controllerFor(release).load(release)
                 assertTrue("$release did not resolve", config.hasProfile)
                 val bytes = controllerFor(release).nativeDocument(config)
                 assertNotNull("$release has no native document", bytes)

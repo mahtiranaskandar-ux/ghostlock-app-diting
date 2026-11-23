@@ -112,11 +112,30 @@ GHOSTLOCK_BIN := $(NATIVE_BUILD_DIR)/ghostlock
 DFPROBE_BIN := $(NATIVE_BUILD_DIR)/libdfprobe.so
 DFPROBE_SRC := core/probe/dfprobe.c
 
-.PHONY: all ghostlock dfprobe clean product
+# --- timer route tool (CVE-2026-98260) -------------------------------------
+# A standalone static aarch64 executable delivered over Shizuku; it is never
+# loaded as a library. The source is the boundary build recorded in the root
+# repo at external/port/timer-boundary-2026-11-21/. API 24 matches that
+# evidence build; the tool uses raw syscalls and needs no newer surface.
+TIMER_API ?= 24
+TIMER_CC := $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/aarch64-linux-android$(TIMER_API)-clang
+TIMER_SRC := timer/timer.c timer/profile_json.c
+TIMER_HDR := timer/profile_json.h timer/kbuilds.h $(wildcard timer/kbuilds/*.h)
+TIMER_BIN := $(NATIVE_BUILD_DIR)/timer
+
+.PHONY: all ghostlock dfprobe timer clean product
 
 all: ghostlock
 
 ghostlock: $(GHOSTLOCK_BIN)
+
+timer: $(TIMER_BIN)
+
+$(TIMER_BIN): $(TIMER_SRC) $(TIMER_HDR) Makefile
+	@echo "Using timer compiler: $(TIMER_CC)"
+	@mkdir -p $(dir $@)
+	$(TIMER_CC) -O2 -g -Wall -Wextra -Wno-unused-parameter -static -Itimer \
+	  -o $@ $(TIMER_SRC) -lz -pthread
 
 dfprobe: $(DFPROBE_BIN)
 
@@ -171,6 +190,7 @@ NATIVE_HOST_TESTS := \
   target_constants_test native_resource_test \
   profile_binary_test futex_hash_test scan_grid_test stride_verify_test slab_order_test \
   number_parse_test runtime_paths_test runtime_config_test handoff_probe_test victim_context_test \
+  victim_spin_test \
   run_state_test address_space_test cpp_link_probe_test compat_bitmap_test dirtyfrag_verdict_test \
   anchor_align_test cpu_select_test
 
@@ -197,6 +217,8 @@ HOST_ATTACK_DATAFLOW_SOURCES := \
   core/session/dirtyfrag_stage.cpp \
   core/session/exploit_session.cpp \
   core/session/runtime_config.cpp \
+  core/session/cpu_select.cpp \
+  core/session/victim_context.cpp \
   core/memory/heap_context.cpp \
   core/memory/address_space.cpp \
   core/race/pi_race.cpp \
@@ -366,6 +388,10 @@ $(HOST_BUILD_DIR)/victim_context_test: core/tests/victim_context_test.cpp core/s
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -Icore core/tests/victim_context_test.cpp core/session/victim_context.cpp core/support/native_resource.cpp -o $@
 
+$(HOST_BUILD_DIR)/victim_spin_test: core/tests/victim_spin_test.cpp core/session/victim_spin.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CXX) $(HOST_CXXFLAGS) -pthread -Icore core/tests/victim_spin_test.cpp -o $@
+
 $(HOST_BUILD_DIR)/dirtyfrag_verdict_test: core/tests/dirtyfrag_verdict_test.cpp core/session/dirtyfrag_verdict.hpp
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
@@ -379,5 +405,5 @@ product: ghostlock
 	@echo "构建 APK: .\gradlew.bat :app:assembleDebug"
 
 clean:
-	rm -f $(GHOSTLOCK_BIN) ghostlock
+	rm -f $(GHOSTLOCK_BIN) ghostlock $(TIMER_BIN)
 	rm -rf $(BUILD_ROOT)/native $(BUILD_ROOT)/host

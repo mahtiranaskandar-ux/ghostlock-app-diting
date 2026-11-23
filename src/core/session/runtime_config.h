@@ -70,6 +70,19 @@ namespace ghostlock::config {
          * write. Auto recommends it only for 5.10.198 + the node. */
         VrKoMode vrko_selinux_block = VrKoMode::Auto;
 
+        /* GHOSTLOCK_HANDOFF: the root manager the root script installs after
+         * the exploit. "kernelsu" (default) late-loads ksud; "magisk" runs the
+         * userspace late install — the bundled module pipeline, or a bench
+         * switch on the existing W1 pipelines. */
+        std::string handoff = "kernelsu";
+        /* GHOSTLOCK_MAGISK_BIN: the directory holding the staged Magisk
+         * binaries (magisk, magisk32, magiskpolicy, busybox, ...). */
+        std::string magisk_bin = "/data/local/tmp/magiskbin";
+        /* GHOSTLOCK_MODULE: the staged per-kernel module for the module
+         * pipeline; empty on the W1 pipelines (W1 already made the device
+         * permissive). */
+        std::string module_path;
+
         RuntimeConfig() noexcept = default;
 
         /* Capture the process environment exactly once. */

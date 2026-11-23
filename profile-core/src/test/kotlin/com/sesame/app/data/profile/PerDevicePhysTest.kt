@@ -10,17 +10,17 @@ import org.junit.Test
 class PerDevicePhysTest {
     private fun doc(vararg pairs: Pair<String, Any?>): ValueMap = valueMapOf(*pairs)
 
-    private fun v2(load: Map<String, Any?>, offset: Map<String, Any?>): ValueMap = doc(
-        "schema_version" to 2L,
+    private fun v3(load: Map<String, Any?>, offset: Map<String, Any?>): ValueMap = doc(
+        "schema_version" to 3L,
         "kernel_phys_load" to load,
         "kernel_phys_offset" to offset,
     )
 
     @Test
-    fun `v1 scalars pass through`() {
+    fun `v3 scalars pass through`() {
         val out = PerDevicePhys.resolve(
             doc(
-                "schema_version" to 1L,
+                "schema_version" to 3L,
                 "kernel_phys_load" to 0xa8000000L,
                 "kernel_phys_offset" to 0x80000000L,
             ),
@@ -31,9 +31,9 @@ class PerDevicePhysTest {
     }
 
     @Test
-    fun `v2 maps select the running device case-insensitively`() {
+    fun `v3 maps select the running device case-insensitively`() {
         val out = PerDevicePhys.resolve(
-            v2(mapOf("DITING" to 0xa8000000L), mapOf("diting" to 0x80000000L)),
+            v3(mapOf("DITING" to 0xa8000000L), mapOf("diting" to 0x80000000L)),
             "Diting",
         )
         assertEquals(0xa8000000L, out["kernel_phys_load"])
@@ -43,36 +43,36 @@ class PerDevicePhysTest {
     @Test
     fun `an unlisted device is refused, not resolved to null`() {
         assertThrows(IllegalArgumentException::class.java) {
-            PerDevicePhys.resolve(v2(mapOf("diting" to 1L), mapOf("diting" to 2L)), "dew")
+            PerDevicePhys.resolve(v3(mapOf("diting" to 1L), mapOf("diting" to 2L)), "dew")
         }
     }
 
     @Test
     fun `a null device with a map is refused`() {
         assertThrows(IllegalArgumentException::class.java) {
-            PerDevicePhys.resolve(v2(mapOf("diting" to 1L), mapOf("diting" to 2L)), null)
+            PerDevicePhys.resolve(v3(mapOf("diting" to 1L), mapOf("diting" to 2L)), null)
         }
     }
 
     @Test
     fun `an empty map is refused`() {
         assertThrows(IllegalArgumentException::class.java) {
-            PerDevicePhys.resolve(v2(emptyMap(), emptyMap()), "diting")
+            PerDevicePhys.resolve(v3(emptyMap(), emptyMap()), "diting")
         }
     }
 
     @Test
     fun `the neutral export path keeps the pair null`() {
-        val out = PerDevicePhys.resolveNeutral(v2(mapOf("diting" to 1L), mapOf("diting" to 2L)))
+        val out = PerDevicePhys.resolveNeutral(v3(mapOf("diting" to 1L), mapOf("diting" to 2L)))
         assertNull(out["kernel_phys_load"])
         assertNull(out["kernel_phys_offset"])
     }
 
     @Test
-    fun `v2 may keep legacy all-device scalars`() {
+    fun `v3 may keep all-device scalars`() {
         val out = PerDevicePhys.resolve(
             doc(
-                "schema_version" to 2L,
+                "schema_version" to 3L,
                 "kernel_phys_load" to 0xa8000000L,
                 "kernel_phys_offset" to 0x80000000L,
             ),
@@ -83,9 +83,9 @@ class PerDevicePhysTest {
     }
 
     @Test
-    fun `a map in v1 is rejected`() {
-        val document = v2(mapOf("diting" to 1L), mapOf("diting" to 2L))
-        document["schema_version"] = 1L
+    fun `an older schema is rejected`() {
+        val document = v3(mapOf("diting" to 1L), mapOf("diting" to 2L))
+        document["schema_version"] = 1L  // v1 is no longer accepted
         assertThrows(IllegalArgumentException::class.java) {
             PerDevicePhys.resolve(document, "diting")
         }
@@ -96,7 +96,7 @@ class PerDevicePhysTest {
         assertThrows(IllegalArgumentException::class.java) {
             PerDevicePhys.resolve(
                 doc(
-                    "schema_version" to 2L,
+                    "schema_version" to 3L,
                     "kernel_phys_load" to mapOf("diting" to 1L),
                     "kernel_phys_offset" to 2L,
                 ),
@@ -109,7 +109,7 @@ class PerDevicePhysTest {
     fun `different device key sets are rejected`() {
         assertThrows(IllegalArgumentException::class.java) {
             PerDevicePhys.resolve(
-                v2(mapOf("diting" to 1L), mapOf("dew" to 2L)),
+                v3(mapOf("diting" to 1L), mapOf("dew" to 2L)),
                 "diting",
             )
         }
@@ -118,7 +118,7 @@ class PerDevicePhysTest {
     @Test
     fun `a non-number entry is rejected`() {
         assertThrows(IllegalArgumentException::class.java) {
-            PerDevicePhys.resolve(v2(mapOf("diting" to "x"), mapOf("diting" to 2L)), "diting")
+            PerDevicePhys.resolve(v3(mapOf("diting" to "x"), mapOf("diting" to 2L)), "diting")
         }
     }
 
@@ -126,7 +126,7 @@ class PerDevicePhysTest {
     fun `duplicate device keys ignoring case are rejected`() {
         assertThrows(IllegalArgumentException::class.java) {
             PerDevicePhys.resolve(
-                v2(mapOf("diting" to 1L, "DITING" to 2L), mapOf("diting" to 2L)),
+                v3(mapOf("diting" to 1L, "DITING" to 2L), mapOf("diting" to 2L)),
                 "diting",
             )
         }
@@ -137,7 +137,7 @@ class PerDevicePhysTest {
         assertThrows(IllegalArgumentException::class.java) {
             PerDevicePhys.resolve(
                 doc(
-                    "schema_version" to 3L,
+                    "schema_version" to 4L,
                     "kernel_phys_load" to 1L,
                     "kernel_phys_offset" to 2L,
                 ),
@@ -149,7 +149,7 @@ class PerDevicePhysTest {
     @Test
     fun `the first candidate present selects the pair and its key`() {
         val result = PerDevicePhys.resolveFor(
-            v2(mapOf("spinel" to 0x40000000L), mapOf("spinel" to 0x40000000L)),
+            v3(mapOf("spinel" to 0x40000000L), mapOf("spinel" to 0x40000000L)),
             listOf("missi", "spinel", "generic"),
         )
         assertEquals(0x40000000L, result.document["kernel_phys_load"])
@@ -161,7 +161,7 @@ class PerDevicePhysTest {
     fun `no matching candidate refuses`() {
         assertThrows(IllegalArgumentException::class.java) {
             PerDevicePhys.resolveFor(
-                v2(mapOf("spinel" to 1L), mapOf("spinel" to 2L)),
+                v3(mapOf("spinel" to 1L), mapOf("spinel" to 2L)),
                 listOf("missi", "generic"),
             )
         }
@@ -171,7 +171,7 @@ class PerDevicePhysTest {
     fun `a map with a null counterpart resolves the map side`() {
         val result = PerDevicePhys.resolveFor(
             doc(
-                "schema_version" to 2L,
+                "schema_version" to 3L,
                 "kernel_phys_load" to mapOf("diting" to 0xa8000000L),
                 "kernel_phys_offset" to null,
             ),
@@ -186,7 +186,7 @@ class PerDevicePhysTest {
     fun `a null load with an offset map resolves the offset side`() {
         val result = PerDevicePhys.resolveFor(
             doc(
-                "schema_version" to 2L,
+                "schema_version" to 3L,
                 "kernel_phys_load" to null,
                 "kernel_phys_offset" to mapOf("diting" to 0x80000000L),
             ),

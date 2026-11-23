@@ -40,6 +40,16 @@ sealed interface AppDialog {
         val currentIndex: Int = -1,
     ) : AppDialog
 
+    /**
+     * The route matrix: the backend banners (GhostLock, with its syscall /
+     * carrier / DirtyFrag choices, and the timer). The content reads the live
+     * support state and applies each choice as it is tapped; this type is only
+     * the overlay marker.
+     */
+    data object RouteMatrix : AppDialog {
+        override val titleRes: Int = R.string.route_choice_title
+    }
+
     data class Input(
         override val titleRes: Int,
         val labelRes: Int,

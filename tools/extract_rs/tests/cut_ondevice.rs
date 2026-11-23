@@ -159,7 +159,7 @@ fn device_cut_carries_the_physical_map() {
     let run = run_auto_conf(binary, meta, "sigreturn");
     assert_eq!(run.exit, Some(0), "{}: conf run failed\n{}", meta.release, run.stderr);
     let conf = &run.stdout;
-    assert!(conf.contains("schema_version = 2"), "{conf}");
+    assert!(conf.contains("schema_version = 3"), "{conf}");
     assert!(
         conf.contains("kernel_phys_load = { yunluo = 1073741824 }"),
         "{conf}"
@@ -190,7 +190,7 @@ fn rubens_device_cut_carries_the_physical_map() {
     let run = run_auto_conf(binary, meta, "select_stack");
     assert_eq!(run.exit, Some(0), "{}: conf run failed\n{}", meta.release, run.stderr);
     let conf = &run.stdout;
-    assert!(conf.contains("schema_version = 2"), "{conf}");
+    assert!(conf.contains("schema_version = 3"), "{conf}");
     assert!(
         conf.contains("kernel_phys_load = { rubens = 1073741824 }"),
         "{conf}"

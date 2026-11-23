@@ -98,6 +98,12 @@ int main(int argc, char **argv) {
                 pr_error("runtime configuration failed errno=%d\n", errno);
                 throw FatalError{};
             }
+            /* The stage runs the root script but otherwise never writes it; a
+             * full run would leave its own (KernelSU) handoff in place. Write
+             * it here from this process's runtime config (GHOSTLOCK_HANDOFF,
+             * GHOSTLOCK_MAGISK_BIN), so the module pipeline always runs the
+             * Magisk form. safe_mode is not loaded in this mode (false). */
+            attack::write_root_script();
             return session::run_dirtyfrag_stage(dirtyfrag_plan, dirtyfrag_mode);
         }
         /* Second way: the backend stops after W1 and the frontend handoff is

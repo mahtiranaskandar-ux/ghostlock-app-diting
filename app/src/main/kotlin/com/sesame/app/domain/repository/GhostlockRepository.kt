@@ -1,6 +1,5 @@
 package com.sesame.app.domain.repository
 
-import com.sesame.app.domain.model.CpuPair
 import com.sesame.app.domain.model.CrashEvidenceInfo
 import com.sesame.app.domain.model.DebugSettings
 import com.sesame.app.domain.model.ImportedEvidence
@@ -23,23 +22,10 @@ import com.sesame.app.domain.model.VrKoMode
 interface GhostlockRepository {
     suspend fun snapshot(): KernelSnapshot
 
-    fun selectCpuPair(index: Int)
-
     fun setSafeModeEnabled(enabled: Boolean)
 
     /** Skip the pre-attack KernelSU check and run the exploit as a test. */
     fun setForceAttackTest(enabled: Boolean)
-
-    /** Second way: a W1-only run followed by the DirtyFrag page-cache stage. */
-    fun setSecondWay(enabled: Boolean)
-
-    /**
-     * Debug-only pre-W1 fallback gate: resolve the two-entry
-     * `["dirtyfrag", "ghostlock"]` order and force the DirtyFrag check to fail
-     * once, proving the resolver takes GhostLock without the DirtyFrag W1-only
-     * step. Consumed by the next run; ignored in release builds.
-     */
-    fun setFallbackTest(enabled: Boolean)
 
     /** Debug/test: run the DirtyFrag viability probe and return a one-line report. */
     suspend fun probeDirtyfrag(): String = "probe=NotRun (unsupported)"
@@ -92,7 +78,6 @@ interface GhostlockRepository {
     suspend fun probeStride(
         release: String,
         documentText: String,
-        pair: CpuPair,
         onLog: (String) -> Unit = {},
     ): StrideProbe?
 
@@ -173,6 +158,39 @@ interface GhostlockRepository {
     /** The active profile with every measured fact applied, ready to export. */
     fun mergedProfileDocument(): String?
 
+    /**
+     * The canonical backend document for the timer tool (CVE-2026-98260), or
+     * null when the resolved profile carries no `timer_98260` block. That null
+     * is the timer entry's applicability fact.
+     */
+    fun timerProfileDocument(): String?
+
+    /**
+     * Delivers the timer tool over Shizuku and runs its safe `probe` mode
+     * (release/document validation, no root, no reboot risk). Returns the
+     * tool's exit code.
+     */
+    suspend fun runTimerProbe(onLog: (String) -> Unit): Int
+
+    /**
+     * Runs the timer route's way-2 tool (`fake`) over Shizuku. Refuses a
+     * same-boot retry after any attempt that reached the tool (see
+     * `TimerBootContract`). Returns the tool verdict, or -2 when the run never
+     * started.
+     */
+    suspend fun runTimerRoute(onLog: (String) -> Unit): Int
+
+    /** False when a timer attempt already ran on this boot; a reboot is required. */
+    fun timerRunAllowed(): Boolean
+
+    /**
+     * The live Shizuku status, independent of the native run's toggle. The
+     * timer route gates on it because Shizuku is its only delivery path: the
+     * snapshot reports `NOT_REQUIRED` while the toggle is off, which must not
+     * read as "no Shizuku needed" for the timer.
+     */
+    fun shizukuShellStatus(): ShizukuStatus
+
     /** Single authority for loading, editing and exporting profile config. */
     fun profileController(): ProfileConfigController
 
@@ -252,21 +270,20 @@ interface GhostlockRepository {
     /** Suggested file name for [exportReportBundle]. */
     fun reportBundleName(): String
 
-    suspend fun runExploit(config: ProfileConfig, pair: CpuPair, onLog: (String) -> Unit): Int
+    suspend fun runExploit(config: ProfileConfig, onLog: (String) -> Unit): Int
 
     suspend fun runExploitWithShizuku(
         config: ProfileConfig,
-        pair: CpuPair,
         onLog: (String) -> Unit,
     ): Int
 
     /**
      * Run-start pre-flight (class 1 of the 2026-11-07 exit audit): anchor slot
-     * state, CPU-pair affinity, and the root-manager scan. Returns the first
-     * blocking failure, or [PreflightResult.Passed]. App-side only; the native
-     * keeps its own refusals as the authority.
+     * state and the root-manager scan. Returns the first blocking failure, or
+     * [PreflightResult.Passed]. App-side only; the native keeps its own
+     * refusals — including the CPU pair — as the authority.
      */
-    suspend fun preflight(pair: CpuPair, useShizuku: Boolean): PreflightResult
+    suspend fun preflight(useShizuku: Boolean): PreflightResult
 
     /**
      * The step left `in_progress` by the previous run (usually a kernel panic),

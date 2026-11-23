@@ -88,4 +88,33 @@ class PipelineResolverTest {
         assertEquals("ghostlock", decision.pipeline)
         assertEquals(0, dirtyfragCalls)
     }
+
+    @Test
+    fun `the module entry is viable through its own callback`() {
+        val decision = PipelineResolver.resolve(
+            listOf("module"),
+            ghostlock = { error("must not run") },
+            dirtyfrag = { error("must not run") },
+            module = { null },
+        )
+        assertEquals("module", decision.pipeline)
+        assertTrue(decision.rejected.isEmpty())
+    }
+
+    @Test
+    fun `a refused module entry falls through to the next chain`() {
+        var dirtyfragCalls = 0
+        val decision = PipelineResolver.resolve(
+            listOf("module", "dirtyfrag"),
+            ghostlock = { error("must not run") },
+            dirtyfrag = {
+                dirtyfragCalls++
+                null
+            },
+            module = { "module pipeline is bundled-only" },
+        )
+        assertEquals("dirtyfrag", decision.pipeline)
+        assertEquals(1, dirtyfragCalls)
+        assertEquals(listOf("module: module pipeline is bundled-only"), decision.rejected)
+    }
 }

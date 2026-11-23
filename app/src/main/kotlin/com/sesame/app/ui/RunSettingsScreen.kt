@@ -66,22 +66,6 @@ internal fun RunSettingsScreen(
                 ),
         ) {
             Card(modifier = Modifier.fillMaxWidth()) {
-                if (state.device.cpuPairLabels.isNotEmpty()) {
-                    val customPair = state.device.customCpuPair
-                    val customSummary = customPair?.let {
-                        stringResource(R.string.cpu_pair_custom, "${it.primary}, ${it.consumer}")
-                    }
-                    OverlaySpinnerPreference(
-                        title = stringResource(R.string.cpu_pair_label),
-                        items = state.device.cpuPairLabels.map {
-                            DropdownItem(icon = null, title = it)
-                        },
-                        selectedIndex = if (customPair == null) state.device.cpuPairIndex else -1,
-                        summary = customSummary,
-                        showValue = customPair == null,
-                        onSelectedIndexChange = actions::cpuPairSelected,
-                    )
-                }
                 SwitchPreference(
                     checked = state.runSettings.safeModeEnabled,
                     onCheckedChange = actions::safeModeChanged,

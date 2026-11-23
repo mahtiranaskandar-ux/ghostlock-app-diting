@@ -3,7 +3,6 @@ package com.sesame.app.data
 import android.app.Application
 import androidx.core.content.edit
 import com.sesame.app.data.profile.PerDevicePhys
-import com.sesame.app.domain.model.CpuPair
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -44,10 +43,9 @@ class EditorPhysMapTest {
          * it (PerDevicePhys refuses an unlisted device), so the editor never
          * invents an entry for it. */
         val release = "5.10.101-android12-9-00001-gf4c0e37dbcde-ab8596533"
-        val pair = CpuPair(0, 1)
         val controller = controller(release, "diting")
-        assertFalse(controller.load(release, pair).hasProfile)
-        assertNull(controller.renderResolved(release, pair))
+        assertFalse(controller.load(release).hasProfile)
+        assertNull(controller.renderResolved(release))
     }
 
     @Test
@@ -67,8 +65,8 @@ class EditorPhysMapTest {
             forcedSelection = ProfileSelection.External,
         )
 
-        val document = entry(controller.renderResolved(release, CpuPair(4, 5)) ?: error("no render"))
-        assertEquals(2, (document["schema_version"] as Number).toInt())
+        val document = entry(controller.renderResolved(release) ?: error("no render"))
+        assertEquals(3, (document["schema_version"] as Number).toInt())
         assertTrue(document["kernel_phys_load"] is Map<*, *>)
         assertNull(document["kernel_phys_offset"])
         val diting = PerDevicePhys.resolveFor(document, listOf("diting")).document

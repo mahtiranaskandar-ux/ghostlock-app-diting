@@ -1,15 +1,10 @@
 package com.sesame.app.domain.usecase
 
-import com.sesame.app.domain.model.CpuPair
 import com.sesame.app.domain.model.ProfileConfig
 import com.sesame.app.domain.repository.GhostlockRepository
 
 class LoadKernelSnapshotUseCase(private val repository: GhostlockRepository) {
     suspend operator fun invoke() = repository.snapshot()
-}
-
-class SelectCpuPairUseCase(private val repository: GhostlockRepository) {
-    operator fun invoke(index: Int) = repository.selectCpuPair(index)
 }
 
 class ParseSourceUseCase(private val repository: GhostlockRepository) {
@@ -30,13 +25,12 @@ class ParseSourceUseCase(private val repository: GhostlockRepository) {
 class RunExploitUseCase(private val repository: GhostlockRepository) {
     suspend operator fun invoke(
         config: ProfileConfig,
-        pair: CpuPair,
         useShizuku: Boolean,
         onLog: (String) -> Unit,
     ) = if (useShizuku) {
-        repository.runExploitWithShizuku(config, pair, onLog)
+        repository.runExploitWithShizuku(config, onLog)
     } else {
-        repository.runExploit(config, pair, onLog)
+        repository.runExploit(config, onLog)
     }
 }
 

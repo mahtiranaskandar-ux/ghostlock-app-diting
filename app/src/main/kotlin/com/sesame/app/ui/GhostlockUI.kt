@@ -343,9 +343,6 @@ private fun GhostlockExecutionSheet(
     )
 }
 
-/* The session slice rides along by the migration's uniform signature; the
- * dialog reads only the overlay slice, so the parameter is deliberately unused. */
-@Suppress("UNUSED_PARAMETER")
 @Composable
 private fun GhostlockDialog(
     state: SessionState,
@@ -368,6 +365,8 @@ private fun GhostlockDialog(
         },
         content = {
             when (dialog) {
+                is AppDialog.RouteMatrix -> RouteMatrixContent(state, actions)
+
                 is AppDialog.ListDialog -> {
                     val items = dialog.items.ifEmpty { dialog.itemResIds.map { stringResource(it) } }
                     val leading = dialog.leadingResId

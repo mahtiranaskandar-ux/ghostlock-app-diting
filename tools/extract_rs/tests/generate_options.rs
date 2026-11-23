@@ -33,6 +33,12 @@ fn generate_option_supersets() {
         .min(16);
     par_for_each(&corpus, workers, |meta| {
         let out = options_path(meta);
+        /* `timer_98260` is the timer analyzer's overlay, not this extractor's
+         * output. Preserve it across the regeneration, or a whole-store run
+         * silently drops the two shipped timer entries (measured 2026-11-22). */
+        let previous_timer = std::fs::read_to_string(&out).ok()
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|value| value.get("timer_98260").cloned());
         let run = run_options(binary, meta, &out);
         let text = std::fs::read_to_string(&out).unwrap_or_else(|err| {
             panic!(
@@ -40,9 +46,16 @@ fn generate_option_supersets() {
                 meta.release, run.stderr
             )
         });
-        serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|err| {
+        let mut value = serde_json::from_str::<serde_json::Value>(&text).unwrap_or_else(|err| {
             panic!("{}: invalid superset JSON: {err}", meta.release)
         });
+        if let Some(timer) = previous_timer {
+            value["timer_98260"] = timer;
+            let merged = serde_json::to_string_pretty(&value).expect("serialize superset") + "\n";
+            std::fs::write(&out, &merged).unwrap_or_else(|err| {
+                panic!("{}: cannot preserve timer_98260: {err}", meta.release)
+            });
+        }
         eprintln!(
             "generated {} ({}; {} bytes)",
             meta.release,

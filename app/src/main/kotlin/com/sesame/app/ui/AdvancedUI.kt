@@ -181,9 +181,8 @@ internal fun AdvancedScreen(
                     )
                 }
             }
-            /* The profile's `pipeline` is the only product selector; the
-             * debug-only `second_way` intent remains a lab hook for the
-             * harness and has no UI (see profile-pipeline-selection-plan). */
+            /* The profile's `pipeline` is the only selector; there is no UI
+             * override and no debug intent that changes the order. */
             item(key = "rootManager") {
                 Card {
                     ArrowPreference(
@@ -304,7 +303,8 @@ internal fun ParameterScreen(
                         )
                         val detail = listOfNotNull(
                             state.support.release.takeIf { it.isNotBlank() },
-                            state.support.route?.takeIf { it.isNotBlank() },
+                            state.support.module?.let { stringResource(R.string.module_chain_label) }
+                                ?: state.support.route?.takeIf { it.isNotBlank() },
                         ).joinToString(" · ")
                         if (detail.isNotEmpty()) {
                             Text(
@@ -326,16 +326,96 @@ internal fun ParameterScreen(
                     )
                 }
             }
+            /* The module chain is a pair manifest, not a route: the asset, its
+             * hash and the manager the root script stages are the whole
+             * readiness statement. It is bundle-only, so there is nothing to
+             * export and nothing an imported copy could select. */
+            state.support.module?.let { module ->
+                item(key = "module") {
+                    val blocker = moduleBlockerOf(state)
+                    Card {
+                        Column(modifier = Modifier.padding(16.dp)) {
+                            Text(
+                                text = stringResource(R.string.module_chain_label),
+                                fontSize = 12.sp,
+                                color = MiuixTheme.colorScheme.onSurface.copy(alpha = 0.68f),
+                            )
+                            Text(
+                                text = module.asset.substringAfterLast('/'),
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier.padding(top = 4.dp),
+                            )
+                            Text(
+                                text = stringResource(
+                                    R.string.module_asset_sha,
+                                    module.assetSha256.take(16) + "…",
+                                ),
+                                fontSize = 13.sp,
+                                color = MiuixTheme.colorScheme.onSurface.copy(alpha = 0.68f),
+                                modifier = Modifier.padding(top = 2.dp),
+                            )
+                            if (module.vendorFiles.isNotEmpty()) {
+                                Text(
+                                    text = stringResource(
+                                        R.string.module_vendor_files,
+                                        module.vendorFiles.size,
+                                    ),
+                                    fontSize = 13.sp,
+                                    color = MiuixTheme.colorScheme.onSurface.copy(alpha = 0.68f),
+                                    modifier = Modifier.padding(top = 6.dp),
+                                )
+                                module.vendorFiles.forEach { path ->
+                                    Text(
+                                        text = path,
+                                        fontSize = 12.sp,
+                                        color = MiuixTheme.colorScheme.onSurface.copy(alpha = 0.6f),
+                                    )
+                                }
+                            }
+                            Text(
+                                text = stringResource(
+                                    when (blocker) {
+                                        ModuleBlocker.NotBundled ->
+                                            R.string.module_blocked_not_bundled
+
+                                        ModuleBlocker.AssetMissing ->
+                                            R.string.module_blocked_asset
+
+                                        ModuleBlocker.MagiskMissing ->
+                                            R.string.module_blocked_magisk
+
+                                        null -> R.string.module_magisk_installed
+                                    },
+                                ),
+                                fontSize = 13.sp,
+                                color = if (blocker != null) {
+                                    OverrideHighlight
+                                } else {
+                                    MiuixTheme.colorScheme.onSurface.copy(alpha = 0.68f)
+                                },
+                                modifier = Modifier.padding(top = 8.dp),
+                            )
+                        }
+                    }
+                }
+            }
             item(key = "docs") {
                 ProfileDocsCard { uriHandler.openUri(profileDocsUrl()) }
             }
             if (state.support.hasProfile) {
                 item(key = "actions") {
-                    TextButton(
-                        text = stringResource(R.string.override_export),
-                        onClick = actions::exportProfile,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
+                    if (state.support.module != null) {
+                        ProfileHintBanner(
+                            text = stringResource(R.string.module_export_note),
+                        )
+                    } else {
+                        TextButton(
+                            text = stringResource(R.string.override_export),
+                            onClick = actions::exportProfile,
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
             if (state.support.importedProfilePresent) {

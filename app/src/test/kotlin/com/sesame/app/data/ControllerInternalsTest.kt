@@ -2,7 +2,6 @@ package com.sesame.app.data
 
 import android.app.Application
 import androidx.core.content.edit
-import com.sesame.app.domain.model.CpuPair
 import com.sesame.app.domain.model.ProfileFieldNode
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
@@ -29,7 +28,6 @@ class ControllerInternalsTest {
      * the r8 cuts gave the page-free profiles `fallback { to = "none" }`, so only
      * the six untouched tcp_zerocopy assets can exercise the fallback tuning. */
     private val release = "6.1.138-android14-11-g151cf2b6bfbe-ab13719792"
-    private val pair = CpuPair(primary = 0, consumer = 1)
 
     private fun withController(
         name: String,
@@ -58,7 +56,7 @@ class ControllerInternalsTest {
     @Test
     fun `route tuning is excluded from the tree but offered by the general list`() =
         withController("controller-tree-routes") { controller ->
-            val config = controller.load(release, pair)
+            val config = controller.load(release)
             val treePaths = flatten(config.roots).map { it.path }
             assertTrue(treePaths.none { it == "execution.routes" })
             assertTrue(treePaths.none { it.startsWith("execution.routes.") })

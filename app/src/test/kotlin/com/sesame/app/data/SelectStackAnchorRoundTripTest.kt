@@ -1,6 +1,5 @@
 package com.sesame.app.data
 
-import com.sesame.app.data.profile.CpuPairView
 import com.sesame.app.data.profile.ProfileMerger
 import com.sesame.app.data.profile.ProfileResolver
 import com.sesame.app.data.route.RouteKind
@@ -55,7 +54,6 @@ class SelectStackAnchorRoundTripTest {
             builtin = null,
             imported = document,
             tuningExecution = null,
-            pair = CpuPairView(4, 5),
             routePresets = emptyMap(),
         )
         val route = "select_stack"

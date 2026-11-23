@@ -42,6 +42,8 @@ namespace ghostlock::attack {
     void timer_reset(void);
 
     void timer_mark(const char *label);
+
+    double timer_ms(void);
 } // namespace ghostlock::attack
 
 #endif

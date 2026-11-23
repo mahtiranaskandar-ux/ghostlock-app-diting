@@ -2,6 +2,7 @@
 #define GHOSTLOCK_VICTIM_CONTEXT_HPP
 
 #include "support/native_resource.hpp"
+#include "session/victim_spin.h"
 
 #include <sys/types.h>
 
@@ -21,11 +22,16 @@ namespace ghostlock::session::victim {
     public:
         VictimContext() noexcept = default;
 
-        ~VictimContext() noexcept = default;
+        ~VictimContext() noexcept;
 
         VictimContext(const VictimContext &) = delete;
 
         VictimContext &operator=(const VictimContext &) = delete;
+
+        /* The victim spin page, shared with the child across fork(). Owned
+         * here; reallocated per spawn and unmapped on reset/destruction. */
+        SpinPage *spin = nullptr;
+        void release_spin_page() noexcept;
 
         ghostlock::support::UniqueFd task_read;
         ghostlock::support::UniqueFd cmd_write;

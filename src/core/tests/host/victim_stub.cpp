@@ -27,6 +27,16 @@ namespace ghostlock::session::victim {
         return host::script().next_w2();
     }
 
+    int32_t arm_w2_spin(void *context) {
+        (void) context;
+        host::script().record("arm_w2_spin");
+        return 1;
+    }
+
+    void release_victim_spin(w2_stage_context &stage) {
+        stage.spin_armed = 0;
+    }
+
     int32_t verify_seccomp_probe_stage(void *context) {
         (void) context;
         host::script().record("verify_seccomp");

@@ -3,7 +3,6 @@ package com.sesame.app.data
 import android.app.Application
 import android.content.SharedPreferences
 import androidx.core.content.edit
-import com.sesame.app.domain.model.CpuPair
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -23,7 +22,6 @@ import org.robolectric.annotation.Config
 class ControllerOverrideTest {
     private val context: Application = RuntimeEnvironment.getApplication()
     private val release = "5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284"
-    private val pair = CpuPair(primary = 0, consumer = 1)
 
     private lateinit var preferences: SharedPreferences
     private lateinit var external: FakeExternalProfileStore
@@ -49,14 +47,14 @@ class ControllerOverrideTest {
     @Test
     fun `renderMerged applies a measured fact and refuses an implausible one`() = runBlocking {
         val text = requireNotNull(
-            controller.renderMerged(release, pair, mapOf("kernelsnitch.mm_struct_sz" to 960L)),
+            controller.renderMerged(release, mapOf("kernelsnitch.mm_struct_sz" to 960L)),
         )
         val parsed = checkNotNull(HoconSupport.parseValue(text).asValueMap())
         val snitch = checkNotNull(parsed["kernelsnitch"].asValueMap())
         assertEquals(960L, (snitch["mm_struct_sz"] as Number).toLong())
 
         assertNull(
-            controller.renderMerged(release, pair, mapOf("kernelsnitch.mm_struct_sz" to 7L)),
+            controller.renderMerged(release, mapOf("kernelsnitch.mm_struct_sz" to 7L)),
         )
     }
 
@@ -86,12 +84,11 @@ class ControllerOverrideTest {
             ),
         )
         assertNull(
-            controller.renderMerged(release, pair, kernel.facts.associate { it.key to it.value }),
+            controller.renderMerged(release, kernel.facts.associate { it.key to it.value }),
         )
         val text = requireNotNull(
             controller.renderMerged(
                 release,
-                pair,
                 kernel.profileFacts().associate { it.key to it.value },
             ),
         )
@@ -101,13 +98,14 @@ class ControllerOverrideTest {
     }
 
     @Test
-    fun `the cpu pair reaches the native document`() = runBlocking {
-        val pair = CpuPair(primary = 2, consumer = 3)
-        val config = controller.load(release, pair)
+    fun `the native document carries the neutral CPU pair`() = runBlocking {
+        val config = controller.load(release)
         val decoded = checkNotNull(
             NativeProfileDocument.fromBinary(checkNotNull(controller.nativeDocument(config))),
         )
-        assertEquals(2u, decoded.execution.recommendedMainCpu)
-        assertEquals(3u, decoded.execution.recommendedConsumerCpu)
+        /* The native chooses the pair at run time (cpu_select); the wire's
+         * required slots carry the neutral fallback, never a UI prediction. */
+        assertEquals(0u, decoded.execution.recommendedMainCpu)
+        assertEquals(1u, decoded.execution.recommendedConsumerCpu)
     }
 }

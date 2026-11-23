@@ -7,9 +7,9 @@ refuses to run. In most cases you don't need to change code — you only add a
 profile (a HOCON config file) for that kernel.
 
 > Only kernel geometry (symbol and struct offsets) is required.
-> `recommend_shizuku` and the retry/wait values under `execution` are
-> suggestions: a profile may omit them, and the shipped default becomes the
-> suggestion (see [Shared Execution Defaults](defaults.md)).
+> The retry/wait values under `execution` are suggestions: a profile may omit
+> them, and the shipped default becomes the suggestion (see
+> [Shared Execution Defaults](defaults.md)).
 
 ## Before you start
 
@@ -88,9 +88,7 @@ and doesn't repeat the field reference.
 5. **Transcribe field by field, then check your work.**
    Field meanings and requirements are in the
    [Profile schema](PROFILE_SCHEMA.md). Confirm every required `off_*` is
-   non-zero and that the task/cred layout comes from the same image. Set
-   `recommend_shizuku` as needed (default `0`; only the 5.15 multicast profile
-   recommends it).
+   non-zero and that the task/cred layout comes from the same image.
 
 6. **Change `execution` only with device evidence.**
    Otherwise keep the [Shared Defaults](defaults.md). You can also try values on the

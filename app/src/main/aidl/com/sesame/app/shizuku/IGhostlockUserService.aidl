@@ -6,7 +6,7 @@ import com.sesame.app.shizuku.IGhostlockStatusCallback;
 
 interface IGhostlockUserService {
     void destroy() = 16777114;
-    void runExploit(int primaryCpu, int consumerCpu, boolean safeMode, boolean forceAttack, boolean anchorTrusted, in byte[] profileBlob, @nullable String debugDir, @nullable String managerPackage, IGhostlockCallback callback, IGhostlockStatusCallback statusCallback) = 2;
+    void runExploit(boolean safeMode, boolean forceAttack, boolean anchorTrusted, in byte[] profileBlob, @nullable String debugDir, @nullable String managerPackage, IGhostlockCallback callback, IGhostlockStatusCallback statusCallback) = 2;
 
     /* Crash evidence: the shell can read the boot-reason properties and the
      * pstore nodes that an app cannot. The pstore names are a fixed allowlist
@@ -27,4 +27,10 @@ interface IGhostlockUserService {
      * arrives. Shell may run bugreportz; it may not read the shell app's
      * bugreports directory, which is why the service streams it. */
     void startBugreport(in ParcelFileDescriptor sink) = 6;
+
+    /* The timer route (CVE-2026-98260): stage the tool and the canonical
+     * profile document, run it as shell, and stream its log. The tool parks
+     * on success and on several failures, so the service reports a verdict
+     * from the log markers and never kills the process. */
+    void runTimer(in String profileJson, in String mode, @nullable String managerPackage, IGhostlockCallback callback) = 7;
 }

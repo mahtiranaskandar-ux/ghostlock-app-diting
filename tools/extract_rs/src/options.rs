@@ -664,12 +664,12 @@ fn render_cut(
         ),
         format!("# cut from the option superset: route={route} plan={label}"),
     ];
-    for key in ["release", "kernel_major", "recommend_shizuku"] {
+    for key in ["release", "kernel_major"] {
         if let Some(value) = value(key) {
             lines.push(format!("{key} = {value}"));
         }
     }
-    let schema_version = if device.is_some() { 2 } else { 1 };
+    let schema_version = 3;
     lines.push(format!("schema_version = {schema_version}"));
     /* A device derivation selects its own pair. The legacy single-device
      * superset has no derivation and carries the pair in the top-level profile;
@@ -759,9 +759,356 @@ fn render_cut(
     lines.join("\n") + "\n"
 }
 
+/// Render the storage/export superset: every feasible route's block and the
+/// shared common blocks. There is no route order: the app displays the viable
+/// routes alphabetically. The runtime still cuts one route.
+pub fn render_superset(
+    superset: &Superset,
+    kind: PlanKind,
+    device: Option<&str>,
+) -> Option<String> {
+    let derivation = device.and_then(|name| {
+        superset
+            .devices
+            .iter()
+            .find(|entry| entry.device.eq_ignore_ascii_case(name))
+    });
+    let plans = derivation
+        .map(|entry| entry.plans.as_slice())
+        .unwrap_or(superset.plans.as_slice());
+    let mut chosen: Vec<(&RouteOption, &Plan)> = Vec::new();
+    for option in &superset.routes {
+        if option.verdict != "feasible" {
+            continue;
+        }
+        let route_plans = plans.iter().find(|entry| entry.route == option.route)?;
+        let plan = match kind {
+            PlanKind::Page => &route_plans.page,
+            PlanKind::Auto => route_plans
+                .page_free
+                .iter()
+                .find(|plan| !plan.conditioned)
+                .or(route_plans.anchor_only.as_ref())
+                .unwrap_or(&route_plans.page),
+            PlanKind::Attested => route_plans.page_free.iter().find(|plan| plan.conditioned)?,
+        };
+        chosen.push((option, plan));
+    }
+    if chosen.is_empty() {
+        return None;
+    }
+    let top = superset.profile.get("").cloned().unwrap_or_default();
+    let value = |key: &str| top.get(key).cloned();
+    let phys = derivation.map(|entry| (entry.kernel_phys_load, entry.kernel_phys_offset));
+    let mut lines = vec![
+        format!(
+            "# GhostLock kernel profile: {} (HOCON, self-contained, route superset).",
+            superset.release
+        ),
+        "# The app's route picker reads this document; a run still cuts one route.".to_string(),
+    ];
+    for key in ["release", "kernel_major"] {
+        if let Some(value) = value(key) {
+            lines.push(format!("{key} = {value}"));
+        }
+    }
+    let schema_version = 3;
+    lines.push(format!("schema_version = {schema_version}"));
+    let has_derivation = device.is_some() && phys.is_some();
+    let (load_override, offset_override) = match phys {
+        Some((load, offset)) if device.is_some() => (load, offset),
+        _ => (None, None),
+    };
+    let phys_line = |key: &str, override_value: Option<u64>| {
+        if has_derivation {
+            match (device, override_value) {
+                (Some(name), Some(value)) => format!("{key} = {{ {name} = {value} }}"),
+                _ => format!("{key} = null"),
+            }
+        } else {
+            match (device, value(key)) {
+                (Some(name), Some(value)) if value != "null" => {
+                    format!("{key} = {{ {name} = {value} }}")
+                }
+                (None, Some(value)) => format!("{key} = {value}"),
+                _ => format!("{key} = null"),
+            }
+        }
+    };
+    lines.push(phys_line("kernel_phys_load", load_override));
+    lines.push(phys_line("kernel_phys_offset", offset_override));
+    if !superset.pipeline_order.is_empty() {
+        let list = superset
+            .pipeline_order
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        lines.push(format!("pipeline = [ {list} ]"));
+    }
+    lines.push("route {".to_string());
+    for (option, plan) in &chosen {
+        lines.push(format!("  {} {{", option.route));
+        let mut geometry: BTreeMap<&str, &i64> = option
+            .geometry
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
+            .collect();
+        /* The route's selectable carriers, in the profile's order (primary
+         * first), as a list key like `pipeline`. The app renders one box for
+         * this list and injects the wire's `compat_carrier` from the choice;
+         * a block without `carriers` keeps the legacy flag semantics. */
+        let mut carriers: Vec<&str> = Vec::new();
+        if !option.carrier.is_empty() {
+            carriers.push(option.carrier.as_str());
+        }
+        for alt in &option.alternatives {
+            if alt.verdict == "feasible" && !carriers.contains(&alt.carrier.as_str()) {
+                carriers.push(alt.carrier.as_str());
+            }
+        }
+        if !carriers.is_empty() {
+            let list = carriers
+                .iter()
+                .map(|carrier| format!("\"{carrier}\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            lines.push(format!("    carriers = [ {list} ]"));
+        }
+        let mut emitted: BTreeMap<String, i64> = BTreeMap::new();
+        let mut wrote_compact = false;
+        if let Some(anchor) = &plan.anchor {
+            for key in ["waiter_shift", "compact_waiter"] {
+                if let Some(value) = geometry.remove(key) {
+                    lines.push(format!("    {key} = {value}"));
+                    emitted.insert(key.to_string(), *value);
+                    if key == "compact_waiter" {
+                        wrote_compact = true;
+                    }
+                }
+            }
+            for (key, value) in &geometry {
+                lines.push(format!("    {key} = {value}"));
+                emitted.insert((*key).to_string(), **value);
+            }
+            lines.push(format!("    lock_anchor_image = {}", anchor.image));
+            lines.push(format!("    lock_anchor_bytes = {}", anchor.bytes));
+            lines.push(format!("    lock_anchor_stride = {}", anchor.stride));
+            emitted.insert("lock_anchor_image".to_string(), anchor.image as i64);
+            emitted.insert("lock_anchor_bytes".to_string(), anchor.bytes as i64);
+            emitted.insert("lock_anchor_stride".to_string(), anchor.stride as i64);
+        } else {
+            for (key, value) in &geometry {
+                lines.push(format!("    {key} = {value}"));
+                emitted.insert((*key).to_string(), **value);
+                if *key == "compact_waiter" {
+                    wrote_compact = true;
+                }
+            }
+        }
+        /* The other feasible carriers' geometry joins the same block. The
+         * primary carrier's value wins on a shared key; with more than one
+         * carrier the legacy `compat_carrier` flag is omitted (the app sets
+         * the wire's flag from the chosen carrier). */
+        for alt in &option.alternatives {
+            if alt.verdict != "feasible" {
+                continue;
+            }
+            for (key, value) in &alt.geometry {
+                if key == "compat_carrier" && carriers.len() > 1 {
+                    continue;
+                }
+                if emitted.contains_key(key) {
+                    continue;
+                }
+                lines.push(format!("    {key} = {value}"));
+                emitted.insert(key.clone(), *value);
+            }
+        }
+        /* `tcp_zerocopy` has no per-route geometry of its own: its stamp-shape
+         * flag is the document-global waiter layout fact. An empty branch would
+         * carry no `compact_waiter`, which the app's validator requires, so the
+         * route would silently drop out of the picker (and out of a generated
+         * profile's round-trip). Emit the shared fact. */
+        if option.route == "tcp_zerocopy" && !wrote_compact {
+            if let Some(compact) = superset
+                .profile
+                .get("waiter_layout")
+                .and_then(|layout| layout.get("compact"))
+            {
+                lines.push(format!("    compact_waiter = {compact}"));
+            }
+        }
+        lines.push("  }".to_string());
+    }
+    lines.push("}".to_string());
+    if let Some(fallback) = superset.profile.get("fallback") {
+        lines.push("fallback {".to_string());
+        for (key, value) in fallback {
+            lines.push(format!("  {key} = {value}"));
+        }
+        lines.push("}".to_string());
+    }
+    if let Some(selinux) = superset.profile.get("selinux") {
+        lines.push("selinux {".to_string());
+        for (key, value) in selinux {
+            lines.push(format!("  {key} = {value}"));
+        }
+        lines.push("}".to_string());
+    }
+    /* The scratch is one top-level fact; emit it only when every route's
+     * chosen plan uses the same region. A mixed set omits it (the page path)
+     * rather than claiming a slot that does not fit another route's anchor. */
+    let shared_scratch = chosen
+        .first()
+        .and_then(|(_, plan)| plan.scratch.as_ref())
+        .filter(|scratch| {
+            chosen.iter().all(|(_, plan)| {
+                plan.scratch
+                    .as_ref()
+                    .map(|entry| entry.image)
+                    == Some(scratch.image)
+            })
+        });
+    if let Some(scratch) = shared_scratch {
+        lines.push("w1_scratch {".to_string());
+        lines.push(format!("  image = {}", scratch.image));
+        lines.push("}".to_string());
+    }
+    for block in [
+        "kernelsnitch",
+        "task_struct",
+        "cred",
+        "offset",
+        "waiter_layout",
+    ] {
+        if let Some(entries) = superset.profile.get(block) {
+            lines.push(format!("{block} {{"));
+            for (key, value) in entries {
+                lines.push(format!("  {key} = {value}"));
+            }
+            lines.push("}".to_string());
+        }
+    }
+    Some(lines.join("\n") + "\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_superset_render_lists_every_feasible_route_and_the_order() {
+        use std::collections::BTreeMap;
+        let plan = |route: &str, anchored: bool| Plan {
+            route: route.to_string(),
+            /* A tcp route cannot be anchored (its fake lock is a crafted
+             * object); in the live superset its Auto plan is the page plan. */
+            anchor: anchored.then_some(AnchorTriple {
+                image: 0x1000,
+                bytes: 0x400,
+                stride: 32,
+            }),
+            scratch: Some(ScratchPlacement {
+                image: 0x2000,
+                window: 0x100,
+                reserved_first: Some(0),
+                reserved_last: Some(0),
+            }),
+            page_free: true,
+            conditioned: false,
+            anchor_name: Some("dump_skip.zeroes".to_string()),
+            scratch_source: Some("in-anchor".to_string()),
+            reason: String::new(),
+        };
+        let option = |route: &str,
+                      geometry: BTreeMap<String, i64>,
+                      alternatives: Vec<RouteVariantOption>| RouteOption {
+            route: route.to_string(),
+            carrier: "native".to_string(),
+            verdict: "feasible".to_string(),
+            reason: String::new(),
+            numbers: BTreeMap::new(),
+            anchor_capable: true,
+            geometry,
+            alternatives,
+        };
+        let superset = Superset {
+            schema_version: 3,
+            release: "6.1.138-x".to_string(),
+            kernel_major: Some(6),
+            kernel_phys_load: None,
+            kernel_phys_offset: None,
+            phys_source: "unset".to_string(),
+            routes: vec![
+                option("tcp_zerocopy", BTreeMap::new(), vec![]),
+                option(
+                    "select_stack",
+                    BTreeMap::from([("waiter_shift".to_string(), -2)]),
+                    vec![RouteVariantOption {
+                        carrier: "compat".to_string(),
+                        verdict: "feasible".to_string(),
+                        reason: String::new(),
+                        numbers: BTreeMap::new(),
+                        geometry: BTreeMap::from([
+                            ("compat_carrier".to_string(), 1),
+                            ("compat_futex_abi".to_string(), 1),
+                            ("waiter_home".to_string(), 488),
+                            ("select_dst_depth".to_string(), 496),
+                        ]),
+                    }],
+                ),
+            ],            pipeline_facts: crate::pipeline::PipelineFacts::default(),
+            pipelines: vec![],
+            pipeline_order: vec!["ghostlock".to_string()],
+            candidates: vec![],
+            plans: vec![
+                RoutePlans {
+                    route: "tcp_zerocopy".to_string(),
+                    page: plan("tcp_zerocopy", false),
+                    anchor_only: None,
+                    page_free: vec![plan("tcp_zerocopy", false)],
+                },
+                RoutePlans {
+                    route: "select_stack".to_string(),
+                    page: plan("select_stack", true),
+                    anchor_only: None,
+                    page_free: vec![plan("select_stack", true)],
+                },
+            ],
+            profile: parse_conf_blocks(
+                "release = \"6.1.138-x\"\nkernel_major = 6\n\
+                 fallback { to = \"none\" }\nselinux { enforcing = 0, initialized = 2 }\n\
+                 waiter_layout {\ncompact = 1\n}\n\
+                 task_struct { prio = 1 }\ncred { copy_size = 128 }\noffset { init_task = 1 }\n",
+            ),
+            devices: vec![],
+        };
+        let text = render_superset(&superset, PlanKind::Auto, None).expect("a superset");
+        assert!(text.contains("tcp_zerocopy {"), "{text}");
+        /* The carrier choice is a list key inside the route block; the
+         * alternative's geometry joins the same block and the legacy
+         * `compat_carrier` flag is omitted while both carriers are listed. */
+        assert!(text.contains("carriers = [ \"native\" ]"), "{text}");
+        assert!(
+            text.contains("carriers = [ \"native\", \"compat\" ]"),
+            "{text}"
+        );
+        assert!(text.contains("waiter_home = 488"), "{text}");
+        assert!(text.contains("select_dst_depth = 496"), "{text}");
+        assert!(!text.contains("compat_carrier"), "{text}");
+        /* The tcp branch's stamp-shape flag is the shared waiter layout; an
+         * empty branch would drop the route on the app side. */
+        assert!(
+            text.contains("tcp_zerocopy {\n    carriers = [ \"native\" ]\n    compact_waiter = 1"),
+            "{text}"
+        );
+        assert!(text.contains("select_stack {"), "{text}");
+        assert!(!text.contains("routes = "), "no route order is written\n{text}");
+        assert!(text.contains("pipeline = [ \"ghostlock\" ]"), "{text}");
+        assert!(text.contains("lock_anchor_image = 4096"), "{text}");
+        assert!(text.contains("w1_scratch {"), "{text}");
+    }
 
     fn placement(image: u64, inside: bool) -> ScratchPlacement {
         ScratchPlacement {
@@ -899,7 +1246,7 @@ mod tests {
             String::new(),
             BTreeMap::from([
                 ("release".to_string(), "\"r\"".to_string()),
-                ("schema_version".to_string(), "1".to_string()),
+                ("schema_version".to_string(), "3".to_string()),
                 ("kernel_major".to_string(), "6".to_string()),
                 ("kernel_phys_load".to_string(), "123".to_string()),
                 ("kernel_phys_offset".to_string(), "null".to_string()),

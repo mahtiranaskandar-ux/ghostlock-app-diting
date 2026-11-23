@@ -1,6 +1,5 @@
 package com.sesame.app.data
 
-import com.sesame.app.data.profile.CpuPairView
 import com.sesame.app.data.profile.ProfileMerger
 import com.sesame.app.data.profile.ProfileResolver
 import com.sesame.app.data.route.MulticastConfig
@@ -57,7 +56,6 @@ class MulticastAnchorRoundTripTest {
             builtin = null,
             imported = document,
             tuningExecution = null,
-            pair = CpuPairView(4, 5),
             routePresets = emptyMap(),
         )
         val route = "multicast_waiter"

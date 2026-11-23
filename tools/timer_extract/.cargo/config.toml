@@ -1,0 +1,5 @@
+# Keep cargo's artifacts under the repository-root build/ directory.
+# Relative paths in a cargo config file resolve against this file's directory,
+# so ../../build/timer-extract is <repo>/build/timer-extract.
+[build]
+target-dir = "../../build/timer-extract"

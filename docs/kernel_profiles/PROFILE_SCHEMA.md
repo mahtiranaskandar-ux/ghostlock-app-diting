@@ -10,16 +10,21 @@ native.
 > To add support for a new kernel, follow [README.md](README.md). For
 > execution-tuning defaults, see [defaults.md](defaults.md).
 
-> **Two version names** (do not conflate them):
+> **Version names** (do not conflate them):
 > - **Profile schema version**: the HOCON profile generation, carried by the
->   `schema_version` field inside each profile (see section 2). `1` means the phys fields are
->   scalars or absent; `2` means they are per-device maps.
+>   `schema_version` field inside each profile (see section 2). It is **`3`** —
+>   the only accepted version. The earlier `1`/`2` documents and the
+>   unversioned `remote/main`-era JSON reports were retired on 2026-11-22: a
+>   document that states `1`, `2`, or no version is refused; regenerate or
+>   export it with this build (section 11).
+> - **Options-report version**: the extractor's `--options-out` document has
+>   its own `schema_version` (currently `2`); it is not a profile and is not
+>   accepted as one.
 > - **Binary wire version**: the GLK1 transport version after magic
 >   `0x0D000721`. The current writer emits wire version `2` (object sections,
 >   see section 9); it is the only version, and Kotlin/native are version-bound.
 >
-> Everything below describes the current v2 configuration. The legacy v1 JSON
-> import path is Kotlin-side only and is collected in section 11.
+> Everything below describes schema v3.
 
 ## 0. File format (HOCON)
 
@@ -37,8 +42,8 @@ parsed as **HOCON**:
   struct crosses to native (section 9);
 - the app stores and exports HOCON; `ghostlock-extract --format conf` emits a
   flattened, self-contained profile (credential/KernelSnitch constants inlined,
-  no `include` lines) that imports through the normal path (the v1 JSON import
-  path is section 11);
+  no `include` lines) that carries `schema_version = 3` and imports through the
+  normal path;
 - extractor output is a **candidate source**: it writes every field the image
   actually yields and omits the rest, never borrowing a neighbouring kernel
   family's guesses. A candidate may be incomplete; after import the app's field
@@ -70,15 +75,18 @@ internal overrides (sparse HOCON text)    written by the advanced override page
 
 Merge priority (low to high): `execution-tuning` (plus the per-route
 `execution-<route>.conf`) → built-in profile + imported offsets → advanced
-overrides. Finally `execution.selected_cpus` is forced in (from the manual
-selection or an explicit imported/override value).
+overrides.
+
+The CPU pair is not a profile input: the native chooses it at run time
+(`cpu_select`). The wire's required `recommended_cpus` slots carry the neutral
+fallback `0/1`.
 
 ## 2. Top-level structure
 
 ```hocon
 # GhostLock kernel profile (HOCON; JSON stays valid)
 release = "6.6.77-android15-8-gca30f3b4bef6-abogki440974771-4k"
-schema_version = 1
+schema_version = 3
 kernel_major = 6
 route {
   select_stack { waiter_shift = -2 }
@@ -94,27 +102,90 @@ offset { init_task = 34464384, init_cred = 34538824 }
 | Field | Type | Meaning |
 |---|---|---|
 | `release` | string | Must match the device's `uname -r` exactly (case and suffix); template files never participate in matching |
-| `schema_version` | int | `1` or `2`: `1` when the phys fields are scalars or absent; `2` when they are per-device maps (required for maps) |
+| `schema_version` | int | Must be `3`; any other value (or an absent field) is refused. The phys fields may be a per-device map (preferred), an all-device scalar, or `null` (native default) |
 | `kernel_major` | int | `5` or `6`; used for address resolution and sanity checks, no longer selects the route |
-| `route` | object | Explicit route parent with exactly one branch; see section 3 |
+| `pipeline` | list | Optional ordered chain list: `ghostlock`, `dirtyfrag`, `module`; absent = `["ghostlock"]`. See *Pipeline selection* below |
+| `route` | object | Explicit route parent with one or more branches; the app's picker displays the viable ones; see section 3 |
+| `routes` | list | Legacy and ignored: the app has no route order and displays the viable routes alphabetically; see section 3 |
 | `fallback` | object | Fallback declaration (`to` plus an optional `route` branch); see section 3 |
 | geometry | object/int | Grouped by namespace: `task_struct` / `cred` / `offset` / `kernelsnitch`. Omit unused route-specific fields entirely — don't write `0` or placeholders. `null` only appears in templates and in-progress edits |
 | `execution` | object | Advisory tuning. General values come from `execution-tuning.conf`, per-route values from `execution-<route>.conf`; the resolver loads both as presets, device profiles don't `include` them. Write only differences |
+| `timer_98260` | object | Optional timer-route capability block (section 4.9); absent = a native-only profile |
+| `module` | object | The module chain's pair manifest (section 4.10); required with, and only with, a `module` entry in `pipeline` |
+
+### Pipeline selection (`pipeline`)
+
+`pipeline` is optional. Absent means the legacy default `["ghostlock"]`. It is an ordered list of
+chain names; the resolver walks it before any stage and runs the first viable entry. Values:
+`ghostlock`, `dirtyfrag`, `module`.
+
+`module` is the bundled-only chain (DirtyFrag without W1, a per-kernel module as the SELinux
+switch, Magisk as the userspace manager). It is never derived: it is honoured only for a bundled
+profile that ships together with a hand-built module for the same release, declared by the
+`module` block (section 4.10), and an imported profile declaring it is refused. The entry and the
+block imply each other: one without the other is refused.
+
+The requirements are pipeline-scoped. `release`, `schema_version` and `kernel_major` are always
+required. The `route`, `task_struct`, `cred` and `offset` groups are required only when the list
+contains a W1-based entry (`ghostlock` or `dirtyfrag`, including the legacy default); a
+`["module"]` document may omit them. A `route` that is present is still validated as in section 3.
+For a KDP image (`kdp = 1`) the order must be the strict `["dirtyfrag"]` or `["module"]`.
 
 ## 3. Route mechanism
 
 The route is no longer inferred from the kernel version or from which fields
-exist: the profile declares it explicitly. `route` is a parent with **exactly
-one branch**:
+exist: the profile declares it explicitly. `route` is a parent with **one or
+more branches** — a one-branch profile is the single-route case, and multiple
+branches form the superset the app's route picker displays
+(`docs/analysis/route-superset-plan.md`):
 
 ```hocon
-route { tcp_zerocopy { compact_waiter = 1 } }
 route { select_stack { waiter_shift = -2 } }
-route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
+# or the superset:
+route {
+  select_stack { waiter_shift = -2 }
+  tcp_zerocopy { compact_waiter = 1 }
+}
+routes = ["select_stack", "tcp_zerocopy", "timer_98260"]
 ```
 
-- Each route needs only its own branch; write no other branch, and never leave
-  two branches side by side (one config, one path).
+- **Viability is a parse result.** The app validates each branch (its required
+  fields and the static guards: the waiter shape, anchor alignment, page-free
+  facts) and the optional `timer_98260` block (the complete fake group). Only
+  the viable entries are listed in the picker; a branch that fails is not a
+  candidate, and it does not invalidate the profile's other branches.
+- **No route order.** The app displays the viable routes **alphabetically**; a
+  legacy `routes` list is accepted and validated but ignored. The choice is
+  remembered per exact `uname -r` (a remembered route that is no longer viable
+  is simply cleared); with no remembered choice the alphabetically first viable
+  route is the default. The native routes need a `route.<name>` branch; the
+  timer route is the `timer_98260` block and has no branch.
+- **Carriers are a list inside the branch.** A route's selectable carriers are a
+  list key, like `pipeline`, and the block carries the union of their geometry
+  (`docs/analysis/route-choice-matrix-plan.md`):
+  ```hocon
+  route {
+    select_stack {
+      carriers = [ "native", "compat" ]
+      waiter_shift = 1
+      waiter_home = 488
+      select_dst_depth = 496
+      compat_futex_abi = 1
+    }
+  }
+  ```
+  A branch without `carriers` keeps the legacy rule: `compat_carrier = 1`
+  selects the AArch32 carrier, its absence the native one. The app renders one
+  carrier box when the list has more than one entry, remembers the choice per
+  release and route, and injects the wire's `compat_carrier` from it; the
+  native wire schema is unchanged.
+- **DirtyFrag is a run choice, not a document key.** The profile's ordered
+  `pipeline` list is the capability; the home shows an on/off box only when
+  the list names both `dirtyfrag` and `ghostlock`, and "off" trims the order to
+  GhostLock for that run.
+- **The runtime document is still one route.** The app renders the chosen
+  branch into the native wire (and the timer block into the timer document);
+  the native's `fallback` stays as the primary route's own internal fallback.
 - `fallback` declares a fallback: `"to"` is `"none"` or a route name. When you
   declare a target, also provide the `"route"` branch holding the fields the
   fallback needs:
@@ -139,6 +210,13 @@ route { multicast_waiter { waiter_off = 96, buffer_size = 264 } }
 | `route.tcp_zerocopy.compact_waiter` / `route.multicast_waiter.compact_waiter` | required | | required |
 | `route.select_stack.waiter_shift` | | required (0 is valid) | |
 | `route.multicast_waiter.waiter_off` (>0), `route.multicast_waiter.buffer_size`, `route.multicast_waiter.task_offset`, `route.multicast_waiter.lock_offset`, `offset.empty_zero_page`, `cred.ref_count` (>0) | | | required |
+
+A branch that lists `carriers` requires each listed carrier's fields: the
+native entry needs `waiter_shift` (select) and the compat entry needs
+`waiter_home` + `select_dst_depth` (select) or `compat_waiter_off` +
+`compat_buffer_size` + `compat_futex_abi` (multicast). `compact_waiter` stays
+required for tcp and multicast. A legacy branch without `carriers` is checked
+as before.
 
 Credential-template bounds (general): `cred.usage_offset + 4 ≤ cred.copy_size`;
 `cred.caps_offset + cred.caps_count × 8 ≤ cred.copy_size`; `cred.ref_count ≤ 4`;
@@ -222,7 +300,10 @@ addresses.
 | `offset.slide_nfulnl_logger` / `offset.slide_boot_id` / `offset.slide_loggers_0_1` | KASLR slide anchors |
 | `kernel_phys_load` | Kernel physical load address (0 falls back to the SoC formula) |
 | `kernel_phys_offset` | DRAM base / linear-map `PHYS_OFFSET` used for image→direct-map translation (default: compiled `P0_PHYS_OFFSET = 0x80000000`). Set it for devices whose DRAM base differs (e.g. MTK `0x40000000`); `boot.img` does not carry it — on MediaTek the extractor reads it from the `vendor_boot.img` embedded DTB's `/memory` node (or `--dtbo`), and on a rooted device `/proc/iomem` supplies it |
-| `recommend_shizuku` | Whether this kernel recommends the Shizuku path (0/1, required in every profile, default 0; advisory only). It is not shown in any editor: for recommended kernels the app **turns the home-screen "Run via Shizuku" switch on at every start**. You can turn it off for the session, and once off the app stops requiring Shizuku for that session |
+
+`recommend_shizuku` was retired from the authored schema on 2026-11-23. It is
+still accepted and ignored in existing schema-v3 documents; Shizuku is opt-in
+through the app switch.
 
 ### 4.4 select_stack / tcp route fields
 
@@ -294,7 +375,112 @@ leak, no reclaim sockets, no page-acceptance gate, no `[spray]` lines, `base=0`.
 states its value source (`w1_value_source=scratch` for W1/W1p, `init_cred` for W2, `target-8` for
 leaf writes). The page-based credential copy/fill and the fops sentinel remain on the page path; a
 profile without either anchor behaves exactly as before. Both keys are optional and do not change
-`schema_version` (`1`, or `2` for a per-device-maps profile); a missing key means the page path.
+`schema_version` (always `3`); a missing key means the page path.
+
+### 4.9 The timer route's capability block (`timer_98260`)
+
+An optional top-level block for the Shizuku-delivered timer tool (CVE-2026-98260). It is a
+Kotlin-side sibling of the native route, not a `route` branch: the native exploit never runs the
+timer tool, and the native wire never carries this block (the same profile with and without it
+produces a byte-identical native document). A profile without the block is native-only and the
+timer route is unavailable.
+
+A profile generated on the device may carry the block too: the parse path runs the timer analyzer
+against the same image and merges the emitted block only when the app's parser accepts it
+(`docs/analysis/timer-block-generation-plan.md`). A real-only block is legal and leaves the timer
+route unavailable (a way-2 run needs the fake group).
+
+```hocon
+timer_98260 {
+  version = 1
+  timer_site_lower_21bit = 507136
+  timer_object_size = 264
+  cred_request_size = 168
+  cred_alloc_size = 192
+  cred_uid_offset = 4
+  timer_node_offset = 120
+  page_alloc_gfp_offset = 20
+  page_alloc_gfp_size = 4
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `version` | int | Always `1`; the block evolves without touching `schema_version` |
+| `timer_site_lower_21bit` | int | `do_timer_create`'s `kmem_cache_alloc(posix_timers_cache)` return site, masked to 21 bits as the trace scanner compares it |
+| `timer_object_size`, `cred_request_size`, `cred_alloc_size` | int | SLUB sizes: `posix_timers_cache` object size, `cred_jar` request, `cred_jar` allocation |
+| `cred_uid_offset` | int | `cred.uid` offset |
+| `timer_node_offset` | int | `k_itimer.it.cpu.node` offset (optional; default `0x78`) |
+| `static_timer_site`, `task_alloc_site_lower_21bit`, `task_alloc_size`, `task_cred_offset`, six data symbols | fake only | The fake-path constants; the data symbols are kernel VAs and **must be quoted hex strings** (`"0xffffffc00a2293d0"`), because a HOCON/JSON number cannot carry them |
+| `cred_usage_size`, `cred_caps_offset`, `cred_caps_count`, `cred_security_offset`, `cred_user_offset`, `cred_user_ns_offset`, `cred_ucounts_offset`, `cred_group_info_offset` | fake only | The fake cred's layout: where the fabricated object carries its fields. `cred_ucounts_offset` exists only where the cred has `ucounts` (5.10 omits it, and `init_ucounts` with it) |
+| `security_sid_offset` | fake only | The `sid` offset **inside the LSM blob** the fake cred's `security` pointer names — not a cred offset |
+| `page_alloc_gfp_offset`, `page_alloc_gfp_size` | int, int | Where the raw `mm_page_alloc` record carries `gfp_flags`: `0x14`/`4` on 5.10, `0x18`/`8` on 6.x. The reclaim's frag/slab classifier reads it; a wrong layout silently disables the discriminator |
+
+Rules: unknown keys inside the block are an error; the real-path five are always required. The
+block carries no mode key: the fake ending is declared structurally, so **any** fake key makes the
+whole fake set (including the flat cred keys) required, and a block without them supports the real
+ending only. `0` is
+written only when it is the real value (a 5.10 cred has no `ucounts`, so
+`init_ucounts`/`cred_ucounts_offset` are omitted there); every `cred_*_offset` must fall inside
+`cred_request_size` (with the caps run fitting) and the fake path's `task_cred_offset` inside
+`task_alloc_size`; `static_timer_site`'s
+low 21 bits must equal `timer_site_lower_21bit` (the same image site — a disagreement would derive
+a bogus KASLR slide); `timer_site_lower_21bit` and
+`task_alloc_site_lower_21bit` are 21-bit; `timer_object_size`/`cred_request_size`/`cred_alloc_size` must agree with the
+measured `/proc/slabinfo` lines when those are present.
+
+The app renders the merged, validated profile as the canonical backend document
+(`ProfileDocument`): top-level `release`/`schema_version`/`kernel_major`, a `kernel` block (the
+shared geometry), a `native` block (route/fallback/pipeline/execution) and this block. The timer
+tool reads only `release` and `timer_98260` and re-checks its own invariants; the native keeps its
+binary wire in this version. 64-bit values are `"0x..."` strings in the document.
+
+### 4.10 The module chain's pair manifest (`module`)
+
+An optional top-level block for the module chain (DirtyFrag without W1, a per-kernel module as the
+SELinux switch, Magisk as the userspace manager). It is a Kotlin-side block: the native exploit
+never reads it and the native wire never carries it (the same profile with and without the block
+produces a byte-identical native document). It is the only declaration of the bundle-only pair — a
+bundled profile and the hand-built `.ko` it names, validated together. There is no separate asset
+index.
+
+The block and the `pipeline` entry imply each other: `pipeline = [ "module" ]` requires the block,
+and a block without the entry is refused as inert.
+
+```hocon
+module {
+  version = 1
+  asset = "modules/5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284.ko"
+  asset_sha256 = "…"                       # 64 hex characters
+  vendor_files = [                         # optional; absent = the built-in probe list
+    "/vendor/lib64/libbinderdebug.so",
+    "/vendor/lib64/libstagefrighthw.so",
+    "/vendor/lib64/libstagefright_aidl_bufferpool2.so",
+  ]
+}
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `version` | int | Always `1`; the block evolves without touching `schema_version` |
+| `asset` | string | The bundled artifact, relative to `assets/`: `modules/<name>.ko`; no absolute path, `..` segment or empty segment |
+| `asset_sha256` | string | 64 hex characters; the app refuses an artifact that does not hash to it |
+| `vendor_files` | list | Optional ordered `vendor_file` targets; absent = the app's built-in list. The first that exists, passes a bridge read and holds the module is used. Each is an absolute `/vendor/…` path shorter than the stub's 64-byte target field (63 bytes plus NUL); an explicitly empty list is an error |
+
+Rules: unknown keys are an error; `version`, `asset` and `asset_sha256` are required; a `module`
+entry without the block and a block without the entry are both refused.
+
+The image's module ABI (vermagic, `sizeof(struct module)`, the `module_layout` CRC) is deliberately
+not a profile key: the build gate pins the exact Image config and the loader enforces the ABI (a
+wrong magic half or CRC is a clean `ENOEXEC`), while `asset_sha256` binds the exact artifact. The
+one non-clean loader outcome — an undersized `struct module` — is prevented at authoring time by
+building from the Image's exact config; the app cannot read the running kernel's ABI (no BTF on
+5.10, no config access), so a profile-side copy could not be checked against it.
+
+The app resolves the pair before any delivery: it opens `assets/<asset>` and verifies the hash,
+then picks a `vendor_files` target by probing. The block is rendered in the canonical backend
+document (`ProfileDocument`) so a round-trip preserves it; an imported profile still cannot
+authorize the chain (bundle-only).
 
 ## 5. execution tuning (advisory)
 
@@ -304,9 +490,9 @@ defaults. The common groups come from `execution-tuning.conf` and the per-route
 groups from `execution-<route>.conf`; the app resolver (and the Gradle exporter)
 load these presets directly, so device profiles no longer `include` them:
 
-- `recommended_cpus` / `selected_cpus`: suggested and locally selected cores
-  (`selected_cpus` is maintained by the "general parameter override" page or the
-  home-screen CPU picker)
+- `recommended_cpus`: the wire's CPU-pair fallback. It is not authored here and
+  not shown in any editor; the app writes `0/1`, and the native chooses the
+  pair at run time.
 - `heap`: KernelSnitch search attempt counts and timeouts
 - `race`: route race wait / settle / poll intervals
 - `stages`: W1/W2/W3 attempt counts and settle times
@@ -395,8 +581,8 @@ and there is no legacy decode.
 - Native has exactly one decode path: `profile/entry.cpp` hands the stdin (or
   file) bytes to `profile/binary.cpp::parse`; it detects no format other than
   the magic and has no JSON fallback.
-- Internal storage and "export config" are HOCON (human-readable). The legacy
-  v1 `offsets.json` is converted to v2 only on the Kotlin side; see section 11.
+- Internal storage and "export config" are HOCON, schema v3 (human-readable).
+  An older document is refused, never converted (section 11).
 - Runtime route and capability decisions (`TargetProfile::route()`,
   `TargetProfile::supports()`, `route_capability`) are all based on the decoded
   route.
@@ -425,39 +611,20 @@ and there is no legacy decode.
 5. When renaming or regrouping fields, update `FieldLabels.kt` +
    `values*/strings.xml` and, when relevant, `docs/kernel_profiles/defaults*.md`.
 
-## 11. Legacy v1 JSON import (compatibility)
+## 11. Earlier schema versions (retired 2026-11-22)
 
-This section collects everything about the **v1 JSON** compatibility layer;
-sections 0–10 describe the current v2 configuration only. Native reads v2
-exclusively (section 9); the v1 path is Kotlin-side and self-contained.
+Schema **v3 is the only accepted profile format**. The following are gone, not
+converted:
 
-- **v1 = the old JSON format**: the `offsets.json` of the remote/main era — the
-  extractor report (`symbols` / `struct_fields`, four top-level scalars, and
-  metadata such as `kimage_text_base` / `btf_size` / `kallsyms`).
-  `ghostlock-extract --format json` still emits this shape for external tools.
-- `LegacyProfileConverter` normalizes a v1 document to v2 on load, idempotently:
+- **v1 / v2 profiles** (`schema_version = 1` or `2`): refused on import and on
+  load with a `schema_version` error. The app writes every document as v3.
+- **Unversioned `remote/main`-era JSON reports** (`symbols` / `struct_fields`
+  flat offsets): no longer converted. `ghostlock-extract --format json` still
+  emits that report shape for external tools, but it is not a profile.
+- The legacy converter, the automatic schema upgrade of imported copies, and
+  the v0→v1→v2 migration tests are removed with it.
 
-  | v1 content | Conversion result |
-  |---|---|
-  | `symbols` object (`off_*` keys) | `offset.*` namespace |
-  | `struct_fields` object (`task_*` keys) | `task_struct.*` namespace; a few fields (`rt_mutex_waiter`, `cred_uid`, `seccomp_*`, …) stay in place and take no part in validation/comparison |
-  | top-level `pselect_waiter_shift` | `route.select_stack.waiter_shift` (as `fallback.route.select_stack.waiter_shift` for a tcp profile) |
-  | top-level `compact_waiter` | `route.tcp_zerocopy.compact_waiter` |
-  | top-level `mm_struct_sz` | `kernelsnitch.mm_struct_sz` |
-  | `kimage_text_base` / `btf_size` / `kallsyms` | dropped |
-  | no `route` field | inferred from 6.x geometry: `compact_waiter` → tcp, otherwise select |
-  | no cred template | seeds the bundled 6.x constants (`credential-6x.conf` / `kernelsnitch-6x.conf`); 5.x credential fields stay author-supplied |
+To move an older profile forward, regenerate it from its image with this build
+(`ghostlock-extract --format conf`) or export it from an app build that still
+reads it; the result carries `schema_version = 3`.
 
-- Old flat keys (`kernelsnitch_collisions` / `mm_struct_sz` / `task_*` /
-  `cred_*` / `off_*` / `mcast_*`) are folded into the matching namespaces when
-  importing an old `offsets.json`, parsing extractor output, or reading
-  advanced overrides.
-- The same route inference applies to an old config with no `route`:
-  `kernel_major == 5 && mcast.waiter_off > 0` → `multicast_waiter`; otherwise
-  `compact_waiter != 0` → `tcp_zerocopy`; otherwise `select_stack`. A v1
-  document can never select the 5.x branch (`multicast_waiter` is retained only
-  as a guarded inference).
-- Old JSON caches are **not migrated and are discarded at startup**; internal
-  storage, snapshots, and exports are always HOCON.
-- Native has no v1 parser: the native `legacy/` JSON decoder was removed; a v1
-  document is converted to v2 on the Kotlin side before transport.
