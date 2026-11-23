@@ -36,6 +36,8 @@ jobs:
 
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
+      - name: Install Android Rust target
+        run: rustup target add aarch64-linux-android
 
       - name: Cache Cargo
         uses: actions/cache@v6
