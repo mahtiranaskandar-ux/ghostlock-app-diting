@@ -74,10 +74,11 @@ int32_t main(void) {
     }
 
     /* The multicast/sigreturn route guard's predicate: the per-image
-     * `waiter_layout.compact` is authoritative, the release family (5.x and
-     * 6.1 compact, 6.6+ the rt_waiter_node shape) is the fallback for profiles
-     * that predate it, and an unparsable release fails closed. The legacy
-     * route `compact_waiter` flag (set on `decoded` here) is not consulted. */
+     * `waiter.compact` is authoritative, the release family (5.x and
+     * 6.1 compact, 6.6+ the rt_waiter_node shape) is the fallback when the
+     * per-image layout is absent, and an unparsable release fails closed. The
+     * route-local `compact_waiter` flag (set on `decoded` here) is not
+     * consulted. */
     decoded.waiter.compact.reset();
     decoded.uname_r = "6.6.66-android15-8-g29d86c5fc9dd-abogki428889875-4k";
     ghostlock::profile::TargetProfile release_66 = ghostlock::profile::TargetProfile::from(&decoded);

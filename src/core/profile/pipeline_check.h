@@ -1,11 +1,11 @@
-/* The wire `meta.pipeline` cross-check.
+/* The `mode` cross-check.
  *
- * The app resolves the profile's ordered pipeline list to one entry before W1
- * and writes it into the binary document. The native must be invoked in the
- * matching mode: a resolved DirtyFrag run is the `--w1-only` invocation (the
- * DirtyFrag stage follows as its own process), and a resolved GhostLock run is
- * the full chain. A mismatch means the two sides disagree about the run's
- * shape, so the native refuses rather than runs the wrong one.
+ * The app resolves the document's ladder to one engine before W1 and writes it
+ * into the JSON document as `mode`. The native must be invoked
+ * in the matching mode: a resolved DirtyFrag run is the `--w1-only`
+ * invocation (the DirtyFrag stage follows as its own process), and a resolved
+ * GhostLock run is the full chain. A mismatch means the two sides disagree
+ * about the run's shape, so the native refuses rather than runs the wrong one.
  *
  * Header-only so the host test exercises the exact policy main.cpp applies. */
 
@@ -15,12 +15,13 @@
 #include <optional>
 
 namespace ghostlock::profile {
-    /* Wire values of `meta.pipeline`; NativeProfile.kt mirrors them. */
+    /* JSON `mode` values; ProfileTransport.kt writes them. */
     constexpr uint32_t kPipelineGhostlock = 1;
     constexpr uint32_t kPipelineDirtyfrag = 2;
 
     enum class PipelineCheck {
-        /* The document predates the cross-check; keep the legacy behaviour. */
+        /* The document omits the run key (the parse/preview paths); skip the
+         * cross-check. */
         NotDeclared,
         Match,
         Mismatch,

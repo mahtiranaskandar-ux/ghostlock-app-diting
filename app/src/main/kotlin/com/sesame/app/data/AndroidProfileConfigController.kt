@@ -5,14 +5,14 @@ import android.content.SharedPreferences
 import android.os.Build
 import androidx.core.content.edit
 import com.sesame.app.BuildConfig
+import com.sesame.app.data.profile.MeasuredOverlay
 import com.sesame.app.data.profile.ModuleBlock
+import com.sesame.app.data.profile.OverlayFact
 import com.sesame.app.data.profile.PerDevicePhys
-import com.sesame.app.data.profile.ProfileDocument
 import com.sesame.app.data.profile.ProfileMerger
 import com.sesame.app.data.profile.ProfileResolver
-import com.sesame.app.data.profile.RouteCarriers
+import com.sesame.app.data.profile.ProfileTransport
 import com.sesame.app.data.profile.Timer98260
-import com.sesame.app.data.route.RouteKind
 import com.sesame.app.domain.model.AnchorGeometry
 import com.sesame.app.domain.model.ExecutionFieldValue
 import com.sesame.app.domain.model.ProfileConfig
@@ -22,6 +22,7 @@ import com.sesame.app.domain.model.ProfileFieldNode
 import com.sesame.app.domain.model.ProfileLayers
 import com.sesame.app.domain.model.RouteCandidate
 import com.sesame.app.domain.model.physPairErrors
+import com.sesame.app.domain.repository.NativeRunDocument
 import com.sesame.app.domain.repository.ProfileConfigController
 
 /**
@@ -75,7 +76,6 @@ internal class AndroidProfileConfigController(
         DeviceIdentity.candidates(deviceCodename, deviceAliases)
 
     override suspend fun load(release: String): ProfileConfig {
-        migrateLegacyExternalSelection(release)
         val resolution = resolve(release)
         val full = resolution.profile
         if (full == null) {
@@ -85,13 +85,12 @@ internal class AndroidProfileConfigController(
                 layers = resolution.layers,
             )
         }
-        val fallbackTo = fallbackTargetOf(full)
-        val candidates = viableRoutes(full, fallbackTo)
+        val candidates = viableRoutes(full)
         val chosen = resolveRouteChoice(release, candidates)
-        /* The native document/editor always target a native branch. When the
-         * picker chose the timer, the last native route the user picked is the
-         * subject (remembered per release, self-healing against the viable
-         * set); the first viable native route is the fallback. */
+        /* The native document/editor always target a native syscall. When the
+         * picker chose the timer, the last native syscall the user picked is
+         * the subject (remembered per release, self-healing against the viable
+         * set); the first viable native syscall is the fallback. */
         val storedNative = preferences.getString(nativeRouteChoiceKey(release), null)
             ?.takeIf { name -> candidates.any { !it.timer && it.name == name } }
         if (storedNative == null && preferences.contains(nativeRouteChoiceKey(release))) {
@@ -100,61 +99,49 @@ internal class AndroidProfileConfigController(
         val route = chosen?.takeIf { it in ProfileConfig.Routes }
             ?: storedNative
             ?: candidates.firstOrNull { !it.timer }?.name
-            ?: routeNameOf(full)
         val pipelineOrder = ProfileResolver.pipelineOrder(full)
         val needsW1 = ProfileResolver.requiresW1(pipelineOrder)
-        /* The module chain's pair manifest, when the list selects it. A
+        /* The module chain's pair manifest, when the document carries it. A
          * malformed block is already in invalidPaths; the runtime then has no
          * spec and refuses the chain. */
         val module = if ("module" in pipelineOrder) {
-            ModuleBlock.parse(full[ModuleBlock.BLOCK_KEY]).first
+            ModuleBlock.parse(
+                (full[ProfileResolver.GhostlockKey] as? Map<*, *>)?.get(ModuleBlock.BLOCK_KEY),
+            ).first
         } else {
             null
         }
-        /* The carrier choice belongs to the active native route; the timer
-         * selection has none. DirtyFrag is a choice only when the pipeline
-         * lists both entries (off then leaves GhostLock runnable). */
         val carrierCandidates = candidates.firstOrNull { it.name == route }?.carriers.orEmpty()
         val selectedCarrier = resolveCarrierChoice(release, route, carrierCandidates)
         val dirtyFragSelectable = "dirtyfrag" in pipelineOrder && "ghostlock" in pipelineOrder
         val dirtyFragOn = resolveDirtyFragChoice(release, pipelineOrder)
-        val invalidPaths = validateProfileFields(full, route, fallbackTo, needsW1) +
-            ProfileResolver.validateMerged(full, route, fallbackTo)
-                .mapTo(mutableSetOf()) { it.fieldPath }
+        val (physLoad, physOffset) = ProfileResolver.physOf(full)
+        val invalidPaths = mutableSetOf<String>()
+        invalidPaths += ProfileResolver.validateMerged(full).map { it.fieldPath }
+        invalidPaths += physPairErrors(
+            socName,
+            loadPresent = physLoad != null,
+            offsetPresent = physOffset != null,
+            needsW1 = needsW1,
+        ).map { it.substringBefore(':') }
         /* Invalid fields missing from the resolved document still get a row,
          * otherwise the run stays blocked with no red field to fix. */
         materializeInvalidPaths(full, invalidPaths)
-        /* The editor shows every field of the active route plus the shared
-         * geometry, so a field the profile did not carry appears as an
-         * editable `null` row instead of being invisible. */
-        val complete = completeProfileFields(full, route, fallbackTo)
         val baseline = full
-        val roots = buildTree(complete, "")
-        /* The anchor trio lives in the active route's own branch; the native
-         * writes only that section to the wire (NativeProfile: "only the
-         * active route's route.* section is written"). */
-        val anchor = route?.let { name ->
-            full.getLongAt("route.$name.lock_anchor_image")?.let { image ->
-                AnchorGeometry(
-                    image = image,
-                    bytes = full.getLongAt("route.$name.lock_anchor_bytes"),
-                    stride = full.getLongAt("route.$name.lock_anchor_stride"),
-                )
-            }
+        val roots = buildTree(full, "")
+        val anchor = ProfileResolver.anchorOf(full)?.let { (image, bytes, stride) ->
+            image?.let { AnchorGeometry(it, bytes, stride) }
         }
         return ProfileConfig(
             release = release,
             hasProfile = true,
-            physLoad = full.getLongAt("kernel_phys_load"),
-            physOffset = full.getLongAt("kernel_phys_offset"),
+            physLoad = physLoad,
+            physOffset = physOffset,
             anchor = anchor,
-            layers = resolution.layers.copy(
-                uncarriedKeys = uncarriedRouteKeys(full, route),
-            ),
+            layers = resolution.layers,
             roots = roots,
-            general = generalFields(full, baseline, route, fallbackTo),
+            general = generalFields(full, baseline, route),
             route = route,
-            fallbackTo = fallbackTo,
             routeCandidates = candidates,
             selectedRoute = chosen,
             carrierCandidates = carrierCandidates,
@@ -169,7 +156,7 @@ internal class AndroidProfileConfigController(
 
     override fun selectRoute(release: String, route: String): Boolean {
         val full = resolve(release).profile ?: return false
-        val viable = viableRoutes(full, fallbackTargetOf(full)).map { it.name }
+        val viable = viableRoutes(full).map { it.name }
         return if (route in viable) {
             preferences.edit {
                 putString(routeChoiceKey(release), route)
@@ -192,7 +179,7 @@ internal class AndroidProfileConfigController(
         carrier: String,
     ): Boolean {
         val full = resolve(release).profile ?: return false
-        val carriers = RouteCarriers.of(full, route)
+        val carriers = ProfileResolver.carriersOf(branchOf(full, route))
         return if (carrier in carriers) {
             preferences.edit { putString(carrierChoiceKey(release, route), carrier) }
             true
@@ -248,11 +235,7 @@ internal class AndroidProfileConfigController(
     }
 
     private fun dirtyFragSelectable(full: ValueMap): Boolean {
-        val order = when (val raw = full["pipeline"]) {
-            is String -> listOf(raw.trim().lowercase())
-            is List<*> -> raw.mapNotNull { (it as? String)?.trim()?.lowercase() }
-            else -> emptyList()
-        }
+        val order = ProfileResolver.pipelineOrder(full)
         return "dirtyfrag" in order && "ghostlock" in order
     }
 
@@ -287,323 +270,41 @@ internal class AndroidProfileConfigController(
     }
 
     /**
-     * The viable candidates: a pure parse of the resolved document. Native
-     * branches are filtered by the static guards valid for that route (errors
-     * that belong to another branch or to the timer are ignored); the timer is
-     * a candidate when its block parses with the complete fake group.
+     * The viable candidates: the document's declared syscall branches, each
+     * with its declared carrier pair, plus the timer engine when its block and
+     * the shared kernel facts supply the fake group. The picker displays them
+     * alphabetically; the first is the default.
      */
-    private fun viableRoutes(full: ValueMap, fallbackTo: String?): List<RouteCandidate> {
-        val branchOrder = when (val raw = full["route"]) {
-            is String -> listOf(raw)
-            is Map<*, *> -> raw.keys.filterIsInstance<String>()
-            else -> emptyList()
-        }
-        val native = branchOrder
-            .filter { it in ProfileConfig.Routes }
-            .filter { routeErrors(full, it, fallbackTo).isEmpty() }
-            .map {
-                RouteCandidate(
-                    it,
-                    timer = false,
-                    carriers = RouteCarriers.of(full, it),
-                )
+    private fun viableRoutes(full: ValueMap): List<RouteCandidate> {
+        val order = ProfileResolver.pipelineOrder(full)
+        val native = if (!ProfileResolver.requiresW1(order)) {
+            /* A profile that selects no native chain (timer-only) must not
+             * offer the native syscalls: they cannot run without one. */
+            emptyList()
+        } else {
+            ProfileResolver.syscallsOf(full).map { (name, carriers) ->
+                RouteCandidate(name, timer = false, carriers = carriers)
             }
+        }
         val timer = if (timerViable(full)) {
             listOf(RouteCandidate(Timer98260.BLOCK_KEY, timer = true))
         } else {
             emptyList()
         }
-        /* No route order: the picker displays the viable routes
-         * alphabetically. A `routes` key in an older profile is accepted but
-         * does not rank anything. */
         return (native + timer).sortedBy { it.name }
     }
 
-    /** The static errors that belong to [route] itself (shared or its branch). */
-    private fun routeErrors(full: ValueMap, route: String, fallbackTo: String?): Set<String> {
-        val needsW1 = ProfileResolver.requiresW1(ProfileResolver.pipelineOrder(full))
-        val errors = validateProfileFields(full, route, fallbackTo, needsW1).toMutableSet()
-        errors += ProfileResolver.validateMerged(full, route, fallbackTo).map { it.fieldPath }
-        return errors.filterNot { foreignRoutePath(it, route) }.toSet()
-    }
+    private fun timerViable(full: ValueMap): Boolean = Timer98260.fakeSupported(full)
 
-    /** Errors for another route's branch or for the timer block. */
-    private fun foreignRoutePath(path: String, route: String): Boolean = when {
-        path == Timer98260.BLOCK_KEY || path.startsWith("${Timer98260.BLOCK_KEY}.") -> true
-        path.startsWith("route.") && !path.startsWith("route.$route.") -> true
-        path.startsWith("fallback.route.") && !path.startsWith("fallback.route.$route.") -> true
-        else -> false
-    }
+    /** The document's selected syscall. */
+    private fun routeNameOf(profile: ValueMap): String? =
+        ((profile[ProfileResolver.GhostlockKey] as? Map<*, *>)?.get("syscall")) as? String
 
-    private fun timerViable(full: ValueMap): Boolean {
-        val block = full[Timer98260.BLOCK_KEY] ?: return false
-        val (config, errors) = Timer98260.parse(block)
-        return config != null && errors.isEmpty() && config.fakeSupported
-    }
-
-    /**
-     * Kotlin-side geometry/credential validation. The profile declares its
-     * route explicitly; fields that belong to other routes may stay absent.
-     */
-    private fun validateProfileFields(
-        profile: ValueMap,
-        explicitRoute: String?,
-        fallbackTo: String?,
-        needsW1: Boolean,
-    ): Set<String> {
-        val invalid = mutableSetOf<String>()
-        fun value(path: String): Long? = profile.getLongAt(path)
-        fun requireNonZero(vararg paths: String) {
-            paths.forEach { path ->
-                val current = value(path)
-                if (current == null || current == 0L) invalid += path
-            }
-        }
-
-        /* The route is profile-controlled: a missing or unknown branch is
-         * invalid for a W1 chain. Legacy documents get their route from the
-         * converter, so an unresolved route there means the profile is
-         * genuinely broken. A bundled `module` profile has no route at all. */
-        val route = explicitRoute?.takeIf { it in ProfileConfig.Routes }
-        if (needsW1 && route == null) invalid += "route"
-
-        if (needsW1) requireNonZero(*RouteCommonRequired.toTypedArray())
-        val major = value("kernel_major")
-        if (major != 5L && major != 6L) invalid += "kernel_major"
-
-        /* The credential template is only consumed by the W1 chain. */
-        if (needsW1) {
-            val copySize = value("cred.copy_size")
-            if (copySize == null || copySize == 0L) invalid += "cred.copy_size"
-            /* Absent cred.usage_offset decodes as 0 and passes, exactly like native. */
-            val usageOffset = value("cred.usage_offset") ?: 0L
-            if (copySize != null && usageOffset + SizeofU32 > copySize) {
-                invalid += "cred.usage_offset"
-            }
-
-            val capsCount = value("cred.caps_count")
-            val capsOffset = value("cred.caps_offset")
-            if (capsCount == null || capsCount == 0L) invalid += "cred.caps_count"
-            if (copySize != null && capsCount != null && capsOffset != null &&
-                capsOffset + capsCount * SizeofU64 > copySize
-            ) {
-                invalid += "cred.caps_offset"
-                invalid += "cred.caps_count"
-            }
-
-            val refCount = value("cred.ref_count") ?: 0L
-            if (refCount > 4) invalid += "cred.ref_count"
-            for (index in 0 until 4) {
-                if (index >= refCount) break
-                val image = value("cred.ref${index}_image")
-                if (image == null || image == 0L) invalid += "cred.ref${index}_image"
-                val offset = value("cred.ref${index}_offset")
-                if (copySize != null && offset != null && offset + SizeofU64 > copySize) {
-                    invalid += "cred.ref${index}_offset"
-                }
-            }
-        }
-
-        val stride = value("kernelsnitch.mm_struct_sz")
-        if (stride != null && (stride < MinSlabStride || stride > MaxSlabStride)) {
-            invalid += "kernelsnitch.mm_struct_sz"
-        }
-
-        val routePrefix = route?.let { "route.$it" } ?: "route"
-        val fallbackPrefix = fallbackTo?.takeIf { it != "none" }
-            ?.let { "fallback.route.$it" }
-        /* The selectable carriers change which required fields apply: a
-         * `carriers` list names them; a branch without it keeps the legacy
-         * `compat_carrier` flag semantics. */
-        val routeCarriers = route?.let { RouteCarriers.of(profile, it) }.orEmpty()
-        val compatCarrier = RouteCarriers.Compat in routeCarriers
-        val nativeCarrier = RouteCarriers.Native in routeCarriers
-        when (route) {
-            "tcp_zerocopy" -> {
-                val compact = value("$routePrefix.compact_waiter")
-                if (compact == null || compact == 0L) {
-                    invalid += "$routePrefix.compact_waiter"
-                } else if (compact < 0L || compact > 0xffL) {
-                    invalid += "$routePrefix.compact_waiter"
-                }
-            }
-
-            "select_stack" -> {
-                /* The AArch32 compat carrier places the stamp from the
-                 * measured geometry (waiter_home / select_dst_depth), not from
-                 * the 64-bit fd_set word shift; a compat profile legitimately
-                 * omits waiter_shift and must state both depths instead. */
-                if (compatCarrier) {
-                    for (field in listOf("waiter_home", "select_dst_depth")) {
-                        val current = value("$routePrefix.$field")
-                        if (current == null || current <= 0L ||
-                            current > UInt.MAX_VALUE.toLong()
-                        ) {
-                            invalid += "$routePrefix.$field"
-                        }
-                    }
-                    /* Optional: the derived ABI (0 time32, 1 time64). Absent
-                     * keeps the native's legacy home table. */
-                    val abi = value("$routePrefix.compat_futex_abi")
-                    if (abi != null && abi !in 0L..1L) {
-                        invalid += "$routePrefix.compat_futex_abi"
-                    }
-                }
-                if (nativeCarrier || !compatCarrier) {
-                    val shift = value("$routePrefix.waiter_shift")
-                    if (shift == null ||
-                        shift < Int.MIN_VALUE.toLong() || shift > Int.MAX_VALUE.toLong()
-                    ) {
-                        invalid += "$routePrefix.waiter_shift"
-                    }
-                }
-            }
-
-            "multicast_waiter" ->
-                invalid += validateMulticastGeometry(routePrefix, ::value, compatCarrier)
-        }
-        if (fallbackTo != null && fallbackTo != "none" && fallbackTo !in ProfileConfig.Routes) {
-            invalid += "fallback.to"
-        } else if (fallbackPrefix != null) {
-            when (fallbackTo) {
-                "tcp_zerocopy" -> {
-                    val compact = value("$fallbackPrefix.compact_waiter")
-                    if (compact == null || compact == 0L) {
-                        invalid += "$fallbackPrefix.compact_waiter"
-                    } else if (compact < 0L || compact > 0xffL) {
-                        invalid += "$fallbackPrefix.compact_waiter"
-                    }
-                }
-
-                "select_stack" -> {
-                    val shift = value("$fallbackPrefix.waiter_shift")
-                    if (shift == null ||
-                        shift < Int.MIN_VALUE.toLong() || shift > Int.MAX_VALUE.toLong()
-                    ) {
-                        invalid += "$fallbackPrefix.waiter_shift"
-                    }
-                }
-
-                "multicast_waiter" ->
-                    invalid += validateMulticastGeometry(
-                        fallbackPrefix,
-                        ::value,
-                        compatListed =
-                            value("$fallbackPrefix.compat_carrier") == 1L,
-                    )
-            }
-        }
-        return invalid
-    }
-
-    /**
-     * `route.multicast_waiter`'s geometry, in either carrier form. The 64-bit
-     * form (`waiter_off`/`buffer_size`) is the 5.x-6.1 `group_source_req`
-     * copy and carries the 5.x cred reference slots; the compat form
-     * (`compat_carrier` + the three `compat_*` keys, docs/analysis/
-     * compat-multicast-carrier-plan.md) is the armv7 helper's 32-bit copy at
-     * the extractor's derived depth. A compat profile states that geometry
-     * instead and, on 6.x, legitimately omits the 5.x cred slots (the native
-     * treats absent references as zero and uses `usage_size`/`uid_offset`).
-     */
-    private fun validateMulticastGeometry(
-        prefix: String,
-        value: (String) -> Long?,
-        compatListed: Boolean,
-    ): Set<String> {
-        val invalid = mutableSetOf<String>()
-        for (field in listOf("task_offset", "lock_offset")) {
-            val current = value("$prefix.$field")
-            if (current == null || current == 0L) {
-                invalid += "$prefix.$field"
-            } else if (current < 0L || current > UInt.MAX_VALUE.toLong()) {
-                invalid += "$prefix.$field"
-            }
-        }
-        val compact = value("$prefix.compact_waiter")
-        if (compact == null || compact == 0L) {
-            invalid += "$prefix.compact_waiter"
-        } else if (compact < 0L || compact > 0xffL) {
-            invalid += "$prefix.compact_waiter"
-        }
-        if (value("offset.empty_zero_page") == null || value("offset.empty_zero_page") == 0L) {
-            invalid += "offset.empty_zero_page"
-        }
-        val lockOffset = value("$prefix.lock_offset")
-        if (compatListed) {
-            val compatOff = value("$prefix.compat_waiter_off")
-            if (compatOff == null || compatOff <= 0L || compatOff > Int.MAX_VALUE.toLong()) {
-                invalid += "$prefix.compat_waiter_off"
-            }
-            val compatBuffer = value("$prefix.compat_buffer_size")
-            if (compatBuffer == null || compatBuffer <= 0L ||
-                compatBuffer > UInt.MAX_VALUE.toLong()
-            ) {
-                invalid += "$prefix.compat_buffer_size"
-            }
-            val compatAbi = value("$prefix.compat_futex_abi")
-            if (compatAbi == null || compatAbi < 0L || compatAbi > 1L) {
-                invalid += "$prefix.compat_futex_abi"
-            }
-            if (compatOff != null && compatOff > 0L && compatOff <= Int.MAX_VALUE.toLong() &&
-                compatBuffer != null && compatBuffer in 0L..UInt.MAX_VALUE.toLong() &&
-                lockOffset != null && lockOffset in 0L..UInt.MAX_VALUE.toLong() &&
-                compatOff + lockOffset + SizeofU64 > compatBuffer
-            ) {
-                invalid += "$prefix.compat_waiter_off"
-                invalid += "$prefix.lock_offset"
-                invalid += "$prefix.compat_buffer_size"
-            }
-            return invalid
-        }
-        for (field in RouteMulticastFields) {
-            val current = value("$prefix.$field")
-            if (current == null || current == 0L) {
-                invalid += "$prefix.$field"
-            } else if (current < 0L || current > UInt.MAX_VALUE.toLong()) {
-                invalid += "$prefix.$field"
-            }
-        }
-        if (value("cred.ref_count") == null || value("cred.ref_count") == 0L) {
-            invalid += "cred.ref_count"
-        }
-        val copySize = value("cred.copy_size")
-        if (copySize != null && copySize < 0xa0L) invalid += "cred.copy_size"
-        val waiterOff = value("$prefix.waiter_off")
-        if (waiterOff == null || waiterOff <= 0L || waiterOff > Int.MAX_VALUE.toLong()) {
-            invalid += "$prefix.waiter_off"
-        }
-        val bufferSize = value("$prefix.buffer_size")
-        if (waiterOff != null && waiterOff > 0L && waiterOff <= Int.MAX_VALUE.toLong() &&
-            bufferSize != null && bufferSize in 0L..UInt.MAX_VALUE.toLong() &&
-            lockOffset != null && lockOffset in 0L..UInt.MAX_VALUE.toLong() &&
-            waiterOff + lockOffset + SizeofU64 > bufferSize
-        ) {
-            invalid += "$prefix.waiter_off"
-            invalid += "$prefix.lock_offset"
-            invalid += "$prefix.buffer_size"
-        }
-        return invalid
-    }
-
-    /** The single branch key declared under "route" (string legacy allowed). */
-    private fun routeNameOf(profile: ValueMap): String? {
-        return when (val value = profile["route"]) {
-            is String -> value.takeIf { it.isNotEmpty() && it != "null" }
-            is Map<*, *> -> value.keys.filterIsInstance<String>()
-                .firstOrNull { it in ProfileConfig.Routes }
-            else -> null
-        }
-    }
-
-    private fun fallbackTargetOf(profile: ValueMap): String? {
-        profile["fallback"].asValueMap()?.let { fallback ->
-            val to = fallback["to"] as? String ?: ""
-            if (to.isNotEmpty() && to != "null") return to
-        }
-        /* Legacy flat spelling from transition builds. */
-        return (profile["fallback_to"] as? String)
-            ?.takeIf { it.isNotEmpty() && it != "null" }
+    /** The selected syscall's branch (carrier blocks included). */
+    private fun branchOf(profile: ValueMap, syscall: String?): Map<*, *>? {
+        if (syscall == null) return null
+        val syscalls = (profile[ProfileResolver.GhostlockKey] as? Map<*, *>)?.get("syscalls")
+        return (syscalls as? Map<*, *>)?.get(syscall) as? Map<*, *>
     }
 
     /**
@@ -632,16 +333,20 @@ internal class AndroidProfileConfigController(
         val resolved = resolve(release).profile ?: return null
         val view = resolved.copyValue().asValueMap() ?: return null
         for ((path, value) in extraValues) view.setValueAt(path, value)
-        val route = routeNameOf(view)
-        val fallbackTo = fallbackTargetOf(view)
         val needsW1 = ProfileResolver.requiresW1(ProfileResolver.pipelineOrder(view))
-        val invalid = validateProfileFields(view, route, fallbackTo, needsW1) +
-            ProfileResolver.validateMerged(view, route, fallbackTo).map { it.fieldPath }
+        val (load, offset) = ProfileResolver.physOf(view)
+        val invalid = ProfileResolver.validateMerged(view).map { it.fieldPath } +
+            physPairErrors(
+                socName,
+                loadPresent = load != null,
+                offsetPresent = offset != null,
+                needsW1 = needsW1,
+            ).map { it.substringBefore(':') }
         if (invalid.isNotEmpty()) return null
         view["schema_version"] = ProfileResolver.ProfileSchemaVersion
         view["release"] = release
         fillRouteExecutionDefaults(view)
-        if (source != null) injectPhysMaps(view, source)
+        if (source != null) widenDevices(view, source)
         return HoconSupport.render(view)
     }
 
@@ -655,52 +360,43 @@ internal class AndroidProfileConfigController(
     fun renderTimerDocument(release: String): String? {
         val resolved = resolve(release).profile ?: return null
         val block = resolved[Timer98260.BLOCK_KEY] ?: return null
-        /* Way 2 is the product gate: the block must carry the complete fake
-         * group. A real-only block is a lab document, not an app entry. */
+        /* Way 2 is the product gate: the timer block and the shared kernel
+         * facts must supply the complete fake group. A real-only document is a
+         * lab document, not an app entry. */
         val (timer, errors) = Timer98260.parse(block)
-        if (timer == null || errors.isNotEmpty() || !timer.fakeSupported) return null
+        if (timer == null || errors.isNotEmpty() || !Timer98260.fakeSupported(resolved)) return null
         val view = resolved.copyValue().asValueMap() ?: return null
         /* The tool refuses a document whose release differs from uname -r. */
         view["release"] = release
-        return ProfileDocument.render(view)
+        /* The tool computes its own kernel VAs from `kernel.image_base` plus
+         * the image-relative offsets, so it reads the same transport document
+         * the ghostlock backend does — only its block matters. */
+        return ProfileTransport.render(view)
     }
 
     /**
-     * Restore the source's per-device physical maps into an export. The
-     * running device's entry takes the resolved value (or the source's own
-     * value); every other device key is preserved. A source
-     * field that is null stays null (the native default), and an edited value
-     * for a device the source did not carry adds its key.
+     * Restore the selected document's per-device entries into an export: the
+     * resolved view carries the running device's single entry, while every
+     * other identity the source states must survive. The running device's
+     * entry takes the resolved value.
      */
-    private fun injectPhysMaps(view: ValueMap, source: ValueMap) {
-        val loadMap = source["kernel_phys_load"] as? Map<*, *>
-        val offsetMap = source["kernel_phys_offset"] as? Map<*, *>
-        if (loadMap == null && offsetMap == null) return
-        val matched = runCatching {
-            PerDevicePhys.resolveFor(source, deviceCandidates).device
-        }.getOrNull()
-        val key = matched ?: deviceCodename ?: deviceCandidates.firstOrNull()
-        view["schema_version"] = ProfileResolver.ProfileSchemaVersion
-        view["kernel_phys_load"] = physMap(loadMap, key, view.getLongAt("kernel_phys_load"))
-        view["kernel_phys_offset"] = physMap(offsetMap, key, view.getLongAt("kernel_phys_offset"))
-    }
-
-    private fun physMap(sourceMap: Map<*, *>?, device: String?, value: Long?): Any? {
-        if (sourceMap == null) return null
+    private fun widenDevices(view: ValueMap, source: ValueMap) {
+        val sourceDevices = source["devices"] as? Map<*, *> ?: return
         val out = linkedMapOf<String, Any?>()
-        for ((rawName, rawValue) in sourceMap) {
-            val name = rawName as? String ?: continue
-            out[name] = rawValue
-        }
-        if (device != null) {
-            val existing = out.keys.firstOrNull { it.equals(device, ignoreCase = true) }
-            if (value != null) {
-                out[existing ?: device] = value
-            } else if (existing != null) {
-                out.remove(existing)
+        var matchedKey: String? = null
+        for ((rawName, rawEntry) in sourceDevices) {
+            val name = rawName?.toString() ?: continue
+            out[name] = (rawEntry as? Map<*, *>)?.copyValue()
+            if (matchedKey == null && deviceCandidates.any { it.equals(name, ignoreCase = true) }) {
+                matchedKey = name
             }
         }
-        return out
+        val current = (view["devices"] as? Map<*, *>)?.entries?.firstOrNull()
+        if (current != null) {
+            val key = matchedKey ?: current.key?.toString() ?: deviceCodename
+            if (key != null) out[key] = (current.value as? Map<*, *>)?.copyValue()
+        }
+        view["devices"] = out
     }
 
     /** Renders the resolved profile verbatim (no trimming) for debug dumps. */
@@ -752,13 +448,15 @@ internal class AndroidProfileConfigController(
         val entry = ProfileDocumentParser.entryForRelease(text, release, ::loadBundledInclude)
             ?: return null
         val merged = runCatching { merge(release, entry) }.getOrNull() ?: return null
-        val route = routeNameOf(merged)
-        val fallbackTo = fallbackTargetOf(merged)
-        val needsW1 = ProfileResolver.requiresW1(ProfileResolver.pipelineOrder(merged))
-        val invalid = validateProfileFields(merged, route, fallbackTo, needsW1) +
-            ProfileResolver.validateMerged(merged, route, fallbackTo).map { it.fieldPath }
-        if (invalid.isNotEmpty()) return null
-        return buildNativeDocument(release, merged)?.toBinary()
+        /* This is the generation flow's probe frame: the stride is the fact the
+         * probe measures, so its absence is expected here (every run, import
+         * and export path keeps the default and refuses a null stride on a W1
+         * chain). */
+        if (ProfileResolver.validateMerged(merged, requireStride = false).isNotEmpty()) return null
+        return ProfileTransport.render(
+            merged,
+            route = routeNameOf(merged),
+        ).toByteArray(Charsets.UTF_8)
     }
 
     override suspend fun builtinReleases(): List<String> {
@@ -778,35 +476,6 @@ internal class AndroidProfileConfigController(
     override fun importedProfileExists(): Boolean = externalProfiles.importedProfileExists()
 
     /**
-     * Moves the pre-import-copy selection (`external_profile_*` preferences)
-     * into the app-private copy once. A readable URI for the running release
-     * is copied; the old keys are deleted either way. When a copy already
-     * exists it wins and the keys are deleted without a read (the crash window
-     * between the copy write and the key delete).
-     */
-    override fun migrateLegacyExternalSelection(deviceRelease: String) {
-        if (!LegacyExternalKeys.any(preferences::contains)) return
-        if (!externalProfiles.importedProfileExists()) {
-            val uri = preferences.getString(PrefExternalUri, null)?.takeIf { it.isNotEmpty() }
-            if (uri != null) {
-                val text = externalProfiles.read(uri)
-                if (text != null &&
-                    ProfileDocumentParser.entryForRelease(
-                        text, deviceRelease, ::loadBundledInclude,
-                    ) != null
-                ) {
-                    externalProfiles.writeImportedProfile(text)
-                }
-            }
-        }
-        clearLegacyExternalPreferences()
-    }
-
-    private fun clearLegacyExternalPreferences() {
-        preferences.edit { LegacyExternalKeys.forEach { remove(it) } }
-    }
-
-    /**
      * Selects [uri] as the external profile for [deviceRelease]. Transactional:
      * the previous copy is restored when the candidate fails verification, so a
      * rejected import never becomes the selection. The selection wins over the
@@ -819,15 +488,25 @@ internal class AndroidProfileConfigController(
     ): ProfileImportResult {
         val text = externalProfiles.read(uri)
             ?: return ProfileImportResult.Rejected(listOf("the file cannot be read"))
-        ProfileDocumentParser.entryForRelease(text, deviceRelease, ::loadBundledInclude)
+        val entries = ProfileDocumentParser.entries(text, ::loadBundledInclude)
+            ?: return ProfileImportResult.Rejected(listOf("the file cannot be read"))
+        val entry = entries.firstOrNull { it["release"] == deviceRelease }
             ?: return ProfileImportResult.Rejected(
                 listOf("the file carries no profile for $deviceRelease"),
             )
+        /* An external file must be the schema this build writes. The check reads
+         * the selected entry, so a list-form document is gated exactly like a
+         * single object (parsing the raw text as one object would skip a list). */
+        val schema = (entry["schema_version"] as? Number)?.toInt()
+        if (schema != ProfileResolver.ProfileSchemaVersion) {
+            return ProfileImportResult.Rejected(
+                listOf(ProfileResolver.schemaErrorMessage(schema)),
+            )
+        }
         val previous = externalProfiles.readImportedProfile()
         if (!externalProfiles.writeImportedProfile(text)) {
             return ProfileImportResult.Rejected(listOf("the profile copy could not be written"))
         }
-        clearLegacyExternalPreferences()
         preferences.edit { remove(PrefBuiltinRelease) }
         forcedSelection = null
         val config = runCatching { load(deviceRelease) }.getOrNull()
@@ -861,13 +540,15 @@ internal class AndroidProfileConfigController(
             socName,
             loadPresent = config.physLoad != null,
             offsetPresent = config.physOffset != null,
+            /* Only a chain that translates the image address needs the pair;
+             * a timer-only profile never reads it. */
+            needsW1 = ProfileResolver.requiresW1(config.pipelineOrder),
         )
         return errors
     }
 
     override suspend fun clearExternalProfile(deviceRelease: String): ProfileConfig {
         externalProfiles.clearImportedProfile()
-        clearLegacyExternalPreferences()
         forcedSelection = null
         return load(deviceRelease)
     }
@@ -877,7 +558,6 @@ internal class AndroidProfileConfigController(
         deviceRelease: String,
     ): ProfileConfig {
         externalProfiles.clearImportedProfile()
-        clearLegacyExternalPreferences()
         preferences.edit {
             if (release.isNullOrBlank()) remove(PrefBuiltinRelease)
             else putString(PrefBuiltinRelease, release)
@@ -890,61 +570,44 @@ internal class AndroidProfileConfigController(
      * Resolved on demand: the result depends on the selection, so a cached
      * document would go stale.
      */
-    override fun nativeDocument(config: ProfileConfig, pipeline: String?): ByteArray? = synchronized(lock) {
+    override fun nativeDocument(
+        config: ProfileConfig,
+        pipeline: String?,
+        safeMode: Boolean,
+    ): ByteArray? = nativeDocumentWithOverlay(config, pipeline, safeMode, emptyList())?.bytes
+
+    override fun nativeDocumentWithOverlay(
+        config: ProfileConfig,
+        pipeline: String?,
+        safeMode: Boolean,
+        measured: List<OverlayFact>,
+    ): NativeRunDocument? = synchronized(lock) {
         val resolved = resolve(config.release).profile
             ?: return@synchronized null
-        /* The wire carries the picker's selected route, not the document's
-         * first branch: the superset's default is alphabetical and the
-         * selected route can be any branch. The carrier choice likewise comes
-         * from the picker and is injected into the wire's `compat_carrier`. */
-        buildNativeDocument(
-            config.release,
-            resolved,
-            pipeline,
-            config.route,
-            config.selectedCarrier,
-        )?.toBinary()
-    }
-
-    /** Builds the single resolved authority native consumes at run time. */
-    private fun buildNativeDocument(
-        release: String,
-        profile: ValueMap,
-        /** Only a run has a resolved pipeline; previews and schema checks omit it. */
-        pipeline: String? = null,
-        /** The picker's selected native route; null keeps the document's first. */
-        routeOverride: String? = null,
-        /**
-         * The picker's carrier for that route (`native`/`compat`). It replaces
-         * the branch's legacy `compat_carrier` flag on the wire; null keeps the
-         * flag the document states.
-         */
-        carrier: String? = null,
-    ): Profile? {
-        val route = routeOverride?.takeIf { it in ProfileConfig.Routes } ?: routeNameOf(profile)
-        val fallbackTo = fallbackTargetOf(profile)
-        val value: (String) -> Long? = { path ->
-            when {
-                /* The native chooses the CPU pair at run time (cpu_select picks
-                 * the two highest-frequency CPUs that accept a verified pin).
-                 * The wire's required slots carry the neutral fallback, which
-                 * is also what the native keeps when fewer than two CPUs pin. */
-                path == "execution.recommended_cpus.main" -> 0L
-                path == "execution.recommended_cpus.consumer" -> 1L
-                /* Only the compat bit needs injecting: the native carrier is
-                 * the wire's default (an absent/0 flag), so a carriers profile
-                 * with the native choice writes exactly what the document
-                 * states. */
-                path == "compat_carrier" && carrier == RouteCarriers.Compat -> 1L
-                else -> ProfileResolver.nativeValue(profile, route, fallbackTo, path)
-            }
+        /* The measured facts replace their values in the resolved map, never in
+         * the document. The overlay only writes the declared measurable set, so
+         * validation can only fail if the resolved document itself no longer
+         * validates (a concurrent selection change); fail closed then. */
+        val overlay = MeasuredOverlay.apply(resolved, measured)
+        if (overlay.records.isNotEmpty() &&
+            ProfileResolver.validateMerged(overlay.document).isNotEmpty()
+        ) {
+            return@synchronized null
         }
-        return Profile.fromValueMap(
-            release = release,
-            route = RouteKind.fromToken(route),
-            fallbackTo = RouteKind.fromToken(fallbackTo),
-            pipeline = pipeline,
-        ) { path -> value(path) }
+        /* The document carries the picker's selected syscall and carrier, not
+         * the superset's alphabetical first branch. */
+        val route = config.route?.takeIf { it in ProfileConfig.Routes }
+            ?: routeNameOf(overlay.document)
+        NativeRunDocument(
+            bytes = ProfileTransport.render(
+                overlay.document,
+                route = route,
+                carrier = config.selectedCarrier,
+                pipeline = pipeline,
+                safeMode = safeMode,
+            ).toByteArray(Charsets.UTF_8),
+            overlay = overlay.records,
+        )
     }
 
     // ---- resolution ----
@@ -999,10 +662,17 @@ internal class AndroidProfileConfigController(
          * device-neutral: the maps resolve to the native default, as the
          * exporter's own .bin does. The app always has an identity, and a map
          * that does not name it is refused by PerDevicePhys. */
+        if (!ProfileResolver.isCleanedShape(document)) {
+            throw IllegalArgumentException(
+                "the profile is not the cleaned v3 layout; regenerate it with this build",
+            )
+        }
+        val cleaned = document.asValueMap()
+            ?: throw IllegalArgumentException("the profile is not an object")
         val resolvedDocument = if (deviceCandidates.isEmpty()) {
-            PerDevicePhys.resolveNeutral(document)
+            PerDevicePhys.resolveNeutral(cleaned)
         } else {
-            PerDevicePhys.resolveFor(document, deviceCandidates).document
+            PerDevicePhys.resolveFor(cleaned, deviceCandidates).document
         }
         val tuningExecution = readExecutionTuning()
         val routePresets = ProfileConfig.Routes
@@ -1100,35 +770,14 @@ internal class AndroidProfileConfigController(
     }
 
     /**
-     * Keys the resolved profile states in its **active route branch** that no
-     * wire section declares: settings the profile asks for and the transport
-     * cannot deliver. This is the check that would have caught the lock anchor
-     * vanishing between the resolved document and the wire. The fallback branch
-     * is excluded on purpose — its geometry belongs to another route's section
-     * and never crosses the transport either way.
-     */
-    private fun uncarriedRouteKeys(profile: ValueMap, route: String?): List<String> {
-        val release = profile["release"] as? String ?: return emptyList()
-        val known = buildNativeDocument(release, profile)?.document?.wireKeys() ?: return emptyList()
-        val branch = route?.let { name -> profile["route"].asValueMap()?.get(name).asValueMap() }
-            ?: return emptyList()
-        /* `carriers` is the app's choice list; it is consumed here and never a
-         * wire field, so it is not an uncarried-key warning. */
-        return branch.keys.filterIsInstance<String>()
-            .filterNot { it in known || it == "carriers" }
-            .sorted()
-    }
-
-    /**
-     * Native decodes one complete `execution.routes` object, while profiles only
-     * include the route they use (plus their fallback). Missing groups are
-     * filled from the shared `execution-<route>.conf` files.
+     * Native decodes one complete `execution.routes` object. Missing groups are
+     * filled from the shared `execution-<route>.conf` presets.
      */
     private fun fillRouteExecutionDefaults(profile: ValueMap) {
         val presets = ProfileConfig.Routes
             .mapNotNull { route -> readExecutionRoute(route)?.let { route to it } }
             .toMap()
-        ProfileMerger.fillRouteExecutionDefaults(profile, presets)
+        ProfileMerger.fillExecutionDefaults(profile, readExecutionTuning(), presets)
     }
 
     private fun readExecutionRoute(route: String): ValueMap? = runCatching {
@@ -1137,7 +786,6 @@ internal class AndroidProfileConfigController(
         ).asValueMap()?.get("execution").asValueMap()?.get("routes").asValueMap()?.get(route).asValueMap()
     }.getOrNull()
 
-    /** The exported document keeps only the selected route's tuning (+ fallback). */
     private fun readIndex(): ValueMap? = runCatching {
         HoconSupport.parseValue(readAsset("$BuiltinDirectory/index.conf")).asValueMap()
             ?: error("index.conf is not an object")
@@ -1203,21 +851,19 @@ internal class AndroidProfileConfigController(
         profile: ValueMap,
         baseline: ValueMap,
         route: String?,
-        fallbackTo: String?,
     ): List<ExecutionFieldValue> {
+        fun execution(root: ValueMap): ValueMap? =
+            (root[ProfileResolver.GhostlockKey] as? Map<*, *>)?.get("execution").asValueMap()
+
         fun read(root: ValueMap, path: String): Long? = if (path.startsWith("execution.")) {
-            root["execution"].asValueMap()?.getLongAt(path.removePrefix("execution."))
+            execution(root)?.getLongAt(path.removePrefix("execution."))
         } else {
             root.getLongAt(path)
         }
-        /* Route tuning is appended from the resolved document itself: only the
-         * active route's leaves (sorted, so the order is stable), plus the
-         * declared fallback's, so the editor never offers another route's
-         * knobs. Both route groups are filled into `execution.routes` during
-         * resolution, so the keys come straight from the HOCON. */
-        val paths = ProfileConfig.GeneralPaths +
-            routeTuningPaths(profile, route) +
-            routeTuningPaths(profile, fallbackTo?.takeIf { it != "none" && it != route })
+        /* The display paths stay the stable `execution.*` spelling; the read
+         * maps them onto the document's `ghostlock.execution`. The active
+         * syscall's own tuning group is appended from the document. */
+        val paths = ProfileConfig.GeneralPaths + routeTuningPaths(profile, route)
         return paths.map { path ->
             val value = read(profile, path) ?: 0L
             ExecutionFieldValue(
@@ -1228,52 +874,15 @@ internal class AndroidProfileConfigController(
         }
     }
 
+    /** The active syscall's own tuning group, in a stable order. */
     private fun routeTuningPaths(profile: ValueMap, route: String?): List<String> {
         if (route == null || route !in ProfileConfig.Routes) return emptyList()
-        val group = profile["execution"].asValueMap()?.get("routes").asValueMap()
-            ?.get(route).asValueMap() ?: return emptyList()
+        val execution = (profile[ProfileResolver.GhostlockKey] as? Map<*, *>)
+            ?.get("execution").asValueMap() ?: return emptyList()
+        val group = execution.get("routes").asValueMap()?.get(route).asValueMap()
+            ?: return emptyList()
         return group.keys.filterIsInstance<String>().sorted()
             .map { "execution.routes.$route.$it" }
-    }
-
-    /**
-     * Fills every field of the shared geometry and the active route with an
-     * explicit `null` when the resolved profile omitted it, so the advanced
-     * editor always presents the complete editable surface.
-     */
-    private fun completeProfileFields(
-        profile: ValueMap,
-        route: String?,
-        fallbackTo: String?,
-    ): ValueMap {
-        val out = profile.copyValue().asValueMap() ?: return profile
-        if (!out.containsKey("kernel_phys_load")) out["kernel_phys_load"] = null
-        if (!out.containsKey("kernel_phys_offset")) out["kernel_phys_offset"] = null
-        completeSection(out, "task_struct", TaskStructFieldNames)
-        completeSection(out, "cred", CredFieldNames)
-        completeSection(out, "offset", OffsetFieldNames)
-        completeSection(out, "kernelsnitch", KernelsnitchFieldNames)
-        route?.let { completeRouteBranch(out["route"].asValueMap(), it) }
-        if (fallbackTo != null && fallbackTo != "none") {
-            completeRouteBranch(
-                out["fallback"].asValueMap()?.get("route").asValueMap(),
-                fallbackTo,
-            )
-        }
-        return out
-    }
-
-    private fun completeSection(out: ValueMap, section: String, fields: List<String>) {
-        val target = out[section].asValueMap() ?: valueMapOf().also { out[section] = it }
-        for (field in fields) if (!target.containsKey(field)) target[field] = null
-    }
-
-    private fun completeRouteBranch(container: ValueMap?, route: String) {
-        val fields = RouteBranchFields[route] ?: return
-        val containerMap = container ?: return
-        val branch = containerMap[route].asValueMap()
-            ?: valueMapOf().also { containerMap[route] = it }
-        for (field in fields) if (!branch.containsKey(field)) branch[field] = null
     }
 
     private fun buildTree(
@@ -1286,9 +895,8 @@ internal class AndroidProfileConfigController(
             val path = if (prefix.isEmpty()) key else "$prefix.$key"
             when {
                 value is Map<*, *> -> {
-                    /* Execution tuning is edited on the general page
-                     * (ProfileOverrideScreen / ExecutionEditor), not here. */
-                    if (key == "execution") continue
+                    /* Execution tuning is edited on the general page. */
+                    if (key == "execution" && path == "ghostlock.execution") continue
                     val children = buildTree(value.asValueMap() ?: valueMapOf(), path)
                     if (children.isNotEmpty()) {
                         groups += ProfileFieldNode(
@@ -1299,9 +907,7 @@ internal class AndroidProfileConfigController(
                     }
                 }
 
-                value is Number -> if (path != "schema_version" && path != "release" &&
-                    path != "recommend_shizuku"
-                ) {
+                value is Number -> if (path != "schema_version" && path != "release") {
                     leaves += ProfileFieldNode(
                         path = path,
                         name = key,
@@ -1309,14 +915,27 @@ internal class AndroidProfileConfigController(
                     )
                 }
 
-                value == null -> if (path != "schema_version" && path != "release" &&
-                    path != "recommend_shizuku"
-                ) {
+                value == null -> if (path != "schema_version" && path != "release") {
                     leaves += ProfileFieldNode(
                         path = path,
                         name = key,
                         value = null,
                     )
+                }
+
+                /* Addresses are quoted hex strings in the cleaned shape; the
+                 * editor is a numeric view, so a hex leaf becomes its signed
+                 * 64-bit value (the pre-existing spelling for kernel VAs). */
+                value is String -> {
+                    val text = value.trim()
+                    val parsed = if (text.startsWith("0x", ignoreCase = true)) {
+                        text.substring(2).toULongOrNull(16)?.toLong()
+                    } else {
+                        text.toLongOrNull()
+                    }
+                    if (parsed != null && path != "release" && path != "schema_version") {
+                        leaves += ProfileFieldNode(path = path, name = key, value = parsed)
+                    }
                 }
             }
         }
@@ -1329,7 +948,7 @@ internal class AndroidProfileConfigController(
         val left = numericLeaves(current)
         val right = numericLeaves(bundled)
         return (left.keys + right.keys).sorted().mapNotNull { path ->
-            if (path == "schema_version" || path == "release" || path == "recommend_shizuku") {
+            if (path == "schema_version" || path == "release") {
                 return@mapNotNull null
             }
             val currentValue = left[path]
@@ -1359,61 +978,8 @@ internal class AndroidProfileConfigController(
 
     internal companion object {
         private const val BuiltinDirectory = "kernel_profiles"
-        private val RouteCommonRequired = listOf(
-            "offset.init_task", "offset.init_cred", "offset.root_task_group", "offset.selinux_enforcing",
-            "task_struct.prio", "task_struct.pi_lock", "task_struct.pi_waiters", "task_struct.pi_blocked_on",
-            "task_struct.cred", "task_struct.seccomp",
-        )
-        /** Full shared-geometry field universes (native `kTask`/`kCred`/`kOffset`). */
-        private val TaskStructFieldNames = listOf(
-            "prio", "normal_prio", "sched_task_group", "pi_lock", "pi_waiters", "pi_top_task",
-            "pi_blocked_on", "pid", "tgid", "atomic_flags", "real_cred", "cred", "comm", "tasks",
-            "seccomp",
-        )
-        private val CredFieldNames = listOf(
-            "copy_size", "usage_offset", "usage_value", "caps_offset", "caps_count", "caps_value",
-            "ref_count", "ref0_offset", "ref1_offset", "ref2_offset", "ref3_offset",
-            "ref0_image", "ref1_image", "ref2_image", "ref3_image",
-        )
-        private val OffsetFieldNames = listOf(
-            "init_task", "init_cred", "empty_zero_page", "root_task_group", "selinux_enforcing",
-            "selinux_blob_sizes", "security_hook_heads", "slide_nfulnl_logger", "slide_loggers_0_1",
-            "slide_boot_id",
-        )
-        private val KernelsnitchFieldNames = listOf("collisions", "mm_struct_sz")
-
-        /** Fields each route branch carries, used to seed a switched-to route. */
-        private val RouteBranchFields = mapOf(
-            "tcp_zerocopy" to listOf("compact_waiter"),
-            "select_stack" to listOf("waiter_shift"),
-            "multicast_waiter" to listOf(
-                "waiter_off", "buffer_size", "task_offset", "lock_offset",
-                "compact_waiter",
-            ),
-        )
-        private val RouteMulticastFields = listOf(
-            "buffer_size", "task_offset", "lock_offset",
-        )
-        private const val SizeofU32 = 4L
-        private const val SizeofU64 = 8L
-
-        /** Native's spray clamp (`MM_STRUCT_SZ` sanity range in `main.cpp`). */
-        private const val MinSlabStride = 64L
-        private const val MaxSlabStride = 32768L
 
         const val PrefBuiltinRelease = "debug_builtin_release"
-        const val PrefExternalUri = "external_profile_uri"
-        const val PrefExternalName = "external_profile_name"
-        const val PrefExternalRelease = "external_profile_release"
-        const val PrefExternalSha256 = "external_profile_sha256"
-        const val PrefExternalParent = "external_profile_parent"
-        const val PrefExternalParentSha256 = "external_profile_parent_sha256"
-
-        /** Pre-import-copy selection keys; read only by the one-time migration. */
-        private val LegacyExternalKeys = listOf(
-            PrefExternalUri, PrefExternalName, PrefExternalRelease,
-            PrefExternalSha256, PrefExternalParent, PrefExternalParentSha256,
-        )
     }
 }
 

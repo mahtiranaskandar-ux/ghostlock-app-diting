@@ -1,5 +1,7 @@
 package com.sesame.app.domain.repository
 
+import com.sesame.app.data.profile.OverlayFact
+import com.sesame.app.data.profile.OverlayRecord
 import com.sesame.app.domain.model.ProfileConfig
 import com.sesame.app.domain.model.ProfileImportResult
 import com.sesame.app.domain.model.ProfileDiffRow
@@ -24,13 +26,14 @@ interface ProfileConfigController {
 
     /**
      * Stores the carrier choice for one native route. Returns false when the
-     * carrier is not in that branch's `carriers`; the stale choice is cleared.
+     * carrier is not among that branch's stated carrier blocks; the stale
+     * choice is cleared.
      */
     fun selectCarrier(release: String, route: String, carrier: String): Boolean
 
     /**
-     * Stores the DirtyFrag on/off choice. Returns false when the profile's
-     * pipeline does not offer the choice (it must list both entries).
+     * Stores the DirtyFrag on/off choice. Returns false when the document's
+     * ladder does not offer the choice (both DirtyFrag and GhostLock).
      */
     fun selectDirtyFrag(release: String, on: Boolean): Boolean
 
@@ -54,13 +57,6 @@ interface ProfileConfigController {
 
     /** True when the app-private imported copy exists (the external selection). */
     fun importedProfileExists(): Boolean
-
-    /**
-     * Moves the pre-import-copy `external_profile_*` preferences into the
-     * app-private copy once. Idempotent; called before the support decision and
-     * at every load.
-     */
-    fun migrateLegacyExternalSelection(deviceRelease: String)
 
     /**
      * Imports the SD-card document [uri] for [deviceRelease] into the
@@ -93,10 +89,36 @@ interface ProfileConfigController {
      * an invocation that does not match it. Null omits the cross-check (the
      * parse/preview paths).
      */
-    fun nativeDocument(config: ProfileConfig, pipeline: String? = null): ByteArray?
+    fun nativeDocument(
+        config: ProfileConfig,
+        pipeline: String? = null,
+        safeMode: Boolean = false,
+    ): ByteArray?
+
+    /**
+     * The native document with the measured overlay applied (plan decision 13,
+     * §3.3): the resolved map is copied, the declared measurable facts are
+     * written into it, and the records carry the document value, the effective
+     * value and the source. The document itself is never modified. [measured]
+     * is what the measured DB holds for the running release; the caller logs
+     * the records and writes them to the run-store meta.
+     */
+    fun nativeDocumentWithOverlay(
+        config: ProfileConfig,
+        pipeline: String? = null,
+        safeMode: Boolean = false,
+        measured: List<OverlayFact> = emptyList(),
+    ): NativeRunDocument?
 
     companion object {
         /** Reference templates ("6.6-template"): manually loadable, never auto-matched. */
         const val TemplateSuffix = "-template"
     }
 }
+
+/** One rendered native document and the measured facts the overlay applied. */
+data class NativeRunDocument(
+    val bytes: ByteArray,
+    val overlay: List<OverlayRecord>,
+)
+

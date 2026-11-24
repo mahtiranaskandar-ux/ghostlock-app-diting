@@ -32,17 +32,26 @@ pub struct LayoutFacts {
 
 impl LayoutFacts {
     pub fn push_rows(&self, table: &mut FactTable) {
-        push_copy(table, "layout.rt_mutex_size", &self.rt_mutex_size);
-        push_copy(table, "layout.waiter_compact", &self.waiter_compact);
-        push_string(table, "layout.waiter_pi_tree", &self.waiter_pi_tree);
-        push_string(table, "layout.waiter_task", &self.waiter_task);
-        push_string(table, "layout.waiter_lock", &self.waiter_lock);
-        push_string(table, "layout.waiter_wake_state", &self.waiter_wake_state);
-        push_string(table, "layout.cred_usage_size", &self.cred_usage_size);
-        push_string(table, "layout.cred_uid_offset", &self.cred_uid_offset);
-        push_string(table, "layout.cred_security_offset", &self.cred_security_offset);
-        push_string(table, "layout.cred_caps_offset", &self.cred_caps_offset);
-        push_string(table, "layout.cred_copy_size", &self.cred_copy_size);
+        push_copy(table, "kernel.struct.rt_mutex.size", &self.rt_mutex_size);
+        /* The document spells the waiter shape as a word, not a boolean. */
+        table.push(
+            "kernel.struct.waiter.shape",
+            Fact::new(
+                if self.waiter_compact.value { "compact" } else { "node" },
+                self.waiter_compact.domain,
+                self.waiter_compact.source,
+                self.waiter_compact.confidence,
+            ),
+        );
+        push_string(table, "kernel.struct.waiter.pi_tree", &self.waiter_pi_tree);
+        push_string(table, "kernel.struct.waiter.task", &self.waiter_task);
+        push_string(table, "kernel.struct.waiter.lock", &self.waiter_lock);
+        push_string(table, "kernel.struct.waiter.wake_state", &self.waiter_wake_state);
+        push_string(table, "kernel.struct.cred.usage.size", &self.cred_usage_size);
+        push_string(table, "kernel.struct.cred.uid", &self.cred_uid_offset);
+        push_string(table, "kernel.struct.cred.security", &self.cred_security_offset);
+        push_string(table, "kernel.struct.cred.caps.offset", &self.cred_caps_offset);
+        push_string(table, "kernel.struct.cred.copy_size", &self.cred_copy_size);
     }
 }
 

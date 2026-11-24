@@ -17,12 +17,13 @@ dependencies {
 }
 
 /**
- * Serializes every bundled HOCON kernel profile into the v2 binary layout the
- * native side reads. The exporter runs the same [ProfileMerger] /
- * [ProfileResolver] / `NativeProfileDocument` code as the app.
+ * Renders every bundled HOCON kernel profile into the one schema-v3 JSON
+ * document the native side reads. The exporter runs the same [ProfileMerger] /
+ * [ProfileResolver] / [com.sesame.app.data.profile.ProfileDocument] code as the
+ * app.
  */
 tasks.register<JavaExec>("exportKernelProfiles") {
-    description = "Serialize bundled HOCON kernel profiles into v2 .bin documents"
+    description = "Render bundled HOCON kernel profiles into schema-v3 JSON documents"
     group = "build"
     val profilesDir = rootProject.layout.projectDirectory.dir("app/src/main/assets/kernel_profiles")
     val outputDir = rootProject.layout.buildDirectory.dir("kernel-profiles")

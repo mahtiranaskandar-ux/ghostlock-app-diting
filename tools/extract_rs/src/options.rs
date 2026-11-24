@@ -4,8 +4,9 @@
 //! page-vs-conditional prompt; the test corpus keeps it as the single golden.
 //! A runnable profile is a **cut** of this document:
 //! `(superset, route, plan, device)`, not a separate derivation. The document
-//! carries one full derivation per device sidecar set in `devices[]`; the
-//! top-level sections are the first (primary) device.
+//! carries every device pair (`devices.<codename>.phys`);
+//! `device_analysis[]` keeps the per-device evidence — the pair's source and
+//! the anchor/plan derivations that depend on it.
 //!
 //! Policy (operator, 2026-10-31):
 //! - `dump_skip.zeroes`/`__dump_skip.zeroes`, `bm_pmd` and `serial8250_ports`
@@ -25,14 +26,7 @@ use crate::analysis::RouteVerdict;
 use crate::anchor::{self, W1Scratch};
 use crate::pipeline::{PipelineFacts, PipelineOption};
 
-pub const SCHEMA_VERSION: u32 = 2;
-
-impl Superset {
-    /// Deserialize a stored golden for a cut (the tests and the app).
-    pub fn from_value(value: &serde_json::Value) -> Result<Superset, serde_json::Error> {
-        serde_json::from_value(value.clone())
-    }
-}
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Named anchor/scratch classes, in policy order, with the operator's
 /// `conditioned` flag. The scan verdict stays in the entry as evidence.
@@ -44,54 +38,52 @@ const NAMED: [(&str, bool); 5] = [
     ("s3c24xx_serial_ports", true),
 ];
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize)]
 pub struct Superset {
     pub schema_version: u32,
     pub release: String,
     pub kernel_major: Option<u32>,
-    pub kernel_phys_load: Option<u64>,
-    pub kernel_phys_offset: Option<u64>,
-    /// The physical pair's source (`xbl_config FDT`, `uefi memory map`, …),
-    /// so the app can show the same advice without a second run.
-    pub phys_source: String,
+    /// The image's link-time base (`_text`), the anchor for every symbol VA
+    /// the timer engine states.
+    #[serde(default)]
+    pub image_base: Option<u64>,
     pub routes: Vec<RouteOption>,
     /// The image-side pipeline facts. They are recorded here and never written
-    /// into the profile; the profile carries the chosen `pipeline`.
+    /// into the document; the document's ladder is derived from
+    /// `kernel.dirtyfrag` / `kernel.kdp`.
     #[serde(default)]
     pub pipeline_facts: PipelineFacts,
-    /// `ghostlock` and `dirtyfrag`, in stable order. No `chosen_pipeline`:
-    /// the choice belongs to the profile author, not the extractor.
+    /// `ghostlock` and `dirtyfrag`, in stable order. No `chosen` key: the run's
+    /// engine is the document's derived ladder, not the extractor's.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pipelines: Vec<PipelineOption>,
     /// The default pipeline order (highest precedence first), derived from
-    /// `pipelines[]` or the operator's `--pipeline-order` override. The cut
-    /// writes it into the profile's `pipeline` list; the app resolves it
-    /// before W1.
+    /// `pipelines[]` or the operator's `--pipeline-order` override. It ranks
+    /// the envelope's verdicts; the document carries no chain list.
     #[serde(default)]
     pub pipeline_order: Vec<String>,
-    pub candidates: Vec<CandidateOption>,
-    pub plans: Vec<RoutePlans>,
-    /// The common profile blocks rendered once (route-less). A cut selects a
-    /// route and plan and prepends the route block to these maps.
-    pub profile: BTreeMap<String, BTreeMap<String, String>>,
-    /// Every device sidecar set derived for this kernel, in generation order.
-    /// The top-level pair/candidates/plans above are the first (primary)
-    /// device; a cut for another device selects its entry here. The scratch
-    /// placement is a function of the physical delta, so the candidates and
-    /// plans are per device even though the routes and common profile blocks
-    /// are image-level and shared.
+    /// The cleaned v3 profile document for this image: the route-superset form
+    /// (every feasible syscall with its carriers, the shared anchor/scratch)
+    /// and every device pair the entry derived, in the schema shape
+    /// (`devices.<codename>.phys`). Null when the image has no feasible route.
+    /// Every consumer reads this one shape; there is no old-keyed profile map.
+    pub document: crate::document::Node,
+    /// Per-device evidence: where the pair came from and the anchor/plan
+    /// derivations that depend on it, in generation order. The pair itself is
+    /// not repeated here — `document.devices.<codename>.phys` is its one home.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub devices: Vec<DeviceDerivation>,
+    pub device_analysis: Vec<DeviceDerivation>,
 }
 
-/// One device's physical-pair derivation for a kernel.
+/// One device's analysis record for a kernel: the pair's source and the
+/// candidates/plans derived against it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceDerivation {
-    pub device: String,
-    pub kernel_phys_load: Option<u64>,
-    pub kernel_phys_offset: Option<u64>,
+    /// The sidecar device this record was derived for; null for a run with no
+    /// device sidecar set (an excluded corpus entry still keeps its scan).
+    pub device: Option<String>,
     /// `xbl_config FDT`, `uefi memory map`, `vendor_boot header (MediaTek)`,
-    /// `pair.conf`, … .
+    /// `pair.conf`, … — the source of `document.devices.<device>.phys`.
     pub phys_source: String,
     /// Named anchor candidates with this device's scratch placements.
     pub candidates: Vec<CandidateOption>,
@@ -203,51 +195,14 @@ pub struct RoutePlans {
     pub page_free: Vec<Plan>,
 }
 
-/// Parse a rendered profile into `block -> { key: value }`; top-level keys sit
-/// under `""`. The superset stores the common blocks this way so a cut can
-/// render them without re-deriving anything.
-pub fn parse_conf_blocks(text: &str) -> BTreeMap<String, BTreeMap<String, String>> {
-    let mut out: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
-    let mut current: Option<String> = None;
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(name) = current.clone() {
-            if line == "}" {
-                current = None;
-                continue;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                out.entry(name)
-                    .or_default()
-                    .insert(key.trim().to_string(), value.trim().to_string());
-            }
-            continue;
-        }
-        if let Some(rest) = line.strip_suffix('{') {
-            current = Some(rest.trim().to_string());
-            continue;
-        }
-        if line == "}" {
-            continue;
-        }
-        if let Some((key, value)) = line.split_once('=') {
-            out.entry(String::new())
-                .or_default()
-                .insert(key.trim().to_string(), value.trim().to_string());
-        }
-    }
-    out
-}
-
 pub struct Input<'a> {
     pub release: &'a str,
     pub kernel_major: Option<u32>,
     pub phys_load: Option<u64>,
     pub phys_offset: Option<u64>,
     pub phys_source: &'a str,
+    /// The image's link-time base (`_text`).
+    pub image_base: Option<u64>,
     /// The device these sidecars belong to. When set, the superset records a
     /// [DeviceDerivation] entry (the CLI and the store harness run once per
     /// device and merge the entries).
@@ -265,9 +220,9 @@ pub struct Input<'a> {
     pub initialized: Option<u32>,
     pub kernel: &'a [u8],
     pub rel_symbols: &'a BTreeMap<String, BTreeSet<u64>>,
-    /// Route-less rendered profile text (comments allowed); parsed into
-    /// `profile` so the document is self-contained.
-    pub common_profile: &'a str,
+    /// The shared profile facts (symbols, structs, credential layout, the
+    /// stage-1 blocks), rendered into the document by the caller's builder.
+    pub facts: &'a crate::report::ConfInputs<'a>,
 }
 
 /// Build the superset. Deterministic: candidates in `NAMED` order, routes in
@@ -287,7 +242,7 @@ pub fn build(input: &Input<'_>) -> Superset {
         }
         plans.push(plans_for(verdict.route, &candidates));
     }
-    let routes = input
+    let routes: Vec<RouteOption> = input
         .verdicts
         .iter()
         .map(|verdict| {
@@ -325,33 +280,24 @@ pub fn build(input: &Input<'_>) -> Superset {
             }
         })
         .collect();
-    let devices = input
-        .device
-        .map(|device| DeviceDerivation {
-            device: device.to_string(),
-            kernel_phys_load: input.phys_load,
-            kernel_phys_offset: input.phys_offset,
-            phys_source: input.phys_source.to_string(),
-            candidates: candidates.clone(),
-            plans: plans.clone(),
-        })
-        .into_iter()
-        .collect();
+    let device_analysis = vec![DeviceDerivation {
+        device: input.device.map(str::to_string),
+        phys_source: input.phys_source.to_string(),
+        candidates: candidates.clone(),
+        plans: plans.clone(),
+    }];
+    let document = scene_document(input, &routes, &plans);
     Superset {
         schema_version: SCHEMA_VERSION,
-        profile: parse_conf_blocks(input.common_profile),
         release: input.release.to_string(),
         kernel_major: input.kernel_major,
-        kernel_phys_load: input.phys_load,
-        kernel_phys_offset: input.phys_offset,
-        phys_source: input.phys_source.to_string(),
+        image_base: input.image_base,
         routes,
         pipeline_facts: input.pipeline_facts.clone(),
         pipelines: input.pipelines.to_vec(),
         pipeline_order: input.pipeline_order.to_vec(),
-        candidates,
-        plans,
-        devices,
+        document,
+        device_analysis,
     }
 }
 
@@ -529,335 +475,38 @@ fn page_free_plan(
     }
 }
 
-/// Which plan of a route a cut materializes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PlanKind {
-    Page,
-    Auto,
-    Attested,
-}
+/// The cleaned v3 route-superset document for this image: every feasible
+/// syscall with its carriers, the shared anchor/scratch, and the primary
+/// device's pair. The store records it; the CLI prints it and the ship reads
+/// it. Null when no route is feasible (the image yields no profile).
+fn scene_document(
+    input: &Input<'_>,
+    routes: &[RouteOption],
+    plans: &[RoutePlans],
+) -> crate::document::Node {
+    use crate::document::{AnchorDoc, CarrierDoc, DocumentInput, Geometry, RouteDoc};
 
-impl PlanKind {
-    pub fn label(self) -> &'static str {
-        match self {
-            PlanKind::Page => "page",
-            PlanKind::Auto => "auto",
-            PlanKind::Attested => "attested",
-        }
-    }
-}
-
-/// Materialize a runnable profile from the superset: `(superset, route, plan)`.
-/// No derivation happens here; the common blocks were rendered once and the
-/// route/plan select which of the already-derived options is written.
-pub fn cut(superset: &Superset, route: &str, kind: PlanKind) -> Option<String> {
-    cut_with_device(superset, route, kind, None)
-}
-
-/// The runnable cut for one device: the physical pair is written as a schema-v2
-/// per-device map. The device's pair and plans are selected from `devices[]`;
-/// without one the cut uses the primary device's top-level sections.
-pub fn cut_with_device(
-    superset: &Superset,
-    route: &str,
-    kind: PlanKind,
-    device: Option<&str>,
-) -> Option<String> {
-    let route_option = superset
-        .routes
-        .iter()
-        .find(|option| option.route == route && option.verdict == "feasible")?;
-    let derivation = device.and_then(|name| {
-        superset
-            .devices
-            .iter()
-            .find(|entry| entry.device.eq_ignore_ascii_case(name))
-    });
-    let plans = derivation
-        .map(|entry| entry.plans.as_slice())
-        .unwrap_or(superset.plans.as_slice())
-        .iter()
-        .find(|plans| plans.route == route)?;
-    let plan = match kind {
-        PlanKind::Page => &plans.page,
-        /* Auto = the first safe page-free option; without one, the safe
-         * anchor with a page W1 (the CLI renders this); else page. */
-        PlanKind::Auto => plans
-            .page_free
-            .iter()
-            .find(|plan| !plan.conditioned)
-            .or(plans.anchor_only.as_ref())
-            .unwrap_or(&plans.page),
-        PlanKind::Attested => plans.page_free.iter().find(|plan| plan.conditioned)?,
-    };
-    let phys = derivation.map(|entry| (entry.kernel_phys_load, entry.kernel_phys_offset));
-    Some(render_cut(
-        superset,
-        route,
-        route_option,
-        plan,
-        kind.label(),
-        device,
-        phys,
-    ))
-}
-
-/// Materialize one explicitly selected option (the app's picker). The plan is
-/// taken from the superset's `page_free` list (or `anchor_only`/`page`).
-pub fn cut_plan(superset: &Superset, route: &str, plan: &Plan) -> Option<String> {
-    cut_plan_with_device(superset, route, plan, None)
-}
-
-pub fn cut_plan_with_device(
-    superset: &Superset,
-    route: &str,
-    plan: &Plan,
-    device: Option<&str>,
-) -> Option<String> {
-    let route_option = superset
-        .routes
-        .iter()
-        .find(|option| option.route == route && option.verdict == "feasible")?;
-    let derivation = device.and_then(|name| {
-        superset
-            .devices
-            .iter()
-            .find(|entry| entry.device.eq_ignore_ascii_case(name))
-    });
-    let label = plan
-        .anchor_name
-        .as_deref()
-        .map(|name| {
-            format!(
-                "{name}/{}",
-                plan.scratch_source.as_deref().unwrap_or("page")
-            )
-        })
-        .unwrap_or_else(|| "page".to_string());
-    let phys = derivation.map(|entry| (entry.kernel_phys_load, entry.kernel_phys_offset));
-    Some(render_cut(
-        superset,
-        route,
-        route_option,
-        plan,
-        &label,
-        device,
-        phys,
-    ))
-}
-
-fn render_cut(
-    superset: &Superset,
-    route: &str,
-    route_option: &RouteOption,
-    plan: &Plan,
-    label: &str,
-    device: Option<&str>,
-    phys: Option<(Option<u64>, Option<u64>)>,
-) -> String {
-    let top = superset.profile.get("").cloned().unwrap_or_default();
-    let value = |key: &str| top.get(key).cloned();
-    let mut lines = vec![
-        format!(
-            "# GhostLock kernel profile: {} (HOCON, self-contained).",
-            superset.release
-        ),
-        format!("# cut from the option superset: route={route} plan={label}"),
-    ];
-    for key in ["release", "kernel_major"] {
-        if let Some(value) = value(key) {
-            lines.push(format!("{key} = {value}"));
-        }
-    }
-    let schema_version = 3;
-    lines.push(format!("schema_version = {schema_version}"));
-    /* A device derivation selects its own pair. The legacy single-device
-     * superset has no derivation and carries the pair in the top-level profile;
-     * a derivation with a null pair is still authoritative (emit null, never
-     * fall back to another device's pair). */
-    let has_derivation = device.is_some() && phys.is_some();
-    let (load_override, offset_override) = match phys {
-        Some((load, offset)) if device.is_some() => (load, offset),
-        _ => (None, None),
-    };
-    let phys_line = |key: &str, override_value: Option<u64>| {
-        if has_derivation {
-            match (device, override_value) {
-                (Some(name), Some(v)) => format!("{key} = {{ {name} = {v} }}"),
-                _ => format!("{key} = null"),
-            }
-        } else {
-            match (device, value(key)) {
-                (Some(name), Some(v)) if v != "null" => format!("{key} = {{ {name} = {v} }}"),
-                (None, Some(v)) => format!("{key} = {v}"),
-                _ => format!("{key} = null"),
-            }
-        }
-    };
-    lines.push(phys_line("kernel_phys_load", load_override));
-    lines.push(phys_line("kernel_phys_offset", offset_override));
-    lines.push("route {".to_string());
-    lines.push(format!("  {route} {{"));
-    let mut geometry: BTreeMap<&str, &i64> = route_option
-        .geometry
-        .iter()
-        .map(|(key, value)| (key.as_str(), value))
-        .collect();
-    if let Some(anchor) = &plan.anchor {
-        for key in ["waiter_shift", "compact_waiter"] {
-            if let Some(value) = geometry.remove(key) {
-                lines.push(format!("    {key} = {value}"));
-            }
-        }
-        for (key, value) in &geometry {
-            lines.push(format!("    {key} = {value}"));
-        }
-        lines.push(format!("    lock_anchor_image = {}", anchor.image));
-        lines.push(format!("    lock_anchor_bytes = {}", anchor.bytes));
-        lines.push(format!("    lock_anchor_stride = {}", anchor.stride));
-    } else {
-        for (key, value) in &geometry {
-            lines.push(format!("    {key} = {value}"));
-        }
-    }
-    lines.push("  }".to_string());
-    lines.push("}".to_string());
-    if let Some(fallback) = superset.profile.get("fallback") {
-        lines.push("fallback {".to_string());
-        for (key, value) in fallback {
-            lines.push(format!("  {key} = {value}"));
-        }
-        lines.push("}".to_string());
-    }
-    if let Some(selinux) = superset.profile.get("selinux") {
-        lines.push("selinux {".to_string());
-        for (key, value) in selinux {
-            lines.push(format!("  {key} = {value}"));
-        }
-        lines.push("}".to_string());
-    }
-    if let Some(scratch) = &plan.scratch {
-        lines.push("w1_scratch {".to_string());
-        lines.push(format!("  image = {}", scratch.image));
-        lines.push("}".to_string());
-    }
-    for block in [
-        "kernelsnitch",
-        "task_struct",
-        "cred",
-        "offset",
-        "waiter_layout",
-    ] {
-        if let Some(entries) = superset.profile.get(block) {
-            lines.push(format!("{block} {{"));
-            for (key, value) in entries {
-                lines.push(format!("  {key} = {value}"));
-            }
-            lines.push("}".to_string());
-        }
-    }
-    lines.join("\n") + "\n"
-}
-
-/// Render the storage/export superset: every feasible route's block and the
-/// shared common blocks. There is no route order: the app displays the viable
-/// routes alphabetically. The runtime still cuts one route.
-pub fn render_superset(
-    superset: &Superset,
-    kind: PlanKind,
-    device: Option<&str>,
-) -> Option<String> {
-    let derivation = device.and_then(|name| {
-        superset
-            .devices
-            .iter()
-            .find(|entry| entry.device.eq_ignore_ascii_case(name))
-    });
-    let plans = derivation
-        .map(|entry| entry.plans.as_slice())
-        .unwrap_or(superset.plans.as_slice());
     let mut chosen: Vec<(&RouteOption, &Plan)> = Vec::new();
-    for option in &superset.routes {
+    for option in routes {
         if option.verdict != "feasible" {
             continue;
         }
-        let route_plans = plans.iter().find(|entry| entry.route == option.route)?;
-        let plan = match kind {
-            PlanKind::Page => &route_plans.page,
-            PlanKind::Auto => route_plans
-                .page_free
-                .iter()
-                .find(|plan| !plan.conditioned)
-                .or(route_plans.anchor_only.as_ref())
-                .unwrap_or(&route_plans.page),
-            PlanKind::Attested => route_plans.page_free.iter().find(|plan| plan.conditioned)?,
+        let Some(route_plans) = plans.iter().find(|entry| entry.route == option.route) else {
+            continue;
         };
+        let plan = route_plans
+            .page_free
+            .iter()
+            .find(|plan| !plan.conditioned)
+            .or(route_plans.anchor_only.as_ref())
+            .unwrap_or(&route_plans.page);
         chosen.push((option, plan));
     }
     if chosen.is_empty() {
-        return None;
+        return crate::document::Node::Null;
     }
-    let top = superset.profile.get("").cloned().unwrap_or_default();
-    let value = |key: &str| top.get(key).cloned();
-    let phys = derivation.map(|entry| (entry.kernel_phys_load, entry.kernel_phys_offset));
-    let mut lines = vec![
-        format!(
-            "# GhostLock kernel profile: {} (HOCON, self-contained, route superset).",
-            superset.release
-        ),
-        "# The app's route picker reads this document; a run still cuts one route.".to_string(),
-    ];
-    for key in ["release", "kernel_major"] {
-        if let Some(value) = value(key) {
-            lines.push(format!("{key} = {value}"));
-        }
-    }
-    let schema_version = 3;
-    lines.push(format!("schema_version = {schema_version}"));
-    let has_derivation = device.is_some() && phys.is_some();
-    let (load_override, offset_override) = match phys {
-        Some((load, offset)) if device.is_some() => (load, offset),
-        _ => (None, None),
-    };
-    let phys_line = |key: &str, override_value: Option<u64>| {
-        if has_derivation {
-            match (device, override_value) {
-                (Some(name), Some(value)) => format!("{key} = {{ {name} = {value} }}"),
-                _ => format!("{key} = null"),
-            }
-        } else {
-            match (device, value(key)) {
-                (Some(name), Some(value)) if value != "null" => {
-                    format!("{key} = {{ {name} = {value} }}")
-                }
-                (None, Some(value)) => format!("{key} = {value}"),
-                _ => format!("{key} = null"),
-            }
-        }
-    };
-    lines.push(phys_line("kernel_phys_load", load_override));
-    lines.push(phys_line("kernel_phys_offset", offset_override));
-    if !superset.pipeline_order.is_empty() {
-        let list = superset
-            .pipeline_order
-            .iter()
-            .map(|name| format!("\"{name}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        lines.push(format!("pipeline = [ {list} ]"));
-    }
-    lines.push("route {".to_string());
-    for (option, plan) in &chosen {
-        lines.push(format!("  {} {{", option.route));
-        let mut geometry: BTreeMap<&str, &i64> = option
-            .geometry
-            .iter()
-            .map(|(key, value)| (key.as_str(), value))
-            .collect();
-        /* The route's selectable carriers, in the profile's order (primary
-         * first), as a list key like `pipeline`. The app renders one box for
-         * this list and injects the wire's `compat_carrier` from the choice;
-         * a block without `carriers` keeps the legacy flag semantics. */
+
+    fn carriers_of(option: &RouteOption) -> Vec<&str> {
         let mut carriers: Vec<&str> = Vec::new();
         if !option.carrier.is_empty() {
             carriers.push(option.carrier.as_str());
@@ -867,138 +516,117 @@ pub fn render_superset(
                 carriers.push(alt.carrier.as_str());
             }
         }
-        if !carriers.is_empty() {
-            let list = carriers
-                .iter()
-                .map(|carrier| format!("\"{carrier}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            lines.push(format!("    carriers = [ {list} ]"));
-        }
-        let mut emitted: BTreeMap<String, i64> = BTreeMap::new();
-        let mut wrote_compact = false;
-        if let Some(anchor) = &plan.anchor {
-            for key in ["waiter_shift", "compact_waiter"] {
-                if let Some(value) = geometry.remove(key) {
-                    lines.push(format!("    {key} = {value}"));
-                    emitted.insert(key.to_string(), *value);
-                    if key == "compact_waiter" {
-                        wrote_compact = true;
-                    }
-                }
-            }
-            for (key, value) in &geometry {
-                lines.push(format!("    {key} = {value}"));
-                emitted.insert((*key).to_string(), **value);
-            }
-            lines.push(format!("    lock_anchor_image = {}", anchor.image));
-            lines.push(format!("    lock_anchor_bytes = {}", anchor.bytes));
-            lines.push(format!("    lock_anchor_stride = {}", anchor.stride));
-            emitted.insert("lock_anchor_image".to_string(), anchor.image as i64);
-            emitted.insert("lock_anchor_bytes".to_string(), anchor.bytes as i64);
-            emitted.insert("lock_anchor_stride".to_string(), anchor.stride as i64);
-        } else {
-            for (key, value) in &geometry {
-                lines.push(format!("    {key} = {value}"));
-                emitted.insert((*key).to_string(), **value);
-                if *key == "compact_waiter" {
-                    wrote_compact = true;
-                }
-            }
-        }
-        /* The other feasible carriers' geometry joins the same block. The
-         * primary carrier's value wins on a shared key; with more than one
-         * carrier the legacy `compat_carrier` flag is omitted (the app sets
-         * the wire's flag from the chosen carrier). */
-        for alt in &option.alternatives {
-            if alt.verdict != "feasible" {
-                continue;
-            }
-            for (key, value) in &alt.geometry {
-                if key == "compat_carrier" && carriers.len() > 1 {
-                    continue;
-                }
-                if emitted.contains_key(key) {
-                    continue;
-                }
-                lines.push(format!("    {key} = {value}"));
-                emitted.insert(key.clone(), *value);
-            }
-        }
-        /* `tcp_zerocopy` has no per-route geometry of its own: its stamp-shape
-         * flag is the document-global waiter layout fact. An empty branch would
-         * carry no `compact_waiter`, which the app's validator requires, so the
-         * route would silently drop out of the picker (and out of a generated
-         * profile's round-trip). Emit the shared fact. */
-        if option.route == "tcp_zerocopy" && !wrote_compact {
-            if let Some(compact) = superset
-                .profile
-                .get("waiter_layout")
-                .and_then(|layout| layout.get("compact"))
-            {
-                lines.push(format!("    compact_waiter = {compact}"));
-            }
-        }
-        lines.push("  }".to_string());
+        carriers
     }
-    lines.push("}".to_string());
-    if let Some(fallback) = superset.profile.get("fallback") {
-        lines.push("fallback {".to_string());
-        for (key, value) in fallback {
-            lines.push(format!("  {key} = {value}"));
+
+    let mut doc_routes = Vec::new();
+    let mut fallback_geometries: Vec<&BTreeMap<String, i64>> = Vec::new();
+    for (option, _) in &chosen {
+        fallback_geometries.push(&option.geometry);
+        let mut carriers = Vec::new();
+        for carrier in carriers_of(option) {
+            let geometry = if carrier == option.carrier {
+                &option.geometry
+            } else {
+                option
+                    .alternatives
+                    .iter()
+                    .find(|alt| alt.carrier == carrier && alt.verdict == "feasible")
+                    .map(|alt| &alt.geometry)
+                    .unwrap_or(&option.geometry)
+            };
+            carriers.push(CarrierDoc {
+                name: carrier,
+                geometry: Geometry::Map(geometry),
+            });
         }
-        lines.push("}".to_string());
-    }
-    if let Some(selinux) = superset.profile.get("selinux") {
-        lines.push("selinux {".to_string());
-        for (key, value) in selinux {
-            lines.push(format!("  {key} = {value}"));
-        }
-        lines.push("}".to_string());
-    }
-    /* The scratch is one top-level fact; emit it only when every route's
-     * chosen plan uses the same region. A mixed set omits it (the page path)
-     * rather than claiming a slot that does not fit another route's anchor. */
-    let shared_scratch = chosen
-        .first()
-        .and_then(|(_, plan)| plan.scratch.as_ref())
-        .filter(|scratch| {
-            chosen.iter().all(|(_, plan)| {
-                plan.scratch
-                    .as_ref()
-                    .map(|entry| entry.image)
-                    == Some(scratch.image)
-            })
+        doc_routes.push(RouteDoc {
+            name: option.route.as_str(),
+            carriers,
         });
-    if let Some(scratch) = shared_scratch {
-        lines.push("w1_scratch {".to_string());
-        lines.push(format!("  image = {}", scratch.image));
-        lines.push("}".to_string());
     }
-    for block in [
-        "kernelsnitch",
-        "task_struct",
-        "cred",
-        "offset",
-        "waiter_layout",
-    ] {
-        if let Some(entries) = superset.profile.get(block) {
-            lines.push(format!("{block} {{"));
-            for (key, value) in entries {
-                lines.push(format!("  {key} = {value}"));
-            }
-            lines.push("}".to_string());
-        }
+    let selected = chosen
+        .iter()
+        .map(|(option, _)| option.route.as_str())
+        .min();
+    let anchors: Vec<&AnchorTriple> =
+        chosen.iter().filter_map(|(_, plan)| plan.anchor.as_ref()).collect();
+    let shared_anchor = anchors.first().copied().filter(|anchor| {
+        anchors.iter().all(|other| {
+            (other.image, other.bytes, other.stride)
+                == (anchor.image, anchor.bytes, anchor.stride)
+        })
+    });
+    let shared_scratch = chosen
+        .iter()
+        .map(|(_, plan)| plan.scratch.as_ref().map(|scratch| scratch.image))
+        .reduce(|left, right| if left == right { left } else { None })
+        .flatten()
+        .and_then(|image| {
+            chosen
+                .iter()
+                .find_map(|(_, plan)| plan.scratch.as_ref().filter(|s| s.image == image))
+        });
+    let anchor = shared_anchor.map(|anchor| AnchorDoc {
+        image: anchor.image,
+        bytes: Some(anchor.bytes),
+        stride: Some(anchor.stride),
+        scratch: shared_scratch.map(|scratch| scratch.image),
+    });
+
+    crate::document::build(&DocumentInput {
+        facts: input.facts,
+        devices: input
+            .device
+            .map(|name| (name, input.phys_load, input.phys_offset)),
+        routes: doc_routes,
+        selected,
+        anchor,
+        geometry: Geometry::Maps(fallback_geometries),
+    })
+}
+
+/// Render the route-superset document: every feasible route's block, the
+/// shared anchor, and the primary device's pair. The document is built once
+/// in `build` (the store records it); this is its HOCON form for the CLI.
+pub fn render_superset(superset: &Superset) -> Option<String> {
+    match &superset.document {
+        crate::document::Node::Null => None,
+        document => Some(crate::document::render_hocon(document)),
     }
-    Some(lines.join("\n") + "\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    static EMPTY_SYMBOLS: BTreeMap<String, Option<u64>> = BTreeMap::new();
+    static EMPTY_STRUCTS: BTreeMap<String, Option<u32>> = BTreeMap::new();
+    static EMPTY_OFFSETS: crate::report::ConfExtraOffsets =
+        crate::report::ConfExtraOffsets { empty_zero_page: None };
+
+    fn facts(release: &str) -> crate::report::ConfInputs<'_> {
+        crate::report::ConfInputs {
+            release,
+            phys: None,
+            phys_offset: None,
+            phys_source: "unset",
+            image_base: None,
+            symbols: &EMPTY_SYMBOLS,
+            structs: &EMPTY_STRUCTS,
+            pipeline_order: &[],
+            kdp: None,
+            route: None,
+            route_geometry: &[],
+            cred: &[],
+            extra_offsets: &EMPTY_OFFSETS,
+            layouts: None,
+            stage1: None,
+        }
+    }
+
     #[test]
-    fn the_superset_render_lists_every_feasible_route_and_the_order() {
+    fn the_superset_document_lists_every_feasible_route_and_carrier() {
         use std::collections::BTreeMap;
         let plan = |route: &str, anchored: bool| Plan {
             route: route.to_string(),
@@ -1033,81 +661,92 @@ mod tests {
             geometry,
             alternatives,
         };
-        let superset = Superset {
-            schema_version: 3,
-            release: "6.1.138-x".to_string(),
-            kernel_major: Some(6),
-            kernel_phys_load: None,
-            kernel_phys_offset: None,
-            phys_source: "unset".to_string(),
-            routes: vec![
-                option("tcp_zerocopy", BTreeMap::new(), vec![]),
-                option(
-                    "select_stack",
-                    BTreeMap::from([("waiter_shift".to_string(), -2)]),
-                    vec![RouteVariantOption {
-                        carrier: "compat".to_string(),
-                        verdict: "feasible".to_string(),
-                        reason: String::new(),
-                        numbers: BTreeMap::new(),
-                        geometry: BTreeMap::from([
-                            ("compat_carrier".to_string(), 1),
-                            ("compat_futex_abi".to_string(), 1),
-                            ("waiter_home".to_string(), 488),
-                            ("select_dst_depth".to_string(), 496),
-                        ]),
-                    }],
-                ),
-            ],            pipeline_facts: crate::pipeline::PipelineFacts::default(),
-            pipelines: vec![],
-            pipeline_order: vec!["ghostlock".to_string()],
-            candidates: vec![],
-            plans: vec![
-                RoutePlans {
-                    route: "tcp_zerocopy".to_string(),
-                    page: plan("tcp_zerocopy", false),
-                    anchor_only: None,
-                    page_free: vec![plan("tcp_zerocopy", false)],
-                },
-                RoutePlans {
-                    route: "select_stack".to_string(),
-                    page: plan("select_stack", true),
-                    anchor_only: None,
-                    page_free: vec![plan("select_stack", true)],
-                },
-            ],
-            profile: parse_conf_blocks(
-                "release = \"6.1.138-x\"\nkernel_major = 6\n\
-                 fallback { to = \"none\" }\nselinux { enforcing = 0, initialized = 2 }\n\
-                 waiter_layout {\ncompact = 1\n}\n\
-                 task_struct { prio = 1 }\ncred { copy_size = 128 }\noffset { init_task = 1 }\n",
+        let routes = vec![
+            option("tcp_zerocopy", BTreeMap::new(), vec![]),
+            option(
+                "select_stack",
+                BTreeMap::from([("waiter_shift".to_string(), -2)]),
+                vec![RouteVariantOption {
+                    carrier: "compat".to_string(),
+                    verdict: "feasible".to_string(),
+                    reason: String::new(),
+                    numbers: BTreeMap::new(),
+                    geometry: BTreeMap::from([
+                        ("compat_carrier".to_string(), 1),
+                        ("compat_futex_abi".to_string(), 1),
+                        ("waiter_home".to_string(), 488),
+                        ("select_dst_depth".to_string(), 496),
+                    ]),
+                }],
             ),
-            devices: vec![],
+        ];
+        let plans = vec![
+            RoutePlans {
+                route: "tcp_zerocopy".to_string(),
+                page: plan("tcp_zerocopy", false),
+                anchor_only: None,
+                page_free: vec![plan("tcp_zerocopy", false)],
+            },
+            RoutePlans {
+                route: "select_stack".to_string(),
+                page: plan("select_stack", true),
+                anchor_only: None,
+                page_free: vec![plan("select_stack", true)],
+            },
+        ];
+        let facts = facts("6.1.138-x");
+        let input = Input {
+            release: "6.1.138-x",
+            kernel_major: Some(6),
+            phys_load: None,
+            phys_offset: None,
+            phys_source: "unset",
+            image_base: None,
+            device: None,
+            verdicts: &[],
+            pipeline_facts: &crate::pipeline::PipelineFacts::default(),
+            pipelines: &[],
+            pipeline_order: &["ghostlock".to_string()],
+            geometry: &BTreeMap::new(),
+            initialized: None,
+            kernel: &[],
+            rel_symbols: &BTreeMap::new(),
+            facts: &facts,
         };
-        let text = render_superset(&superset, PlanKind::Auto, None).expect("a superset");
+        let document = scene_document(&input, &routes, &plans);
+        let text = crate::document::render_hocon(&document);
         assert!(text.contains("tcp_zerocopy {"), "{text}");
-        /* The carrier choice is a list key inside the route block; the
-         * alternative's geometry joins the same block and the legacy
-         * `compat_carrier` flag is omitted while both carriers are listed. */
-        assert!(text.contains("carriers = [ \"native\" ]"), "{text}");
-        assert!(
-            text.contains("carriers = [ \"native\", \"compat\" ]"),
-            "{text}"
-        );
-        assert!(text.contains("waiter_home = 488"), "{text}");
-        assert!(text.contains("select_dst_depth = 496"), "{text}");
-        assert!(!text.contains("compat_carrier"), "{text}");
-        /* The tcp branch's stamp-shape flag is the shared waiter layout; an
-         * empty branch would drop the route on the app side. */
-        assert!(
-            text.contains("tcp_zerocopy {\n    carriers = [ \"native\" ]\n    compact_waiter = 1"),
-            "{text}"
-        );
+        /* The four-branch catalogue carries every carrier's own block. */
         assert!(text.contains("select_stack {"), "{text}");
+        assert!(text.contains("compat {"), "{text}");
+        assert!(text.contains("waiter_home = 488"), "{text}");
+        assert!(text.contains("dst_depth = 496"), "{text}");
+        assert!(text.contains("futex_abi = \"time64\""), "{text}");
+        assert!(!text.contains("compat_carrier"), "{text}");
+        assert!(text.contains("tcp_zerocopy {\n      native {}"), "{text}");
+        assert!(text.contains("syscall = \"select_stack\""), "{text}");
         assert!(!text.contains("routes = "), "no route order is written\n{text}");
-        assert!(text.contains("pipeline = [ \"ghostlock\" ]"), "{text}");
-        assert!(text.contains("lock_anchor_image = 4096"), "{text}");
-        assert!(text.contains("w1_scratch {"), "{text}");
+        assert!(text.contains("ghostlock {"), "{text}");
+        assert!(text.contains("anchor {"), "{text}");
+        assert!(text.contains("image = \"0x1000\""), "{text}");
+        assert!(text.contains("scratch = \"0x2000\""), "{text}");
+    }
+
+    #[test]
+    fn an_empty_catalogue_has_no_document() {
+        let superset = Superset {
+            schema_version: SCHEMA_VERSION,
+            release: "r".to_string(),
+            kernel_major: None,
+            image_base: None,
+            routes: Vec::new(),
+            pipeline_facts: PipelineFacts::default(),
+            pipelines: Vec::new(),
+            pipeline_order: Vec::new(),
+            document: crate::document::Node::Null,
+            device_analysis: Vec::new(),
+        };
+        assert!(render_superset(&superset).is_none());
     }
 
     fn placement(image: u64, inside: bool) -> ScratchPlacement {
@@ -1240,105 +879,4 @@ mod tests {
         assert!(!auto_plan("tcp_zerocopy", &candidates).page_free);
     }
 
-    fn sample_superset() -> Superset {
-        let mut profile = BTreeMap::new();
-        profile.insert(
-            String::new(),
-            BTreeMap::from([
-                ("release".to_string(), "\"r\"".to_string()),
-                ("schema_version".to_string(), "3".to_string()),
-                ("kernel_major".to_string(), "6".to_string()),
-                ("kernel_phys_load".to_string(), "123".to_string()),
-                ("kernel_phys_offset".to_string(), "null".to_string()),
-            ]),
-        );
-        profile.insert(
-            "selinux".to_string(),
-            BTreeMap::from([
-                ("enforcing".to_string(), "0".to_string()),
-                ("initialized".to_string(), "1".to_string()),
-            ]),
-        );
-        profile.insert(
-            "task_struct".to_string(),
-            BTreeMap::from([("prio".to_string(), "132".to_string())]),
-        );
-        let anchor = AnchorTriple {
-            image: 0x1000,
-            bytes: 0x1000,
-            stride: 32,
-        };
-        let scratch = placement(0x1000, true);
-        let page = Plan {
-            route: "select_stack".to_string(),
-            anchor: None,
-            scratch: None,
-            page_free: false,
-            conditioned: false,
-            anchor_name: None,
-            scratch_source: None,
-            reason: "page".to_string(),
-        };
-        let page_free = Plan {
-            route: "select_stack".to_string(),
-            anchor: Some(anchor),
-            scratch: Some(scratch),
-            page_free: true,
-            conditioned: false,
-            anchor_name: Some("dump_skip.zeroes".to_string()),
-            scratch_source: Some("in-anchor".to_string()),
-            reason: String::new(),
-        };
-        Superset {
-            schema_version: SCHEMA_VERSION,
-            release: "r".to_string(),
-            kernel_major: Some(6),
-            kernel_phys_load: Some(123),
-            kernel_phys_offset: None,
-            phys_source: "unset".to_string(),
-            routes: vec![RouteOption {
-                route: "select_stack".to_string(),
-                carrier: "native".to_string(),
-                verdict: "feasible".to_string(),
-                reason: String::new(),
-                numbers: BTreeMap::new(),
-                anchor_capable: true,
-                geometry: BTreeMap::from([
-                    ("waiter_shift".to_string(), -2),
-                    ("compact_waiter".to_string(), 1),
-                ]),
-                alternatives: Vec::new(),
-            }],
-            pipeline_facts: PipelineFacts::default(),
-            pipelines: Vec::new(),
-            pipeline_order: Vec::new(),
-            candidates: Vec::new(),
-            plans: vec![RoutePlans {
-                route: "select_stack".to_string(),
-                page,
-                anchor_only: None,
-                page_free: vec![page_free],
-            }],
-            profile,
-            devices: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn cut_writes_the_selected_plan() {
-        let superset = sample_superset();
-        let auto = cut(&superset, "select_stack", PlanKind::Auto).expect("auto cut");
-        assert!(auto.contains("lock_anchor_image = 4096"));
-        assert!(auto.contains("w1_scratch {"));
-        assert!(auto.contains("selinux {"));
-        assert!(auto.contains("prio = 132"));
-        let page = cut(&superset, "select_stack", PlanKind::Page).expect("page cut");
-        assert!(!page.contains("lock_anchor_image"));
-        assert!(!page.contains("w1_scratch"));
-        assert!(cut(&superset, "select_stack", PlanKind::Attested).is_none());
-        assert!(cut(&superset, "sigreturn", PlanKind::Auto).is_none());
-        let explicit = cut_plan(&superset, "select_stack", &superset.plans[0].page_free[0])
-            .expect("explicit cut");
-        assert!(explicit.contains("lock_anchor_image = 4096"));
-    }
 }

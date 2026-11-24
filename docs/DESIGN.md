@@ -40,8 +40,9 @@ to the skb and the payload becomes the file's page cache. The chain then injects
 daemon (module-free); KernelSU is optional. This is the second way for Samsung phones: KDP rejects
 credential writes, but there is nothing to reject when the credential is init's own.
 
-A profile carries an **ordered pipeline list** (`pipeline = [ "dirtyfrag", "ghostlock" ]`, highest
-precedence first). The app resolves it before W1: the static verdict from the image, the ROM
+The pipeline ladder is **derived from the profile document** (`kernel.dirtyfrag`,
+`kernel.kdp`, `ghostlock.module`, `timer`), highest precedence first — there is no `pipeline` key.
+The app resolves it before W1: the static verdict from the image, the ROM
 preflight (libc++ hook and cave, policy/service), the stage-2 primitive probe (`libdfprobe`,
 recorded in the measured DB) and the live state. The first viable entry runs; there is no fallback
 after W1, and a KDP image carries `["dirtyfrag"]` only. Every DirtyFrag failure exit restores

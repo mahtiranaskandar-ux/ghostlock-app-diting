@@ -262,7 +262,7 @@ gain the pipeline section and a section for the block.
 | `PipelineResolver` | third entry + viability callback (bundled profile source, the block's asset/hash check, ROM preflight, Magisk source) — implemented |
 | `AndroidGhostlockRepository` | module pipeline path: no W1 native run, no `nativeDocument`; stages `assets/<asset>` after the hash check (`BundledModule`) and passes the block's `vendor_files`; still `runDirtyfragStage`; preflight refusal replaces the ksud gate for this pipeline; refuses `module` unless the effective profile is the bundled one (`bundledAuthoritative`); runtime env passes the handoff + module path to the stage — implemented, diting bench unchanged |
 | native runtime config / `ops.cpp` | the root script branches on `GHOSTLOCK_HANDOFF=magisk`: insmod → wait permissive → Magisk setup → restore Enforcing; the KSU block stays for existing pipelines. No new invocation mode and no wire change (the stage is already `--dirtyfrag <plan>`) |
-| DirtyFrag stub (`dirtyfrag_stub.bin`) | the reference prologue: the worker child forks a grandchild that writes `u:r:vendor_modprobe:s0` to `/proc/self/attr/exec` and execs `/vendor/bin/insmod <vendor target>` (the target string patched like the socket name), then serves its socket exactly as today |
+| DirtyFrag stub (`dirtyfrag_stub_module.bin`) | the reference prologue: the worker child forks a grandchild that writes `u:r:vendor_modprobe:s0` to `/proc/self/attr/exec` and execs `/vendor/bin/insmod <vendor target>` (the target string patched like the socket name), then serves its socket exactly as today. The prologue lives in its **own asset**: the plain DirtyFrag pipeline keeps the smaller `dirtyfrag_stub.bin`, and the cave preflight measures the blob the stage will write (424 B plain, 732 B module; the OnePlus 6.6.66's 640 B cave fits only the plain one) |
 | crash_dump bridge | a small helper patched into `crash_dump64`'s page cache (the app can read it) and exec'd for the `crash_dump` transition; its read/splice modes let the app write the module into a `vendor_file` target. Restore `crash_dump64` and the target after the module loads |
 | module bundle | two shipped pairs: star `5.4.233-qgki-gbb70cde46897` and venus `5.4.274-qgki-g76ac0b265f44`, `.ko` under `assets/modules/`, referenced by their `module` block — no index file; the profile is the manifest. Source and the reproducible recipe: `tools/dirtyfrag_module/` |
 | bundle check | every bundled profile whose `pipeline` contains `module` must have the referenced asset and a matching `asset_sha256`; every `assets/modules/*.ko` must be referenced. Implemented app-side in `BuiltinProfilesTest`; the ABI agreement stays in the build gate record |
@@ -275,8 +275,9 @@ gain the pipeline section and a section for the block.
 the bundle-authority rule (an external profile declaring `module` is refused; a bundled pair with a
 missing module asset is refused); the bundle check (every bundled module-pipeline profile has its
 asset and a matching hash, and every module asset is referenced by exactly one profile); the ROM
-preflight extension (libc++ cave,
-`insmod`/`vendor_modprobe`, Magisk source) on both 5.4 packages. The corpus is untouched by
+preflight extension (libc++ cave against the **module** blob,
+`insmod`/`vendor_modprobe`, Magisk source) on both 5.4 packages — the cave fits both from the
+ROMs' extracted libc++ (`star` 1496 B, `venus` 2136 B against the 732 B blob). The corpus is untouched by
 construction — the extractor does not change. The policy checks in section 2 are already done.
 
 **G2a — diting, Magisk only.** Run the *existing* DirtyFrag pipeline (W1 is device-proven there)

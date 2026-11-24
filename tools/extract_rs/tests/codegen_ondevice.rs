@@ -25,6 +25,7 @@
 //!   successful one says `structure verified`;
 //! * `--no-disasm` on a 5.10 image marks the fallback as a heuristic.
 
+mod common;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -112,20 +113,10 @@ fn field_sources(stderr: &str) -> BTreeMap<String, String> {
 
 fn task_block(profile: &str) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    let mut inside = false;
-    for raw in profile.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line == "task_struct {" {
-            inside = true;
-            continue;
-        }
-        if inside {
-            if line == "}" {
-                break;
-            }
-            if let Some((key, value)) = line.split_once('=') {
-                out.insert(key.trim().to_string(), value.trim().to_string());
-            }
+    for (macro_name, _) in ghostlock_extract::family::TASK_FIELDS {
+        let key = macro_name.trim_start_matches("task_");
+        if let Some(value) = common::profile_value(profile, &format!("kernel.struct.task.{key}")) {
+            out.insert(key.to_string(), value);
         }
     }
     out

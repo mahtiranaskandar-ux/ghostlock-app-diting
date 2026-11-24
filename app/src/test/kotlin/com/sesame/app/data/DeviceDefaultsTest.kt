@@ -73,17 +73,17 @@ class DeviceDefaultsTest {
             val text = AssetConfigLoader(context).load("kernel_profiles/$r.conf")
             val document = HoconSupport.parseValue(text).asValueMap()
                 ?: error("$r is not an object")
-            val diting = PerDevicePhys.resolve(document, "diting")
-            val yunluo = PerDevicePhys.resolve(document, "yunluo")
-            val rubens = PerDevicePhys.resolve(document, "rubens")
-            assertEquals(2818572288L, diting["kernel_phys_load"])
-            assertEquals(2147483648L, diting["kernel_phys_offset"])
-            assertEquals(1073741824L, yunluo["kernel_phys_load"])
-            assertEquals(1073741824L, yunluo["kernel_phys_offset"])
-            assertEquals(1073741824L, rubens["kernel_phys_load"])
-            assertEquals(1073741824L, rubens["kernel_phys_offset"])
+            val cleaned = document
+            fun pair(device: String) = com.sesame.app.data.profile.ProfileResolver.physOf(
+                PerDevicePhys.resolve(cleaned, device),
+            )
+            /* The store states no DRAM base for the diting: the native's
+             * compiled default (0x80000000) applies. */
+            assertEquals(2818572288L to null, pair("diting"))
+            assertEquals(1073741824L to 1073741824L, pair("yunluo"))
+            assertEquals(1073741824L to 1073741824L, pair("rubens"))
             assertThrows(IllegalArgumentException::class.java) {
-                PerDevicePhys.resolve(document, "some-other-device")
+                PerDevicePhys.resolve(cleaned, "some-other-device")
             }
         }
     }
@@ -103,9 +103,12 @@ class DeviceDefaultsTest {
             val text = AssetConfigLoader(context).load("kernel_profiles/$r.conf")
             val document = HoconSupport.parseValue(text).asValueMap()
                 ?: error("$r is not an object")
-            val resolved = PerDevicePhys.resolve(document, device)
-            assertEquals("$r $device load", load, resolved["kernel_phys_load"])
-            assertEquals("$r $device offset", offset, resolved["kernel_phys_offset"])
+            val cleaned = document
+            val (actualLoad, actualOffset) = com.sesame.app.data.profile.ProfileResolver.physOf(
+                PerDevicePhys.resolve(cleaned, device),
+            )
+            assertEquals("$r $device load", load, actualLoad)
+            assertEquals("$r $device offset", offset, actualOffset)
         }
     }
 

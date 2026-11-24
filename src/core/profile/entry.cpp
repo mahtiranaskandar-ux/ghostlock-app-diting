@@ -1,12 +1,12 @@
 /* Profile entry points: the App path (stdin) and the prebuilt-profile path
- * (file). Both decode the typed transport directly (v3, with v2 still
- * accepted); no JSON or legacy rules reach this unit. */
+ * (file). Both carry the canonical JSON document the app renders; the mapper
+ * in profile/json_profile.cpp turns it into the transport struct. */
 #include "profile/entry.h"
 
-#include "profile/binary.h"
 #include "support/native_resource.hpp"
 
 #include <cerrno>
+#include <cstdio>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -60,30 +60,37 @@ namespace ghostlock::profile_entry {
         }
 
         int32_t decode(const std::string &document, profile::kernel_offsets *out,
-                   char *release_buf, size_t release_buf_cap,
-                   binary_profile::component_ids *ids,
-                   binary_profile::digests *out_digests) {
-            return ghostlock::binary_profile::parse(
-                std::string_view(document.data(), document.size()), out,
-                release_buf, release_buf_cap, ids, out_digests);
+                       char *release_buf, size_t release_buf_cap,
+                       component_ids *ids) {
+            char err[256] = {};
+
+            if (ghostlock::json_profile::parse(
+                    std::string_view(document.data(), document.size()), out,
+                    release_buf, release_buf_cap, ids, err, sizeof(err)) != 0) {
+                /* One message, and the caller's own "cannot load" line follows;
+                 * a refusal must be diagnosable from the run log alone. */
+                std::fprintf(stderr, "%s\n",
+                             err[0] ? err : "profile: cannot decode the document");
+                return -1;
+            }
+            return 0;
         }
     } // namespace
 
-    int32_t read_glk1_stdin(profile::kernel_offsets *out, char *release_buf,
-                        size_t release_buf_cap, binary_profile::component_ids *ids,
-                        binary_profile::digests *out_digests) {
+    int32_t read_profile_stdin(profile::kernel_offsets *out, char *release_buf,
+                               size_t release_buf_cap, component_ids *ids) {
         if (!out || !release_buf || release_buf_cap == 0) {
             errno = EINVAL;
             return -1;
         }
         std::string document;
         if (read_all(STDIN_FILENO, &document) != 0) return -1;
-        return decode(document, out, release_buf, release_buf_cap, ids, out_digests);
+        return decode(document, out, release_buf, release_buf_cap, ids);
     }
 
-    int32_t read_glk1_frame_stdin(profile::kernel_offsets *out, char *release_buf,
-                        size_t release_buf_cap, binary_profile::component_ids *ids,
-                        binary_profile::digests *out_digests) {
+    int32_t read_profile_frame_stdin(profile::kernel_offsets *out,
+                                     char *release_buf, size_t release_buf_cap,
+                                     component_ids *ids) {
         if (!out || !release_buf || release_buf_cap == 0) {
             errno = EINVAL;
             return -1;
@@ -100,13 +107,12 @@ namespace ghostlock::profile_entry {
         }
         std::string document(length, '\0');
         if (read_exact(STDIN_FILENO, document.data(), length) != 0) return -1;
-        return decode(document, out, release_buf, release_buf_cap, ids, out_digests);
+        return decode(document, out, release_buf, release_buf_cap, ids);
     }
 
-    int32_t read_glk1_file(const char *path, profile::kernel_offsets *out,
-                       char *release_buf, size_t release_buf_cap,
-                       binary_profile::component_ids *ids,
-                       binary_profile::digests *out_digests) {
+    int32_t read_profile_file(const char *path, profile::kernel_offsets *out,
+                              char *release_buf, size_t release_buf_cap,
+                              component_ids *ids) {
         if (!path || !out || !release_buf || release_buf_cap == 0) {
             errno = EINVAL;
             return -1;
@@ -116,6 +122,6 @@ namespace ghostlock::profile_entry {
         std::string document;
         const int32_t rc = read_all(fd.get(), &document);
         if (rc != 0) return -1;
-        return decode(document, out, release_buf, release_buf_cap, ids, out_digests);
+        return decode(document, out, release_buf, release_buf_cap, ids);
     }
 } // namespace ghostlock::profile_entry

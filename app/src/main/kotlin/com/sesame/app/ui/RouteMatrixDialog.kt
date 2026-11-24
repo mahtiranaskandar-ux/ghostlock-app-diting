@@ -88,11 +88,11 @@ internal fun RouteMatrixContent(state: SessionState, actions: OverlayActions) {
         nativeRoutes.firstOrNull { it.name == syscall }?.carriers?.takeIf { it.isNotEmpty() }
             ?: support.carrierCandidates
 
-    /* The DirtyFrag values the pipeline can express: on when it names dirtyfrag,
-     * off when it names ghostlock (and for the legacy empty pipeline). */
+    /* The DirtyFrag values the pipeline can express: on when it names
+     * dirtyfrag, off when it names ghostlock. */
     val dirtyFragOptions = buildList {
         if ("dirtyfrag" in support.pipelineOrder) add(true)
-        if ("ghostlock" in support.pipelineOrder || support.pipelineOrder.isEmpty()) add(false)
+        if ("ghostlock" in support.pipelineOrder) add(false)
     }.ifEmpty { listOf(false) }
 
     val initialSyscall = support.route?.takeIf { name -> nativeRoutes.any { it.name == name } }

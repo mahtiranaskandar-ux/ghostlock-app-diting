@@ -24,8 +24,8 @@ import android.os.Build
  * skipping the observed mainline/vendor placeholders (`missi`, `generic*`,
  * `generic_arm64`, `mivendor*`, `mgvi_*`, `ossi*`, `qssi*`, `alps*`,
  * `mainline*`, `unknown*`). When every candidate is a placeholder there is no
- * unique key: the caller writes a v1 all-device profile rather than inventing
- * one.
+ * unique key: the caller writes a device-less document (`devices = null`)
+ * rather than inventing one.
  */
 internal object DeviceIdentity {
     @SuppressLint("PrivateApi")
@@ -92,11 +92,12 @@ internal object DeviceIdentity {
             .firstOrNull { !isGenericIdentity(it) }
 
     /**
-     * The key written into a generated v2 profile: `Build.DEVICE` first (the
-     * codename on every non-mainline device), then the vendor identity (the
-     * unique codename on the mainline `spinel`), then the boot-image identity.
-     * Null when every candidate is a mainline/vendor placeholder; the caller
-     * must then write a v1 all-device profile instead of a fake device key.
+     * The key written into a generated profile's `devices` map: `Build.DEVICE`
+     * first (the codename on every non-mainline device), then the vendor
+     * identity (the unique codename on the mainline `spinel`), then the
+     * boot-image identity. Null when every candidate is a mainline/vendor
+     * placeholder; the caller must then write a device-less document
+     * (`devices = null`) instead of a fake device key.
      */
     fun uniqueProfileKey(): String? {
         val vendor = systemProperty("ro.product.vendor.device").trim()

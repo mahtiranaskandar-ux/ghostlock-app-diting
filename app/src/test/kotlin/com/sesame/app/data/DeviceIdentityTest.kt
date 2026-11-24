@@ -11,8 +11,8 @@ import org.junit.Test
  * uses — Build.DEVICE, vendor device, boot-image device. On `myron`
  * `Build.DEVICE=myron` while the vendor property is `mivendor`; on the mainline
  * `spinel` `Build.DEVICE=missi` while the vendor is `spinel`. When every
- * candidate is a mainline/vendor placeholder the caller writes a v1 all-device
- * profile instead of a fake key.
+ * candidate is a mainline/vendor placeholder the caller writes a device-less
+ * profile (`devices = null`) instead of a fake key.
  */
 class DeviceIdentityTest {
     @Test

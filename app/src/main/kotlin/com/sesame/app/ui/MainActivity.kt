@@ -108,6 +108,12 @@ class MainActivity : ComponentActivity() {
         if (BuildConfig.DEBUG && intent?.hasExtra("timer_run") == true) {
             viewModel.runTimerRouteCheck()
         }
+        /* Debug-only: `am start --ez derive_test true --es derive_image <path>`
+         * runs the profile derivation on a local image and records the timer
+         * block's fate in logcat and files/derive-test.txt. No UI, no export. */
+        if (BuildConfig.DEBUG && intent?.hasExtra("derive_test") == true) {
+            intent.getStringExtra("derive_image")?.let { viewModel.runDeriveTest(it) }
+        }
         setContent {
             GhostlockRoute(viewModel, ::handleEffect)
         }

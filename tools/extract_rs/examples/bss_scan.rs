@@ -1,7 +1,7 @@
 //! Temporary helper — batch A of docs/analysis/payload-page-option2-plan.md.
 //!
-//! Lists candidate regions for `route.select_stack.lock_anchor_image`: a zero,
-//! writable, reference-free kernel area the walk can use as a fake rt_mutex.
+//! Lists candidate regions for `ghostlock.anchor`: a zero, writable,
+//! reference-free kernel area the walk can use as a fake rt_mutex.
 //! Prints the section bounds, then every symbol inside [__bss_start,
 //! __bss_stop) whose size (distance to the next symbol) is >= min_size.
 //!

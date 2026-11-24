@@ -17,7 +17,7 @@ object HoconSupport {
 
     /**
      * Parses an object document, or an array document wrapped so HOCON sees a
-     * value (the offsets store keeps its top-level array shape).
+     * value (a list document keeps its top-level array shape).
      */
     fun parseValue(text: String): Any? {
         val isArray = text.trimStart().startsWith("[")
@@ -53,7 +53,7 @@ object HoconSupport {
         }
     }
 
-    /** Top-level arrays (the offsets store) must keep their brackets. */
+    /** Top-level arrays (list documents) must keep their brackets. */
     private fun renderListDocument(out: StringBuilder, list: List<*>, indent: Int) {
         if (list.isEmpty()) {
             out.append("[]")

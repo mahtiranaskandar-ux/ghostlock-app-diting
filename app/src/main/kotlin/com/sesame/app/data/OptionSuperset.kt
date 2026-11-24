@@ -2,8 +2,8 @@ package com.sesame.app.data
 
 /**
  * The extractor's `--options-out` document: every route, anchor candidate and
- * page-free plan for one image, plus the common profile blocks. One parse
- * produces it; a runnable profile is a **cut** of it.
+ * page-free plan for one image, plus the cleaned v3 profile document. One
+ * parse produces it; a runnable profile is a **cut** of that document.
  *
  * The extractor omits nothing. The UI applies the display rules over the full
  * list ([RoutePlans.safeOptions] / [RoutePlans.conditionalOptions]): a single
@@ -18,26 +18,17 @@ data class OptionAnchor(
 
 data class OptionScratch(
     val image: Long,
-    val window: Long,
-    val reservedFirst: Long?,
-    val reservedLast: Long?,
-) {
-    /** The window lies inside the anchor region and reserves lock slots. */
-    val inAnchor: Boolean get() = reservedFirst != null
-}
+)
 
 /** The `scratchSource` spelling for a scratch inside the anchor's own region. */
 const val ScratchInAnchor = "in-anchor"
 
 data class OptionPlan(
-    val route: String,
     val anchor: OptionAnchor?,
     val scratch: OptionScratch?,
-    val pageFree: Boolean,
     val conditioned: Boolean,
     val anchorName: String?,
     val scratchSource: String?,
-    val reason: String,
 ) {
     /** A short technical label (logs and tests): the anchor region and, when it
      * is not in-anchor, the scratch region. */
@@ -49,39 +40,27 @@ data class OptionPlan(
         }
 }
 
-/** One non-primary carrier of a route, with its own geometry. */
+/** One non-primary carrier of a route. */
 data class OptionRouteVariant(
     val carrier: String,
     val verdict: String,
-    val reason: String,
-    val geometry: Map<String, Long>,
 )
 
 data class OptionRoute(
     val route: String,
     val verdict: String,
-    val reason: String,
-    val anchorCapable: Boolean,
-    val geometry: Map<String, Long>,
     /** The primary carrier: `native` or `compat`. */
     val carrier: String = "native",
     /** The route's other feasible carriers (the carrier × route matrix). */
     val alternatives: List<OptionRouteVariant> = emptyList(),
 )
 
-/** One `pipelines[]` verdict from the extractor's maximal pass. */
-data class OptionPipeline(
-    val pipeline: String,
-    val verdict: String,
-    val reason: String,
-)
-
-/** One device sidecar set's physical derivation from the superset's `devices[]`. */
+/** One `device_analysis[]` record: the sidecar set the derivations were made
+ * for. The pair itself lives in the document (`devices.<codename>.phys`).
+ */
 data class OptionDevice(
-    val device: String,
-    val physLoad: Long?,
-    val physOffset: Long?,
-    val physSource: String,
+    /** Codename; null when the pass had no device sidecar set. */
+    val device: String?,
 )
 
 data class RoutePlans(
@@ -122,159 +101,85 @@ fun RoutePlans.decision(): OptionDecision = when {
 
 data class OptionSuperset(
     val release: String,
-    val kernelMajor: Int?,
-    val physLoad: Long?,
-    val physOffset: Long?,
-    val physSource: String,
     val routes: List<OptionRoute>,
     val plans: List<RoutePlans>,
-    /** `profile[block][key]` from the route-less common render; values keep
-     * their HOCON spelling (`"null"`, quoted strings, decimals). */
-    val profile: Map<String, Map<String, String>>,
-    /** Every device derivation the extractor recorded (`--device`); empty on
-     * a legacy device-neutral pass. */
+    /** The cleaned v3 profile document the extractor rendered for this image:
+     * the route-superset form. A cut selects the route, carrier, anchor and
+     * device inside it; nothing is assembled from blocks. Null when the image
+     * has no feasible route. */
+    val document: ValueMap?,
+    /** The device sidecar sets the extractor derived (`device_analysis[]`). */
     val devices: List<OptionDevice> = emptyList(),
-    /** The image's pipeline verdicts (`pipelines[]`); empty on a superset
-     * written before the selector existed. */
-    val pipelines: List<OptionPipeline> = emptyList(),
-    /** The extractor's default pipeline order (highest precedence first); the
-     * cut writes it into the profile's `pipeline` list. */
-    val pipelineOrder: List<String> = emptyList(),
 ) {
     /** The device key this superset was generated for, when it has one. */
     val device: String? get() = devices.firstOrNull()?.device
-
-    /** The pipelines this image can run; the extractor requires a choice when
-     * more than one is feasible. */
-    val feasiblePipelines: List<OptionPipeline>
-        get() = pipelines.filter { it.verdict == Feasible }
 
     fun route(name: String): OptionRoute? = routes.firstOrNull { it.route == name }
 
     fun plansFor(name: String): RoutePlans? = plans.firstOrNull { it.route == name }
 
     /**
-     * Materialize a runnable profile: the common blocks (rendered once by the
-     * extractor) plus the selected route, anchor and scratch. No derivation
-     * happens here.
+     * Materialize a runnable profile: the extractor's document with the
+     * chosen route, carrier and plan anchor applied and narrowed to the
+     * chosen device's pair. No derivation happens here.
      */
     fun cut(
         route: String,
         plan: OptionPlan,
         device: String? = null,
-        pipelineOrder: List<String>? = null,
         carrier: String? = null,
     ): String? {
         val routeOption = routes.firstOrNull { it.route == route && it.verdict == Feasible }
             ?: return null
+        val base = document?.copyValue()?.asValueMap() ?: return null
+        val ghostlock = base["ghostlock"].asValueMap() ?: return null
+        fun hex(value: Long?): String? = value?.let { "0x" + it.toULong().toString(16) }
         /* The carrier choice is a geometry choice inside the route; the primary
-         * is the default, and an absent or unknown carrier fails closed. With
-         * no carrier named the cut is the profile form: every feasible carrier
-         * is listed in `carriers` and their geometry joins one route block. */
-        val carriers = if (carrier != null) {
-            listOf(carrier)
-        } else {
-            (listOf(routeOption.carrier) +
+         * carrier is the default, and an absent or unknown carrier fails
+         * closed. */
+        val declared = (
+            listOf(routeOption.carrier) +
                 routeOption.alternatives
                     .filter { it.verdict == Feasible }
-                    .map { it.carrier })
-                .distinct()
+                    .map { it.carrier }
+            ).distinct()
+        val selectedCarrier = when {
+            carrier != null -> if (carrier in declared) carrier else return null
+            "compat" in declared && "native" !in declared -> "compat"
+            "native" in declared -> "native"
+            else -> null
         }
-        if (carrier != null && carrier !in carriers) return null
-        val geometry = when {
-            carrier == null || carrier == routeOption.carrier -> routeOption.geometry
-            else -> routeOption.alternatives
-                .firstOrNull { it.carrier == carrier && it.verdict == Feasible }
-                ?.geometry ?: return null
+        ghostlock["syscall"] = route
+        ghostlock["carrier"] = selectedCarrier
+        ghostlock["anchor"] = plan.anchor?.let { anchor ->
+            linkedMapOf<String, Any?>(
+                "image" to hex(anchor.image),
+                "bytes" to anchor.bytes,
+                "stride" to anchor.stride,
+                "scratch" to plan.scratch?.let { scratch -> hex(scratch.image) },
+            )
         }
-        val top = profile[""] ?: return null
-        val selected = device?.let { name -> devices.firstOrNull { it.device.equals(name, true) } }
-            ?: devices.firstOrNull()
-        val document = linkedMapOf<String, Any?>()
-        for (key in TopLevelKeys) {
-            /* The physical pair is device-scoped: write the selected device's
-             * schema-v3 per-device map instead of the common render's scalar. */
-            if (selected != null &&
-                (key == "schema_version" || key == "kernel_phys_load" || key == "kernel_phys_offset")
-            ) {
-                continue
-            }
-            top[key]?.let { document[key] = literal(it) }
+        /* The document already states the pair for the device it was generated
+         * for (`devices.<codename>.phys`); a multi-device document is narrowed
+         * to the chosen codename. A pass with no device key keeps the document
+         * as rendered (the pair is null and the native default applies). */
+        val declaredDevices = base["devices"].asValueMap()
+        val wanted = device ?: declaredDevices?.keys?.firstOrNull()
+        if (declaredDevices != null && wanted != null) {
+            declaredDevices.entries
+                .firstOrNull { (name, _) -> name.equals(wanted, ignoreCase = true) }
+                ?.let { (name, entry) -> base["devices"] = linkedMapOf<String, Any?>(name to entry) }
         }
-        if (selected != null) {
-            document["schema_version"] = 3L
-            document["kernel_phys_load"] = selected.physLoad?.let { mapOf(selected.device to it) }
-            document["kernel_phys_offset"] = selected.physOffset?.let { mapOf(selected.device to it) }
-        }
-        /* The profile carries the ordered pipeline preference; a cut without
-         * one would read as the legacy ghostlock default. */
-        val order = pipelineOrder ?: this.pipelineOrder
-        if (order.isNotEmpty()) {
-            document["pipeline"] = order
-        }
-        val block = linkedMapOf<String, Any?>()
-        if (carrier == null) {
-            block["carriers"] = carriers
-        }
-        geometry.forEach { (key, value) -> block[key] = value }
-        if (carrier == null) {
-            for (alternative in routeOption.alternatives.filter { it.verdict == Feasible }) {
-                for ((key, value) in alternative.geometry) {
-                    if (key == "compat_carrier" && carriers.size > 1) continue
-                    block.putIfAbsent(key, value)
-                }
-            }
-        }
-        plan.anchor?.let { anchor ->
-            block["lock_anchor_image"] = anchor.image
-            block["lock_anchor_bytes"] = anchor.bytes
-            block["lock_anchor_stride"] = anchor.stride
-        }
-        document["route"] = linkedMapOf(route to block)
-        profile["fallback"]?.let { fallback ->
-            document["fallback"] = fallback.mapValues { literal(it.value) }
-        }
-        profile["selinux"]?.let { selinux ->
-            document["selinux"] = selinux.mapValues { literal(it.value) }
-        }
-        plan.scratch?.let { scratch ->
-            document["w1_scratch"] = linkedMapOf<String, Any?>("image" to scratch.image)
-        }
-        for (name in CommonBlocks) {
-            profile[name]?.let { entries ->
-                document[name] = entries.mapValues { literal(it.value) }
-            }
-        }
-        document["schema_version"] = 3L
-        return HoconSupport.render(document) + "\n"
+        base["release"] = release
+        return HoconSupport.render(base) + "\n"
     }
 
     companion object {
         const val Feasible = "feasible"
 
-        private val TopLevelKeys = listOf(
-            "release",
-            "schema_version",
-            "kernel_major",
-            "kernel_phys_load",
-            "kernel_phys_offset",
-        )
-
-        private val CommonBlocks = listOf(
-            "kernelsnitch",
-            "task_struct",
-            "cred",
-            "offset",
-            "waiter_layout",
-        )
-
         fun parse(text: String): OptionSuperset? = runCatching {
             val root = HoconSupport.parseValue(text).asValueMap() ?: return@runCatching null
-            val profile = (root["profile"].asValueMap() ?: return@runCatching null)
-                .mapValues { (_, block) ->
-                    block.asValueMap().orEmpty()
-                        .mapValues { (_, value) -> value?.toString() ?: "null" }
-                }
+            val document = root["document"].asValueMap()
             val routes = root["routes"].asValueList().orEmpty().mapNotNull { entry ->
                 val map = entry.asValueMap() ?: return@mapNotNull null
                 val route = map["route"] as? String ?: return@mapNotNull null
@@ -284,77 +189,49 @@ data class OptionSuperset(
                     OptionRouteVariant(
                         carrier = carrier,
                         verdict = altMap["verdict"] as? String ?: "",
-                        reason = altMap["reason"] as? String ?: "",
-                        geometry = geometryOf(altMap["geometry"]),
                     )
                 }
                 OptionRoute(
                     route = route,
                     verdict = map["verdict"] as? String ?: "",
-                    reason = map["reason"] as? String ?: "",
-                    anchorCapable = map["anchor_capable"] as? Boolean ?: false,
-                    geometry = geometryOf(map["geometry"]),
                     carrier = map["carrier"] as? String ?: "native",
                     alternatives = alternatives,
                 )
             }
-            val plans = root["plans"].asValueList().orEmpty().mapNotNull { entry ->
-                val map = entry.asValueMap() ?: return@mapNotNull null
-                val route = map["route"] as? String ?: return@mapNotNull null
-                val page = plan(map["page"]) ?: return@mapNotNull null
-                RoutePlans(
-                    route = route,
-                    page = page,
-                    anchorOnly = plan(map["anchor_only"]),
-                    pageFree = map["page_free"].asValueList().orEmpty()
-                        .mapNotNull { plan(it) },
-                )
+            /* The per-device evidence: the plans are derived against the
+             * device's pair, so the first analysis record's plans are the
+             * list the picker uses. The pair itself is in the document. */
+            val analysis = root["device_analysis"].asValueList().orEmpty()
+                .mapNotNull { entry -> entry.asValueMap() }
+            val plans = analysis.firstOrNull()
+                ?.get("plans").asValueList().orEmpty()
+                .mapNotNull { entry ->
+                    val map = entry.asValueMap() ?: return@mapNotNull null
+                    val route = map["route"] as? String ?: return@mapNotNull null
+                    val page = plan(map["page"]) ?: return@mapNotNull null
+                    RoutePlans(
+                        route = route,
+                        page = page,
+                        anchorOnly = plan(map["anchor_only"]),
+                        pageFree = map["page_free"].asValueList().orEmpty()
+                            .mapNotNull { plan(it) },
+                    )
+                }
+            val devices = analysis.map { map ->
+                OptionDevice(device = map["device"] as? String)
             }
-            val devices = root["devices"].asValueList().orEmpty().mapNotNull { entry ->
-                val map = entry.asValueMap() ?: return@mapNotNull null
-                val device = map["device"] as? String ?: return@mapNotNull null
-                OptionDevice(
-                    device = device,
-                    physLoad = (map["kernel_phys_load"] as? Number)?.toLong(),
-                    physOffset = (map["kernel_phys_offset"] as? Number)?.toLong(),
-                    physSource = map["phys_source"] as? String ?: "unset",
-                )
-            }
-            val pipelines = root["pipelines"].asValueList().orEmpty().mapNotNull { entry ->
-                val map = entry.asValueMap() ?: return@mapNotNull null
-                val pipeline = map["pipeline"] as? String ?: return@mapNotNull null
-                OptionPipeline(
-                    pipeline = pipeline,
-                    verdict = map["verdict"] as? String ?: "",
-                    reason = map["reason"] as? String ?: "",
-                )
-            }
-            val pipelineOrder = root["pipeline_order"].asValueList().orEmpty()
-                .mapNotNull { (it as? String)?.trim()?.lowercase()?.takeIf(String::isNotEmpty) }
             OptionSuperset(
                 release = root["release"] as? String ?: return@runCatching null,
-                kernelMajor = (root["kernel_major"] as? Number)?.toInt(),
-                physLoad = (root["kernel_phys_load"] as? Number)?.toLong(),
-                physOffset = (root["kernel_phys_offset"] as? Number)?.toLong(),
-                physSource = root["phys_source"] as? String ?: "unset",
                 routes = routes,
                 plans = plans,
-                profile = profile,
+                document = document,
                 devices = devices,
-                pipelines = pipelines,
-                pipelineOrder = pipelineOrder,
             )
         }.getOrNull()
-
-        private fun geometryOf(value: Any?): Map<String, Long> =
-            value.asValueMap().orEmpty()
-                .mapNotNull { (key, item) -> (item as? Number)?.let { key to it.toLong() } }
-                .toMap()
 
         private fun plan(value: Any?): OptionPlan? {
             val map = value.asValueMap() ?: return null
             return OptionPlan(
-                route = map["route"] as? String ?: return null,
                 anchor = map["anchor"].asValueMap()?.let { anchor ->
                     OptionAnchor(
                         image = (anchor["image"] as? Number)?.toLong() ?: return@let null,
@@ -365,26 +242,13 @@ data class OptionSuperset(
                 scratch = map["scratch"].asValueMap()?.let { scratch ->
                     OptionScratch(
                         image = (scratch["image"] as? Number)?.toLong() ?: return@let null,
-                        window = (scratch["window"] as? Number)?.toLong() ?: 0,
-                        reservedFirst = (scratch["reserved_first"] as? Number)?.toLong(),
-                        reservedLast = (scratch["reserved_last"] as? Number)?.toLong(),
                     )
                 },
-                pageFree = map["page_free"] as? Boolean ?: false,
                 conditioned = map["conditioned"] as? Boolean ?: false,
                 anchorName = map["anchor_name"] as? String,
                 scratchSource = map["scratch_source"] as? String,
-                reason = map["reason"] as? String ?: "",
             )
         }
 
-        /** Turn a rendered-profile value back into a HOCON literal. */
-        private fun literal(value: String): Any? = when {
-            value == "null" -> null
-            value.length >= 2 && value.startsWith("\"") && value.endsWith("\"") ->
-                value.substring(1, value.length - 1)
-            value.toLongOrNull() != null -> value.toLong()
-            else -> value
-        }
     }
 }

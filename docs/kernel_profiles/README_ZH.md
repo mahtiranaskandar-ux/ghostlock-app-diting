@@ -21,10 +21,10 @@ GhostLock 用 `uname -r` 精确匹配内核版本：匹配不到时应用会直�
 
 - `index.conf`：内置内核清单。新 profile 最终要登记到这里。
 - `<uname-r>.conf`：一款内核一份完整 profile，文件名必须与 `uname -r` 完全一致。
-- `execution-tuning.conf`：所有内核共用的调优值。
+- `execution-tuning.conf`：所有内核共用的调优值。解析后的文档把它放在
+  `ghostlock.execution` 之下。
 - `execution-<route>.conf`：各攻击路线（route）专属的调优值。
   这些 preset 由 resolver 加载；设备 profile 不 include。
-- `credential-6x.conf`、`kernelsnitch-6x.conf`：6.x 内核共享的凭据模板与 KernelSnitch 参数。
 - `*-template.conf`：带逐字段注释的参考模板。可以在调试页手动加载，但不参与设备匹配。
 - `docs/kernel_profiles/templates/`：按大版本整理的模板文档。
 
@@ -67,13 +67,15 @@ GhostLock 用 `uname -r` 精确匹配内核版本：匹配不到时应用会直�
    `--kallsyms`，省略时会尝试恢复镜像内嵌表。`pselect_waiter_shift` 和
    `off_slide_loggers_0_1` 由内置的 arm64 反汇编器推导，route 由内核证据建议
    （`--route` 覆盖）。联发科（MediaTek）镜像没有 `xbl_config.img`，通常也没有内嵌 BTF：
-   请一并传入对应的 `vendor_boot.img`——`kernel_phys_load` 取自其头部，`kernel_phys_offset`
-   取自其内嵌 DTB 的 `/memory` 节点（该镜像不带 DTB 时改用 `--dtbo`）。二者都缺失时，
+   请一并传入对应的 `vendor_boot.img`——物理加载地址取自其头部，DRAM 基址
+   取自其内嵌 DTB 的 `/memory` 节点（该镜像不带 DTB 时改用 `--dtbo`）。文档把它们写成
+   `devices.<codename>.phys.load/offset`（提取器日志仍写作
+   `kernel_phys_load`/`kernel_phys_offset`）。二者都缺失时，
    加载地址回退到 kallsyms 的 `_text`，并可用 `--phys` 覆盖。
 
 5. **逐字段转录并自检。**
    字段含义与必填要求见 [Profile 结构文档](PROFILE_SCHEMA_ZH.md)。
-   确认所有必填的 `off_*` 非零，task/cred 布局来自同一镜像。
+   确认所有必填的 `kernel.symbols.*` 非零，task/cred 布局来自同一镜像。
 
 6. **确有必要时才改 `execution`。**
    没有真机实测证据就保留[公共默认值](defaults_ZH.md)；也可以先在 App 的参数覆盖页试（见下节），确认后再写回 profile。
@@ -96,7 +98,8 @@ GhostLock 用 `uname -r` 精确匹配内核版本：匹配不到时应用会直�
 调参不必每次都改 assets 再重装 App。App 里有两层覆盖，保存后立即生效，并参与下一次运行：
 
 - **参数覆盖页（一般参数覆盖）**：调整 `execution.*` 的调优值，例如尝试次数、等待/超时时间、核心选择。
-- **高级配置覆盖页**：修改 `route` / `fallback.to`，以及任意数值路径（以 sparse HOCON 保存），适合试验新的偏移或几何。
+- **路由矩阵**：选择 syscall 与其 carrier（`ghostlock.syscall` / `.carrier`）；
+  锚点与全部几何块都来自文档。没有 route 回退，也没有 `fallback.to`。
 - **导出配置**：把合并后的完整 HOCON 写到你选定的目录（SAF），可以直接当作新 profile 的底稿。
 
 覆盖按 release 保存，优先级高于内置 profile 和导入的偏移。各层优先级与存储位置见
@@ -104,7 +107,7 @@ GhostLock 用 `uname -r` 精确匹配内核版本：匹配不到时应用会直�
 
 `defaults.json` → 内置 release JSON → 用户稀疏 override → UI 显式核心选择。后层覆盖前层。Kotlin 生成单个 `active-profile.json`，Native 不再搜索或合并配置。
 
-- 模板里的 `off_* = 0` 是相对内核镜像基址的符号偏移，必须自己提取。
+- 模板里的 `kernel.symbols.* = null` 是相对内核镜像基址的符号偏移，必须自己提取（写带引号的十六进制）。
 - task/cred/multicast 布局写错可能造成任意内核内存破坏、黑屏或重启。
 - 调大 `execution` 的尝试次数、调短等待时间会明显升温，并可能降低成功率。
 - 新 profile 在通过真机验证前，不要提交为“已支持”。

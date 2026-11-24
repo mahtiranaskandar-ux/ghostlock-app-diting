@@ -39,12 +39,7 @@ int main(int argc, char **argv) {
     try {
         profile::kernel_offsets decoded = {};
         std::array<char, 256> release_buf{};
-        binary_profile::component_ids ids{
-            static_cast<uint16_t>(runtime::FrontendKind::RootChild),
-            static_cast<uint16_t>(runtime::BackendKind::Cve2026_43499),
-            0,
-        };
-        binary_profile::digests digests{};
+        profile_entry::component_ids ids{};
 
         bool app_call = false;
         bool force_attack = false;
@@ -70,12 +65,12 @@ int main(int argc, char **argv) {
                 dirtyfrag_plan = argv[++i];
             } else if (std::string_view(argv[i]) == "--dirtyfrag-mode" && i + 1 < argc) {
                 dirtyfrag_mode = argv[++i];
-            } else if (std::string_view(argv[i]) == "--load-prebuilt-profile" &&i + 1 < argc) {
+            } else if (std::string_view(argv[i]) == "--load-prebuilt-profile" && i + 1 < argc) {
                 prebuilt_path = argv[++i];
             } else if (std::string_view(argv[i]) == "--dump-kernel-log" && i + 1 < argc) {
                 dump_dir = argv[++i];
             } else {
-                pr_error("usage: %s [--ghostlock-app-call | --load-prebuilt-profile <bin>]"
+                pr_error("usage: %s [--ghostlock-app-call | --load-prebuilt-profile <json>]"
                 " [--dump-kernel-log <dir>] [--force-attack] [--enable-status-record]"
                 " [--probe-stride] [--w1-only] [--dirtyfrag <plan> [--dirtyfrag-mode full|noshell|noscript]]\n", argv[0]);
                 return 1;
@@ -112,46 +107,32 @@ int main(int argc, char **argv) {
 
         int32_t loaded;
         if (prebuilt_path != nullptr) {
-            loaded = profile_entry::read_glk1_file(prebuilt_path, &decoded, release_buf.data(),
-                                                   release_buf.size(), &ids, &digests);
+            loaded = profile_entry::read_profile_file(prebuilt_path, &decoded,
+                                                      release_buf.data(),
+                                                      release_buf.size(), &ids);
         } else if (app_call) {
             loaded = status_record
-                         ? profile_entry::read_glk1_frame_stdin(
-                               &decoded, release_buf.data(), release_buf.size(), &ids, &digests)
-                         : profile_entry::read_glk1_stdin(
-                               &decoded, release_buf.data(), release_buf.size(), &ids, &digests);
+                         ? profile_entry::read_profile_frame_stdin(
+                               &decoded, release_buf.data(), release_buf.size(), &ids)
+                         : profile_entry::read_profile_stdin(
+                               &decoded, release_buf.data(), release_buf.size(), &ids);
         } else {
             pr_error("no entrypoint: pass --ghostlock-app-call or --load-prebuilt-profile <bin>\n");
             return 1;
         }
-        if (loaded == binary_profile::kDigestMismatch) {
-            /* The app's schema and this build's disagree about which keys cross
-             * the transport (or the payload was corrupted); running on it would
-             * use defaults for whatever went missing. */
-            pr_error("profile digest mismatch: sent=0x%016llx computed=0x%016llx\n",
-                     static_cast<unsigned long long>(digests.transmitted.value_or(0)),
-                     static_cast<unsigned long long>(digests.computed));
-            throw FatalError{};
-        }
         if (loaded != 0) {
+            /* The mapper printed its one-line reason above. */
             pr_error("cannot load profile\n");
             throw FatalError{};
         }
-        if (digests.transmitted) {
-            pr_info("profile digest=0x%016llx verified (recomputed 0x%016llx)\n",
-                    static_cast<unsigned long long>(*digests.transmitted),
-                    static_cast<unsigned long long>(digests.computed));
-        } else {
-            pr_info("profile digest: absent (app build predates it)\n");
-        }
 
-        /* The app resolved the profile's ordered pipeline list to one entry and
-         * wrote it into the wire; the invocation must match. A mismatch means
-         * the two sides disagree about the run's shape: a resolved DirtyFrag run
-         * started as the full chain would run the wrong stage, and a GhostLock
-         * run stopped after W1 would leave SELinux permissive with no stage to
-         * continue. Absent (a document that predates the cross-check) keeps the
-         * legacy behaviour. */
+        /* The app resolved the document's ladder to one engine and wrote it as
+         * `mode`; the invocation must match. A mismatch means the two sides
+         * disagree about the run's shape: a resolved DirtyFrag run started as
+         * the full chain would run the wrong stage, and a GhostLock run stopped
+         * after W1 would leave SELinux permissive with no stage to continue.
+         * Absent (a parse/preview document carries no `mode`) keeps the
+         * previous behaviour. */
         switch (profile::check_pipeline(decoded.meta.pipeline, w1_only)) {
             case profile::PipelineCheck::NotDeclared:
                 break;

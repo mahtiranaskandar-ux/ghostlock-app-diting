@@ -67,8 +67,8 @@ namespace ghostlock::route::compat {
                     break;
             }
         } else {
-            /* Legacy profiles did not carry the ABI; the 5.x homes identify
-             * it. A 6.x home reaches this arm only from an old document. */
+            /* A document that leaves the ABI null resolves it from the 5.x
+             * home table; a 6.x home states the key. */
             abi = abi_for_waiter_home(geometry.waiter_home);
         }
         if (!abi) {

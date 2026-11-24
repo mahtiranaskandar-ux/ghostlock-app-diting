@@ -4,10 +4,11 @@
 Usage:
     python3 tools/verify_kernels.py <boot.img|payload.bin|Image>...
 
-For each input it runs the release extractor (`--format conf`) and prints one
-row per image: release, exit code, whether the CVE primitive is present, the
-suggested route, the multicast geometry it emitted (waiter_off / task / lock /
-compact), the kernel_phys_load source, and any missing sidecar-only field.
+For each input it runs the release extractor (`--format conf`, the schema-v3
+document) and prints one row per image: release, exit code, whether the CVE
+primitive is present, the selected syscall, the multicast geometry it emitted
+(waiter_off / waiter task+lock / compact), the physical load source, and any
+missing sidecar-only device pair.
 
 No device or root is involved: this is exactly the offline path a bootloader
 locked user takes.
@@ -32,8 +33,8 @@ def run(image):
 
 
 def conf_fields(conf):
+    """The v3 document flattened to dotted paths, plus the selected syscall."""
     fields = {}
-    route = None
     stack = []
     for line in conf.splitlines():
         line = line.split("#")[0].strip()
@@ -41,8 +42,6 @@ def conf_fields(conf):
             continue
         if line.endswith("{"):
             stack.append(line[:-1].strip())
-            if len(stack) == 2 and stack[0] == "route":
-                route = stack[1]
             continue
         if line == "}":
             if stack:
@@ -50,8 +49,20 @@ def conf_fields(conf):
             continue
         if "=" in line:
             k, v = (p.strip() for p in line.split("=", 1))
-            fields[".".join(stack + [k])] = v
+            fields[".".join(stack + [k])] = v.strip('"')
+    route = fields.get("ghostlock.syscall")
+    if route in (None, "null"):
+        route = None
     return route, fields
+
+
+def numeric(value):
+    if value is None or value == "null":
+        return None
+    try:
+        return int(value, 0)
+    except (TypeError, ValueError):
+        return None
 
 
 def classify(err):
@@ -66,22 +77,34 @@ def waiter_off(err, fields):
     m = re.search(r"waiter_off derived = (0x[0-9a-f]+)", err)
     if m:
         return m.group(1) + " (derived)"
-    if "waiter_off derivation failed" in err:
-        v = fields.get("route.multicast_waiter.waiter_off")
-        return f"{v} (fallback)" if v else "-"
-    return fields.get("route.multicast_waiter.waiter_off", "-")
+    for carrier in ("native", "compat"):
+        value = numeric(
+            fields.get(f"ghostlock.syscalls.multicast_waiter.{carrier}.waiter_off")
+        )
+        if value is not None:
+            fallback = " (fallback)" if "waiter_off derivation failed" in err else ""
+            return f"0x{value:x}{fallback}"
+    return "-"
 
 
 def phys(err, fields):
-    if "kernel_phys_load" in fields:
-        if "(uefi memory map)" in err:
-            return fields["kernel_phys_load"] + " (uefi)"
-        if "(xbl_config FDT)" in err:
-            return fields["kernel_phys_load"] + " (xbl)"
-        return fields["kernel_phys_load"]
-    if "5.x" in err or "mtk" in err:
+    loads = {
+        key: value
+        for key, value in fields.items()
+        if key.startswith("devices.") and key.endswith(".phys.load")
+    }
+    if not loads:
         return "-"
-    return "-"
+    load = next(iter(loads.values()))
+    if "(uefi memory map)" in err:
+        return f"{load} (uefi)"
+    if "(xbl_config FDT)" in err:
+        return f"{load} (xbl)"
+    if "(vendor_boot" in err:
+        return f"{load} (vendor_boot)"
+    if "(--phys" in err:
+        return f"{load} (--phys)"
+    return load
 
 
 def main():
@@ -90,7 +113,7 @@ def main():
     images = sys.argv[1:]
     if not images:
         sys.exit(__doc__)
-    print(f"{'image':<34} {'release':<40} {'st':<4} {'prim':<10} {'route':<17} waiter_off          task/lock  phys            missing")
+    print(f"{'image':<34} {'release':<40} {'st':<4} {'prim':<10} {'syscall':<17} waiter_off          task/lock  phys            missing")
     for image in images:
         try:
             code, conf, err = run(image)
@@ -98,14 +121,17 @@ def main():
             print(f"{os.path.basename(image):<34} TIMEOUT")
             continue
         route, fields = conf_fields(conf)
-        rel = fields.get("release", "-").strip('"')
+        rel = fields.get("release", "-")
         prim = classify(err)
         wo = waiter_off(err, fields)
-        tl = "-"
-        if "route.multicast_waiter.task_offset" in fields:
-            tl = f"{fields['route.multicast_waiter.task_offset']}/{fields['route.multicast_waiter.lock_offset']}"
+        task = numeric(fields.get("kernel.struct.waiter.task"))
+        lock = numeric(fields.get("kernel.struct.waiter.lock"))
+        tl = f"{task}/{lock}" if task is not None and lock is not None else "-"
         ph = phys(err, fields)
-        missing = "kernel_phys_load" if "kernel_phys_load" not in fields else "-"
+        missing = "-" if any(
+            key.startswith("devices.") and key.endswith(".phys.load")
+            for key in fields
+        ) else "devices.<id>.phys.load"
         print(
             f"{os.path.basename(image):<34} {rel:<40} {code:<4} {prim:<10} "
             f"{(route or '-'):<17} {wo:<19} {tl:<10} {ph:<15} {missing}"

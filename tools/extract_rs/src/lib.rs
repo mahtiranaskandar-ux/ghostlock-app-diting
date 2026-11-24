@@ -3,6 +3,7 @@ pub mod anchor;
 pub mod boot;
 pub mod btf;
 pub mod derive;
+pub mod document;
 pub mod disasm;
 pub mod dtbo;
 pub mod error;

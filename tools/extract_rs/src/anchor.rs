@@ -1,4 +1,4 @@
-//! Derive `route.select_stack.lock_anchor_*` from a kernel image.
+//! Derive the `ghostlock.anchor` triple from a kernel image.
 //!
 //! The anchor is a zero, writable, reference-free region the PI walk uses as a
 //! fake rt_mutex. Three numbers describe it, all per-build: the offset, how
@@ -608,7 +608,7 @@ impl ScratchSource {
 /// One valid W1 scratch placement.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct W1Scratch {
-    /// The scratch's image offset (what the profile's `w1_scratch.image` states).
+    /// The scratch's image offset (what the document's `ghostlock.anchor.scratch` states).
     pub image: u64,
     /// The region-relative offset of the value the erase writes:
     /// `alias(image) + 0x100 - alias(anchor)`. Zero when the scratch lies

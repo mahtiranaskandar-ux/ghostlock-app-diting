@@ -17,7 +17,7 @@
 
 mod common;
 
-use common::{blocks, collect_all, options_path, par_for_each, run_no_disasm, run_options};
+use common::{collect_all, options_path, par_for_each, run_no_disasm, run_options};
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -50,19 +50,27 @@ fn check_entry(binary: &str, meta: &common::Meta, checked: &AtomicUsize) {
             .expect("parse produced superset");
     let _ = std::fs::remove_file(&out);
 
-    /* `timer_98260` is the timer tool's overlay, not this extractor's output:
-     * the store carries it for the two timer entries while a fresh run of this
-     * binary cannot. Compare every section the extractor owns. */
+    /* `timer_analysis` is the timer tool's overlay, not this extractor's
+     * output: the store carries it while a fresh run of this binary cannot.
+     * Merge its cleaned fragment into the fresh document, then compare every
+     * section the extractor owns. */
+    let fragment = want
+        .get("timer_analysis")
+        .and_then(|analysis| analysis.get("document"))
+        .cloned();
     for value in [&mut want, &mut got] {
         if let Some(map) = value.as_object_mut() {
-            map.remove("timer_98260");
+            map.remove("timer_analysis");
         }
+    }
+    if let Some(fragment) = fragment {
+        common::merge_document(&mut got["document"], &fragment);
     }
 
     /* Section-first so a failure names the part that moved. */
-    for key in ["schema_version", "release", "kernel_major", "kernel_phys_load",
-                "kernel_phys_offset", "routes", "pipeline_facts", "pipelines", "candidates",
-                "plans", "profile", "chosen", "devices"] {
+    for key in ["schema_version", "release", "kernel_major", "image_base", "routes",
+                "pipeline_facts", "pipelines", "pipeline_order", "document",
+                "device_analysis"] {
         assert_eq!(
             want.get(key),
             got.get(key),
@@ -115,16 +123,10 @@ fn check_entry(binary: &str, meta: &common::Meta, checked: &AtomicUsize) {
         "{release}: --no-disasm failed\n{}",
         control.stderr
     );
-    let want_anchor = want["profile"]["offset"]["slide_loggers_0_1"].as_str();
-    let got_anchor = blocks(&control.stdout)
-        .get("offset")
-        .and_then(|lines| {
-            lines
-                .iter()
-                .find(|line| line.starts_with("slide_loggers_0_1"))
-        })
-        .and_then(|line| line.split_once('='))
-        .map(|(_, value)| value.trim().to_string());
+    let want_anchor = want["document"]["kernel"]["symbols"]["loggers_0_1"]
+        .as_str()
+        .map(str::to_string);
+    let got_anchor = common::profile_string(&control.stdout, "kernel.symbols.loggers_0_1");
     if let (Some(want_anchor), Some(got_anchor)) = (want_anchor, got_anchor) {
         assert_eq!(
             got_anchor, want_anchor,

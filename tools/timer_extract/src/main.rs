@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! `timer-extract`: check whether a kernel still carries CVE-2026-98260 and
-//! derive its `timer_98260` profile block from the image (and, optionally,
-//! runtime facts measured on the same kernel).
+//! derive its cleaned `timer` fragment (`kernel` facts + `timer`) from the
+//! image (and, optionally, runtime facts measured on the same kernel).
 //!
 //! Exit codes: 0 vulnerable, 3 kernel carries the upstream fix, 1 error.
 
@@ -61,10 +61,10 @@ struct Cli {
     /// constant set the emitted block carries: real (default), fake, real,fake
     #[arg(long, value_name = "SPEC")]
     endgame: Option<String>,
-    /// print the `timer_98260` HOCON block (to stdout, or to PATH)
+    /// print the cleaned `timer` fragment as HOCON (to stdout, or to PATH)
     #[arg(long, num_args = 0..=1, value_name = "PATH")]
     emit_timer_conf: Option<Option<PathBuf>>,
-    /// print the store-superset `timer_98260` JSON object (to stdout, or to PATH)
+    /// print the timer evidence object for the store's superset (to stdout, or to PATH)
     #[arg(long, num_args = 0..=1, value_name = "PATH")]
     emit_superset: Option<Option<PathBuf>>,
     /// print the canonical backend document, timer-only projection (to stdout, or to PATH)

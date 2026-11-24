@@ -11,7 +11,6 @@ import com.sesame.app.data.BugreportzOutput
 import com.sesame.app.data.CrashEvidenceStore
 import com.sesame.app.data.DropboxKmsg
 import com.sesame.app.data.ManagerScanner
-import com.sesame.app.data.NativeProfileDocument
 import java.io.File
 import java.io.RandomAccessFile
 import java.nio.charset.StandardCharsets
@@ -94,13 +93,9 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                 // never satisfy the handoff probe; the native process receives
                 // the resolved path via GHOSTLOCK_KSU_LOG.
                 val ksuLog = File(workDir, "ghostlock-ksu-${System.currentTimeMillis()}.log")
-                // v2: safe_mode lives in the meta section; there is no fixed
-                // slot offset, so the blob is rescanned and rewritten.
-                val effectiveBlob = if (safeMode) {
-                    NativeProfileDocument.patchSafeMode(profileBlob) ?: profileBlob
-                } else {
-                    profileBlob
-                }
+                /* The document already states the run's safe_mode; the
+                 * service forwards the bytes unchanged. */
+                val effectiveBlob = profileBlob
                 val argv = mutableListOf(
                     binary.absolutePath,
                     "--ghostlock-app-call",
@@ -131,7 +126,7 @@ class GhostlockUserService(private val context: Context) : IGhostlockUserService
                     .start()
                     .let { process ->
                         val stdinOut = process.outputStream
-                        /* Length-prefixed GLK1; stdin stays open for the ACK. */
+                        /* Length-prefixed document; stdin stays open for the ACK. */
                         runCatching {
                             val length = effectiveBlob.size
                             stdinOut.write(

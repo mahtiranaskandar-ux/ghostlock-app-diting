@@ -35,8 +35,8 @@ stub 注入 init 的 libc++/libbase sentry 构造函数，init 以自己的 uid 
 守护进程（无内核模块），KernelSU 可选。这是三星手机的第二条路：KDP 会拒绝凭据写入，但当
 凭据就是 init 自己的时，没有东西可拒绝。
 
-配置携带**有序的 pipeline 列表**（`pipeline = [ "dirtyfrag", "ghostlock" ]`，优先级从高到
-低）。App 在 W1 之前解析：镜像的静态判定、ROM 预检（libc++ hook 与 cave、策略/服务）、
+pipeline 阶梯**由配置文档推导**（`kernel.dirtyfrag`、`kernel.kdp`、`ghostlock.module`、
+`timer`），优先级从高到低 —— 没有 `pipeline` 键。App 在 W1 之前解析：镜像的静态判定、ROM 预检（libc++ hook 与 cave、策略/服务）、
 阶段 2 的原语探针（`libdfprobe`，结果写入实测数据库）以及当前状态。第一条可行的条目运行；
 W1 之后没有回退，KDP 镜像只带 `["dirtyfrag"]`。DirtyFrag 的每个失败退出都会把 SELinux 恢复
 为 enforcing。可行性由发送路径决定：5.10 是 `splice() → udp_sendpage() →

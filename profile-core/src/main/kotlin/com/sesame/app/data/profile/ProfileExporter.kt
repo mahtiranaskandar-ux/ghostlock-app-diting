@@ -1,18 +1,17 @@
 package com.sesame.app.data.profile
 
 import com.sesame.app.data.HoconSupport
-import com.sesame.app.data.NativeProfileDocument
 import com.sesame.app.data.ValueMap
 import com.sesame.app.data.asValueMap
 import com.sesame.app.data.route.RouteKind
 import java.io.File
 
 /**
- * Serializes the bundled HOCON profiles into the v3 binary the native side
- * reads. It shares [ProfileMerger], [ProfileResolver] and
- * [NativeProfileDocument] with the app, so the exporter and the runtime can no
- * longer drift. The work list comes from `index.conf`; a missing/invalid entry
- * fails the export instead of silently dropping a profile.
+ * Renders the bundled HOCON profiles into the one JSON document every backend
+ * reads. It shares [ProfileMerger], [ProfileResolver] and [ProfileTransport]
+ * with the app, so the exporter and the runtime can no longer drift. The work
+ * list comes from `index.conf`; a missing/invalid entry fails the export
+ * instead of silently dropping a profile.
  */
 object ProfileExporter {
     @JvmStatic
@@ -58,12 +57,15 @@ object ProfileExporter {
             /* Reference templates are not device profiles and are not exported. */
             if (release.endsWith("-template")) continue
             val parsed = parseFile(File(srcDir, file), srcDir) ?: error("cannot parse $file")
-            /* The exporter is device-neutral: the schema-v3 per-device physical map is
-             * validated and left null (the native default). */
-            val resolved = PerDevicePhys.resolveNeutral(parsed)
+            require(ProfileResolver.isCleanedShape(parsed)) {
+                "$file is not the cleaned v3 layout; regenerate it with this build"
+            }
+            val cleaned = parsed
+            /* The exporter is device-neutral: the per-device entries are
+             * dropped (the native default). */
+            val resolved = PerDevicePhys.resolveNeutral(cleaned)
             val actualRelease = resolved["release"] as? String ?: error("$file has no release")
             require(actualRelease == release) { "index/file release mismatch for $file" }
-            val fallbackTo = fallbackOf(resolved)
             val merged = ProfileMerger.resolveMerged(
                 deviceRelease = actualRelease,
                 builtin = resolved,
@@ -71,40 +73,30 @@ object ProfileExporter {
                 tuningExecution = tuningExecution,
                 routePresets = routePresets,
             )
-            /* The app's default route: the viable branches alphabetically, the
-             * first with no route-specific validation error. The runtime
-             * renders exactly this branch, and the agreement test holds the two
-             * paths together. */
-            val route = defaultRoute(merged, routes, fallbackTo)
-            val errors = ProfileResolver.validateMerged(merged, route, fallbackTo)
+            val errors = ProfileResolver.validateMerged(merged)
             if (errors.isNotEmpty()) {
                 error("$file fails validation: ${errors.joinToString()}")
             }
-            /* A module-only profile has no native wire: the DirtyFrag stage is
-             * invoked with its plan, not a profile document. A mixed list keeps
-             * the W1 fallback's wire. */
+            /* A module-only profile has no native document: the DirtyFrag stage
+             * is invoked with its plan, not a profile document. */
             val order = ProfileResolver.pipelineOrder(merged)
             if ("module" in order && !ProfileResolver.requiresW1(order)) {
-                println("exportKernelProfiles: $actualRelease (module-only; no native wire)")
+                println("exportKernelProfiles: $actualRelease (module-only; no native document)")
                 continue
             }
-            val bytes = NativeProfileDocument.from(
-                release = actualRelease,
-                route = RouteKind.fromToken(route)?.token,
-                fallbackTo = RouteKind.fromToken(fallbackTo)?.token,
-            ) { path ->
-                when (path) {
-                    /* The native chooses the CPU pair at run time; the wire's
-                     * required slots carry the neutral fallback, exactly as the
-                     * app's transport boundary does. */
-                    "execution.recommended_cpus.main" -> 0L
-                    "execution.recommended_cpus.consumer" -> 1L
-                    else -> ProfileResolver.nativeValue(merged, route, fallbackTo, path)
-                }
-            }.toBinary()
-            File(staging, "$actualRelease.bin").writeBytes(bytes)
+            /* The app's defaults: the alphabetically first declared syscall and,
+             * within it, the first declared carrier. */
+            val syscalls = ProfileResolver.syscallsOf(merged).sortedBy { it.first }
+            val route = syscalls.firstOrNull()?.first
+            val carrier = syscalls.firstOrNull()?.second?.firstOrNull()
+            val document = ProfileTransport.render(
+                merged,
+                route = route,
+                carrier = carrier,
+            )
+            File(staging, "$actualRelease.json").writeText(document)
             count++
-            println("exportKernelProfiles: $actualRelease (${bytes.size} bytes)")
+            println("exportKernelProfiles: $actualRelease (${document.length} bytes)")
         }
 
         /* Swap without ever deleting the previous output first: move it aside,
@@ -151,39 +143,6 @@ object ProfileExporter {
         require(!out.contains("${File.separator}app${File.separator}src${File.separator}")) {
             "refusing to write into the source tree: $outDir"
         }
-    }
-
-    private fun defaultRoute(
-        merged: ValueMap,
-        routes: List<String>,
-        fallbackTo: String?,
-    ): String? {
-        val branches = when (val raw = merged["route"]) {
-            is String -> listOf(raw)
-            is Map<*, *> -> raw.keys.filterIsInstance<String>()
-            else -> emptyList()
-        }
-        val names = branches.filter { it in routes }.sorted()
-        for (name in names) {
-            val errors = ProfileResolver.validateMerged(merged, name, fallbackTo)
-                .filterNot { foreignRoute(it.fieldPath, name) }
-            if (errors.isEmpty()) return name
-        }
-        return names.firstOrNull()
-    }
-
-    private fun foreignRoute(path: String, route: String): Boolean = when {
-        path.startsWith("timer_98260") -> true
-        path.startsWith("route.") && !path.startsWith("route.$route.") -> true
-        path.startsWith("fallback.route.") && !path.startsWith("fallback.route.$route.") -> true
-        else -> false
-    }
-
-    private fun fallbackOf(profile: Map<*, *>): String? {
-        val to = ((profile["fallback"] as? Map<*, *>)?.get("to") as? String)
-            ?.takeIf { it.isNotEmpty() && it != "null" }
-        if (to != null) return to
-        return (profile["fallback_to"] as? String)?.takeIf { it.isNotEmpty() && it != "null" }
     }
 
     private fun parseFile(file: File, baseDir: File): ValueMap? {

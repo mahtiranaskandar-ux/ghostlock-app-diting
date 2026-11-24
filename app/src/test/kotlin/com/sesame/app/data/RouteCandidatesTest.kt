@@ -3,7 +3,6 @@ package com.sesame.app.data
 import android.app.Application
 import android.content.SharedPreferences
 import androidx.core.content.edit
-import com.sesame.app.data.route.SelectConfig
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -24,6 +23,11 @@ import org.robolectric.annotation.Config
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
 class RouteCandidatesTest {
+    private fun document(bytes: ByteArray?): ValueMap =
+        checkNotNull(
+            HoconSupport.parseValue(String(checkNotNull(bytes), Charsets.UTF_8)).asValueMap(),
+        )
+
     private val context: Application = RuntimeEnvironment.getApplication()
     private val release = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638"
     private val file = "$release.conf"
@@ -32,11 +36,7 @@ class RouteCandidatesTest {
         val document = HoconSupport.parseValue(
             AssetConfigLoader(context).load("kernel_profiles/$file"),
         ).asValueMap()
-        val device = document?.let {
-            listOf("kernel_phys_load", "kernel_phys_offset").firstNotNullOfOrNull { key ->
-                (it[key] as? Map<*, *>)?.keys?.firstOrNull()?.toString()
-            }
-        }
+        val device = document?.get("devices").asValueMap()?.keys?.firstOrNull()
         return AndroidProfileConfigController(
             context = context,
             externalProfiles = FakeExternalProfileStore(),
@@ -77,20 +77,35 @@ class RouteCandidatesTest {
         val native = controller.load(release)
         assertEquals(listOf("native", "compat"), native.carrierCandidates)
         assertEquals("native", native.selectedCarrier)
-        val nativeLayout = NativeProfileDocument.fromBinary(
-            checkNotNull(controller.nativeDocument(native)),
-        )!!.routeConfig as SelectConfig
-        assertEquals(null, nativeLayout.compatCarrier)
+        val nativeDoc = document(controller.nativeDocument(native))
+        assertEquals("native", nativeDoc["ghostlock"].asValueMap()?.get("carrier"))
+        assertEquals("select_stack", nativeDoc["ghostlock"]?.asValueMap()?.get("syscall"))
+        assertEquals(
+            1L,
+            nativeDoc.getLongAt("ghostlock.syscalls.select_stack.native.waiter_shift"),
+        )
 
         assertTrue(controller.selectCarrier(release, "select_stack", "compat"))
         val compat = controller.load(release)
         assertEquals("compat", compat.selectedCarrier)
-        val compatLayout = NativeProfileDocument.fromBinary(
-            checkNotNull(controller.nativeDocument(compat)),
-        )!!.routeConfig as SelectConfig
-        assertEquals(1.toUByte(), compatLayout.compatCarrier)
-        assertEquals(488u, compatLayout.waiterHome)
-        assertEquals(496u, compatLayout.selectDstDepth)
+        val compatDoc = document(controller.nativeDocument(compat))
+        assertEquals("compat", compatDoc["ghostlock"]?.asValueMap()?.get("carrier"))
+        assertEquals(
+            488L,
+            compatDoc.getLongAt("ghostlock.syscalls.select_stack.compat.waiter_home"),
+        )
+        assertEquals(
+            496L,
+            compatDoc.getLongAt("ghostlock.syscalls.select_stack.compat.dst_depth"),
+        )
+        assertEquals(
+            "time64",
+            compatDoc["ghostlock"].asValueMap()
+                ?.get("syscalls").asValueMap()
+                ?.get("select_stack").asValueMap()
+                ?.get("compat").asValueMap()
+                ?.get("futex_abi"),
+        )
 
         /* A stale/unknown carrier is refused and the choice falls back. */
         assertFalse(controller.selectCarrier(release, "select_stack", "bogus"))
@@ -98,7 +113,7 @@ class RouteCandidatesTest {
     }
 
     @Test
-    fun `dirtyfrag is offered only with both pipeline entries and self-heals`() = runBlocking {
+    fun `dirtyfrag is offered only with both ladder engines and self-heals`() = runBlocking {
         val ditingRelease = "5.10.236-android12-9-00003-gfb24cf99ad97-ab14313284"
         val controller = controllerFor("$ditingRelease.conf", "diting", "route-carriers-df")
         val config = controller.load(ditingRelease)
@@ -120,7 +135,7 @@ class RouteCandidatesTest {
         val config = controller("route-candidates-a").load(release)
         assertEquals(
             listOf(
-                "multicast_waiter", "select_stack", "sigreturn", "tcp_zerocopy", "timer_98260",
+                "multicast_waiter", "select_stack", "sigreturn", "tcp_zerocopy", "timer",
             ),
             config.routeCandidates.map { it.name },
         )
@@ -134,9 +149,9 @@ class RouteCandidatesTest {
     @Test
     fun `the timer choice is remembered and the editor keeps the native route`() = runBlocking {
         val controller = controller("route-candidates-b")
-        assertTrue(controller.selectRoute(release, "timer_98260"))
+        assertTrue(controller.selectRoute(release, "timer"))
         val config = controller.load(release)
-        assertEquals("timer_98260", config.selectedRoute)
+        assertEquals("timer", config.selectedRoute)
         assertEquals("multicast_waiter", config.route)
     }
 
@@ -154,14 +169,14 @@ class RouteCandidatesTest {
     fun `a non-viable selection is refused and cleared`() = runBlocking {
         val controller = controller("route-candidates-d")
         assertFalse(controller.selectRoute(release, "bogus_route"))
-        assertTrue(controller.selectRoute(release, "timer_98260"))
+        assertTrue(controller.selectRoute(release, "timer"))
     }
 
     @Test
     fun `the export keeps the timer block and the native route`() = runBlocking {
         val text = controller("route-candidates-e").renderResolved(release)
         assertNotNull(text)
-        assertTrue(text!!.contains("timer_98260"))
+        assertTrue(text!!.contains("timer"))
         assertTrue(text.contains("select_stack"))
     }
 }

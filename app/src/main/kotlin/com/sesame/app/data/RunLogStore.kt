@@ -107,6 +107,11 @@ internal object RunLogStore {
                 writeMeta(dir, meta.entry, RunLogState.INTERRUPTED)
         }
 
+    /** The stored log text of one retained run; null when it cannot be read. */
+    fun readLog(context: Context, stamp: String): String? = runCatching {
+        File(File(root(context), stamp), LogName).readText()
+    }.getOrNull()
+
     /** Streams one run into [target] as `<stamp>/…`, the shape a report is read in. */
     fun exportZip(context: Context, stamp: String, target: Uri): Boolean = runCatching {
         val dir = File(root(context), stamp)
@@ -306,7 +311,38 @@ internal object RunLogStore {
         SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
 
     internal fun writeMeta(dir: File, entry: String, state: RunLogState): Boolean = runCatching {
-        val text = "entry=$entry\nstate=${state.token}\n"
+        /* Non-state lines (the measured overlay's provenance) survive every
+         * state write, so a finished run still says what it ran with. */
+        val extras = File(dir, MetaName).takeIf { it.isFile }?.readLines().orEmpty()
+            .filterNot { it.startsWith("entry=") || it.startsWith("state=") }
+        val text = buildString {
+            append("entry=$entry\nstate=${state.token}\n")
+            extras.forEach { append("$it\n") }
+        }
+        FileOutputStream(File(dir, MetaName), false).use { out ->
+            out.write(text.toByteArray(StandardCharsets.UTF_8))
+            out.flush()
+            out.fd.syncQuietly()
+        }
+        true
+    }.getOrDefault(false)
+
+    /**
+     * Adds or replaces one non-state meta line (the measured overlay's
+     * provenance) without disturbing `entry=`/`state=`. [line] is `key=value`.
+     */
+    internal fun appendMeta(dir: File, line: String): Boolean = runCatching {
+        val values = File(dir, MetaName).takeIf { it.isFile }?.readLines().orEmpty()
+        val entry = values.firstOrNull { it.startsWith("entry=") } ?: "entry=run"
+        val state = values.firstOrNull { it.startsWith("state=") } ?: "state=running"
+        val key = line.substringBefore('=')
+        val extras = values.filterNot {
+            it.startsWith("entry=") || it.startsWith("state=") || it.startsWith("$key=")
+        } + line
+        val text = buildString {
+            append("$entry\n$state\n")
+            extras.forEach { append("$it\n") }
+        }
         FileOutputStream(File(dir, MetaName), false).use { out ->
             out.write(text.toByteArray(StandardCharsets.UTF_8))
             out.flush()
@@ -327,10 +363,16 @@ internal object RunLogStore {
         Meta(
             entry = values["entry"].orEmpty().ifEmpty { "run" },
             state = RunLogState.fromToken(values["state"].orEmpty()),
+            overlay = values["overlay"],
         )
     }.getOrDefault(Meta("run", RunLogState.INTERRUPTED))
 
-    internal data class Meta(val entry: String, val state: RunLogState)
+    internal data class Meta(
+        val entry: String,
+        val state: RunLogState,
+        /** The measured overlay's provenance (`path:document->effective(source)`). */
+        val overlay: String? = null,
+    )
 }
 
 /**

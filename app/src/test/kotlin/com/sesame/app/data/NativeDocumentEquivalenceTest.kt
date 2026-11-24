@@ -15,9 +15,10 @@ import java.nio.file.Files
 import java.security.MessageDigest
 
 /**
- * Batch 1 wire-equivalence lock: every builtin profile must still produce the
- * exact `NativeProfileDocument.toBinary()` bytes frozen before the refactor
- * (`app/src/test/resources/native-doc-golden.sha256`).
+ * Transport-document equivalence lock: every builtin profile must still
+ * produce the exact rendered document bytes frozen before the refactor
+ * (`app/src/test/resources/native-doc-golden.sha256`). Both backends read this
+ * one document; the digest covers the whole shape, run keys included.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -31,7 +32,7 @@ class NativeDocumentEquivalenceTest {
 
         val root = Files.createTempDirectory("native-doc-equivalence").toFile()
         try {
-            /* The migrated profiles carry their physical pair in a per-device
+            /* The bundled profiles carry their physical pair in a per-device
              * map and their timing null. Resolve each with its authoring device
              * so the frozen bytes still describe the shipped no-op on that
              * device; a device-neutral resolution is covered by
@@ -77,13 +78,11 @@ class NativeDocumentEquivalenceTest {
              * path to regenerate; a normal run compares. */
             val updatePath = System.getenv("UPDATE_NATIVE_DOC_GOLDEN")
             if (updatePath != null) {
-                val stage4Note =
-                    "\n# Re-frozen 2026-10-30 (Stage 4): the eight bundled 5.10 profiles carry the\n" +
-                    "# page-free blocks -- `selinux` (enforcing 0, initialized 2) and `w1_scratch`\n" +
-                    "# (the in-anchor slot on 136/209/226/236; bm_pmd on 81/177/198; the Samsung\n" +
-                    "# array's zero gap on 101). Only those eight documents changed."
+                val transportNote =
+                    "\n# Re-frozen 2026-11-24: the native input is the one rendered JSON\n" +
+                    "# document (the GLK1 wire is gone). Every row moved; no value did."
                 val header = goldenHeader().let {
-                    if (it.contains("Re-frozen 2026-10-30 (Stage 4)")) it else it + stage4Note
+                    if (it.contains("Re-frozen 2026-11-24")) it else it + transportNote
                 }
                 val rows = computed.entries.joinToString("\n") { "${it.key} ${it.value}" }
                 Files.writeString(java.nio.file.Path.of(updatePath), "$header\n$rows\n")
@@ -91,7 +90,7 @@ class NativeDocumentEquivalenceTest {
             }
             for ((release, expected) in golden) {
                 assertEquals(
-                    "$release wire bytes drifted",
+                    "$release transport document drifted",
                     expected,
                     computed.getValue(release),
                 )

@@ -1,56 +1,20 @@
 package com.sesame.app.data.profile
 
 /**
- * The canonical backend document (W2 §1.5): the merged, validated profile as
- * self-contained JSON — quoted keys and strings, numbers, objects and arrays,
- * no includes/comments/substitutions, stable (sorted) key order.
+ * The canonical document writer: the resolved profile tree as self-contained
+ * JSON — quoted keys and strings, numbers, objects and arrays, no
+ * includes/comments/substitutions.
  *
- * The app hands this document to a backend; each backend reads its block. The
- * timer tool reads `release` and `timer_98260` and ignores `kernel`/`native`.
- * The `module` block is the app's own pair manifest: no external backend reads
- * it, but it is rendered so a round-trip preserves it.
- * The native exploit keeps its typed binary wire in W2 (`NativeProfileDocument`
- * is its own encoding of the same merged map); migrating the native to this
- * document is a separate, versioned workstream.
- *
- * Rendering rules: integers whose magnitude exceeds 2^53 are emitted as
- * `"0x..."` strings, because a double-based JSON parser would silently corrupt
- * them; everything else stays a JSON number. The timer block's 64-bit kernel
- * addresses are already quoted hex strings in the profile and pass through.
+ * Every backend reads this one document. Integers whose magnitude exceeds
+ * 2^53 are emitted as `"0x..."` strings, because a double-based JSON parser
+ * would silently corrupt them; kernel addresses are already quoted hex strings
+ * in the profile and pass through.
  */
 object ProfileDocument {
-    /** Shared geometry and facts the native and the timer tool both read. */
-    private val KernelKeys = listOf(
-        "offset", "task_struct", "cred", "kernelsnitch",
-        "kernel_phys_load", "kernel_phys_offset",
-        "waiter_layout", "selinux", "w1_scratch", "kdp",
-    )
-
-    /** The native chain's selection and tuning. */
-    private val NativeKeys = listOf("route", "fallback", "pipeline", "execution")
-
-    /** The timer route's capability block. */
-    private val TimerKey = Timer98260.BLOCK_KEY
-
-    /** The module chain's pair manifest (read by the app, not a native backend). */
-    private val ModuleKey = ModuleBlock.BLOCK_KEY
-
     private const val MAX_EXACT = 1L shl 53
 
-    fun render(merged: Map<String, Any?>): String {
-        val kernel = linkedMapOf<String, Any?>()
-        for (key in KernelKeys) merged[key]?.let { kernel[key] = it }
-        val native = linkedMapOf<String, Any?>()
-        for (key in NativeKeys) merged[key]?.let { native[key] = it }
-        val document = linkedMapOf<String, Any?>(
-            "release" to merged["release"],
-            "schema_version" to merged["schema_version"],
-            "kernel_major" to merged["kernel_major"],
-            "kernel" to kernel,
-            "native" to native,
-            TimerKey to merged[TimerKey],
-            ModuleKey to merged[ModuleKey],
-        )
+    /** Serializes one value tree as the canonical document text. */
+    fun renderJson(document: Map<String, Any?>): String {
         val out = StringBuilder()
         writeValue(out, document, 0)
         out.append('\n')

@@ -48,8 +48,9 @@ Where the pieces live:
   per-field ownership contract), runtime configuration, the frontend handoff
   (`root_child_frontend.*`), stage types, handoff probes and the victim pipe
   context.
-- `profile/`: the GLK1 v2 transport (object sections: `binary.cpp` / `model.h`),
-  its typed model, accessors and entry points.
+- `profile/`: the JSON profile transport (`json.c` tree reader, the ghostlock
+  mapper `json_profile.cpp`, `model.h`, accessors and the entry points every
+  backend shares).
 - `kernel/`: target ABI, constants and offset tables.
 - `support/`: generic C++ result/RAII helpers, time and the fatal-error type.
 - `kernelsnitch/`: kernel-address discovery implementation.

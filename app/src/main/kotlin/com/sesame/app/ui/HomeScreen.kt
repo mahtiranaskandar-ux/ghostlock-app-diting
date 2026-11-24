@@ -169,7 +169,7 @@ internal fun HomeScreen(
 
 private enum class StatusKind { Success, Pending, Action }
 
-private enum class BarAction { Run, Shizuku, Generate }
+private enum class BarAction { Run, Shizuku, Generate, AutoBuiltin, RemoveImport }
 
 private data class StatusCopy(
     val kind: StatusKind,
@@ -244,20 +244,53 @@ private fun statusCopy(state: SessionState, status: SupportStatus): StatusCopy {
         is SupportStatus.AccessPending -> StatusCopy(
             kind = StatusKind.Pending,
             title = stringResource(R.string.shizuku_label),
-            summary = shizukuLine(status.status),
+            summary = shizukuLine(status.status, status.installed),
             detail = detail,
             barLabel = stringResource(R.string.home_action_shizuku),
             action = BarAction.Shizuku,
         )
 
-        SupportStatus.Missing -> StatusCopy(
+        SupportStatus.SelectionUnusable -> StatusCopy(
+            /* The saved copy cannot be used, whatever the reason. There is one
+             * way out — remove the import — and the next step (use the bundle,
+             * generate, or re-import) is the user's choice from there. */
             kind = StatusKind.Action,
-            title = stringResource(R.string.kernel_profile_required),
-            summary = stringResource(R.string.kernel_profile_required_summary),
+            title = stringResource(R.string.imported_profile_unusable),
+            summary = stringResource(R.string.imported_profile_unusable_summary),
             detail = null,
-            barLabel = stringResource(R.string.home_action_generate),
-            action = BarAction.Generate,
+            barLabel = stringResource(R.string.home_action_remove_import),
+            action = BarAction.RemoveImport,
         )
+
+        SupportStatus.Missing -> {
+            /* A hand-picked builtin for another release cannot run here; name
+             * the override instead of the generic "select a profile" state. */
+            val layers = state.support.layers
+            val selectedBuiltin = layers?.builtinRelease?.takeIf { layers.builtinSelected }
+            if (selectedBuiltin != null) {
+                StatusCopy(
+                    kind = StatusKind.Action,
+                    title = stringResource(R.string.home_builtin_override_title),
+                    summary = stringResource(
+                        R.string.home_builtin_override_summary,
+                        selectedBuiltin,
+                        shortRelease(state.device.kernelRelease),
+                    ),
+                    detail = null,
+                    barLabel = stringResource(R.string.home_action_auto_match),
+                    action = BarAction.AutoBuiltin,
+                )
+            } else {
+                StatusCopy(
+                    kind = StatusKind.Action,
+                    title = stringResource(R.string.kernel_profile_required),
+                    summary = stringResource(R.string.kernel_profile_required_summary),
+                    detail = null,
+                    barLabel = stringResource(R.string.home_action_generate),
+                    action = BarAction.Generate,
+                )
+            }
+        }
     }
 }
 
@@ -327,6 +360,8 @@ private fun dispatch(action: BarAction, actions: HomeActions) {
         BarAction.Run -> actions.run()
         BarAction.Shizuku -> actions.statusClick()
         BarAction.Generate -> actions.openGeneration()
+        BarAction.AutoBuiltin -> actions.selectBuiltinAuto()
+        BarAction.RemoveImport -> actions.clearImport()
     }
 }
 
@@ -365,11 +400,16 @@ private fun lastRunSummary(state: SessionState): String = stringResource(    whe
 )
 
 @Composable
-private fun shizukuLine(status: ShizukuStatus): String = stringResource(
-    when (status) {
-        ShizukuStatus.READY -> R.string.shizuku_status_ready
-        ShizukuStatus.PERMISSION_REQUIRED -> R.string.shizuku_status_permission_required
-        ShizukuStatus.NOT_RUNNING -> R.string.shizuku_status_not_running
+private fun shizukuLine(status: ShizukuStatus, installed: Boolean): String = stringResource(
+    when {
+        /* The live status folds "not installed" into NOT_RUNNING; the install
+         * flag splits the instruction, as the timer notice already does. */
+        status == ShizukuStatus.NOT_RUNNING && !installed ->
+            R.string.shizuku_status_missing
+
+        status == ShizukuStatus.READY -> R.string.shizuku_status_ready
+        status == ShizukuStatus.PERMISSION_REQUIRED -> R.string.shizuku_status_permission_required
+        status == ShizukuStatus.NOT_RUNNING -> R.string.shizuku_status_not_running
         else -> R.string.shizuku_status_checking
     },
 )

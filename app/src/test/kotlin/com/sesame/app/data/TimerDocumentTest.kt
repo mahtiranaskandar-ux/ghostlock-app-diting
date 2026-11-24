@@ -16,7 +16,7 @@ import org.robolectric.annotation.Config
 
 /**
  * The timer tool's input is the canonical backend document (W2 §1.5). The
- * entry's applicability fact is the presence of the `timer_98260` block; the
+ * entry's applicability fact is the presence of the `timer` block; the
  * renderer must emit it under its top-level key with the running release.
  */
 @RunWith(RobolectricTestRunner::class)
@@ -46,11 +46,7 @@ class TimerDocumentTest {
         val document = HoconSupport.parseValue(
             AssetConfigLoader(context).load("kernel_profiles/$file"),
         ).asValueMap()
-        val device = document?.let {
-            listOf("kernel_phys_load", "kernel_phys_offset").firstNotNullOfOrNull { key ->
-                (it[key] as? Map<*, *>)?.keys?.firstOrNull()?.toString()
-            }
-        }
+        val device = document?.get("devices").asValueMap()?.keys?.firstOrNull()
         return AndroidProfileConfigController(
             context = context,
             externalProfiles = FakeExternalProfileStore(),
@@ -65,14 +61,15 @@ class TimerDocumentTest {
         val text = controllerFor(ditingFile).renderTimerDocument(diting)
         assertNotNull("no timer document for $diting", text)
         val json = JSONObject(text!!)
-        assertTrue("the timer block is missing", json.has("timer_98260"))
+        assertTrue("the timer block is missing", json.has("timer"))
         assertEquals(diting, json.getString("release"))
-        assertEquals("core_state", json.getJSONObject("timer_98260").getString("trigger"))
-        /* The canonical split: native keys live under "native", never at the
-         * top level, so the tool reads only its own block. */
-        assertTrue(json.has("native"))
+        assertEquals("core_state", json.getJSONObject("timer").getString("trigger"))
+        /* One document for every backend: the engine blocks are siblings and
+         * the tool reads only `timer` (plus the shared `kernel` facts). */
         assertTrue(json.has("kernel"))
+        assertTrue(json.has("ghostlock"))
         assertTrue(!json.has("route"))
+        assertTrue(!json.has("timer_98260"))
     }
 
     @Test

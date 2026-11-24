@@ -1,11 +1,12 @@
 package com.sesame.app.data
 
+import com.sesame.app.data.profile.MeasuredOverlay
 import java.io.File
 import java.nio.charset.StandardCharsets
 
 /** One root-measured or app-probed fact about one kernel. */
 internal data class MeasuredFact(
-    /** Dotted profile path the fact belongs to (`kernelsnitch.mm_struct_sz`). */
+    /** Dotted profile path the fact belongs to (`kernel.heap.stride`). */
     val key: String,
     val value: Long,
     /** Who measured it: [MeasuredProfileStore.SourceRootSlabinfo] or
@@ -27,40 +28,55 @@ internal data class MeasuredKernel(
     fun fact(key: String): MeasuredFact? = facts.firstOrNull { it.key == key }
 
     /**
-     * Facts that name a profile path, i.e. the ones a merge may apply to a
-     * document. The DirtyFrag probe fact and its two companions are runtime
-     * decisions for the pipeline resolver: they stay visible in the
-     * measurements screen, but merged as profile values they would create an
-     * unknown top-level `dirtyfrag` key and the validator would refuse the
-     * whole export. The DB keeps one fact shape; this is the projection the
-     * merge needs.
+     * The facts a merge or the run-time overlay may apply: exactly the
+     * declared measurable set (`MeasuredOverlay.Paths`), and only from a root
+     * measurement. A generation probe is weaker evidence — the generated
+     * profile carries its value, so the probe is shown but never applied or
+     * merged. The DirtyFrag probe trio is a runtime decision for the pipeline
+     * resolver and stays out; a fact under a retired key (e.g.
+     * `kernelsnitch.mm_struct_sz` written by an older build) stays out too —
+     * merging it would add an unknown top-level key and the validator would
+     * refuse the whole export.
      */
-    fun profileFacts(): List<MeasuredFact> = facts.filter { it.key !in ProbeFactKeys }
+    fun profileFacts(): List<MeasuredFact> =
+        facts.filter {
+            it.key in MeasuredOverlay.Paths &&
+                it.source != MeasuredProfileStore.SourceGenerationProbe
+        }
 }
 
-/** The non-profile fact keys [MeasuredKernel.profileFacts] excludes. */
+/** The runtime decision facts: visible in the UI, never merged or overlaid. */
 private val ProbeFactKeys = setOf(
     MeasuredProfileStore.KeyDirtyfragProbe,
     MeasuredProfileStore.KeyDirtyfragProbeRom,
     MeasuredProfileStore.KeyDirtyfragProbeProtocol,
 )
 
+/** Every key a current build understands; a load drops anything else. */
+private val KnownFactKeys = MeasuredOverlay.Paths + ProbeFactKeys
+
 /**
  * The measured database: per-kernel ground truth and one controlled probe fact.
  *
- * Written from the root phase's `/proc/slabinfo` read (after a completed run)
- * and from a **clear** DirtyFrag viability probe result (before W1). The run
- * path reads the store only for the probe fact, in the pipeline resolver's
- * viability step; it never reaches a profile value or a route. A profile value
- * still reaches a run only when the user merges it into a profile and selects
- * that document. Format and rationale: `docs/analysis/measured-db-plan.md`.
+ * Written from the root phase's `/proc/slabinfo` read (after a completed run),
+ * from a **clear** DirtyFrag viability probe result (before W1), and — as
+ * weaker evidence only — from the generation flow's stride probe. The run path
+ * reads it twice: the DirtyFrag probe fact gates the ladder step, and the
+ * root-measured stride is applied by the measured overlay to the resolved map
+ * at render time (`MeasuredOverlay`), never written into the profile document.
+ * A generation probe is excluded from both the overlay and the merge; the
+ * generated profile carries that value itself. The merge preview remains the
+ * way to materialize a root fact into an exported document.
+ * Format and rationale: `docs/analysis/measured-db-plan.md`.
  */
 internal class MeasuredProfileStore(private val file: File) {
     companion object {
         const val SchemaVersion = 1L
         const val SourceRootSlabinfo = "root-slabinfo"
         const val SourceDirtyfragProbe = "dirtyfrag-probe"
-        const val KeyMmStructSz = "kernelsnitch.mm_struct_sz"
+        /** A stride the generation flow's leak-round probe measured. */
+        const val SourceGenerationProbe = "generation-probe"
+        const val KeyMmStructSz = "kernel.heap.stride"
         const val KeyDirtyfragProbe = "dirtyfrag.probe"
         const val KeyDirtyfragProbeRom = "dirtyfrag.probe_rom"
         const val KeyDirtyfragProbeProtocol = "dirtyfrag.probe_protocol"
@@ -132,6 +148,34 @@ internal class MeasuredProfileStore(private val file: File) {
      */
     @Synchronized
     fun record(release: String, fact: MeasuredFact): Boolean = recordAll(release, listOf(fact))
+
+    /**
+     * Records a generation probe's stride as the [KeyMmStructSz] fact, with
+     * the weaker [SourceGenerationProbe] source.
+     *
+     * This is evidence, not authority: the generation flow writes the same
+     * value into the exported document, and `profileFacts()` excludes it, so
+     * it is never applied by the run-time overlay nor merged into an export.
+     * The root phase's `/proc/slabinfo` measurement is ground truth: it is
+     * never replaced by a probe, so choosing the same value in the picker is a
+     * no-op and choosing a different one is refused. A probe may replace an
+     * earlier probe. The value must be a plausible slab object size.
+     */
+    fun recordProbeStride(release: String, value: Long, evidence: String): Boolean {
+        if (value !in PlausibleObjectSize) return false
+        val existing = kernel(release)?.fact(KeyMmStructSz)
+        if (existing != null && existing.source == SourceRootSlabinfo) return false
+        return record(
+            release,
+            MeasuredFact(
+                key = KeyMmStructSz,
+                value = value,
+                source = SourceGenerationProbe,
+                evidence = evidence,
+                measuredAt = System.currentTimeMillis(),
+            ),
+        )
+    }
 
     /**
      * Records a clear DirtyFrag probe result for [release]: the value, the ROM
@@ -231,7 +275,16 @@ internal class MeasuredProfileStore(private val file: File) {
             }
             MeasuredKernel(release, updatedAt, facts.sortedBy { it.key })
         }.sortedBy { it.release }
-        return Loaded(kernels, true)
+        /* A fact under a retired key (written by a pre-v3 build) is dropped
+         * once and the file rewritten, so the measurements screen and every
+         * merge see only keys the current document understands. A write failure
+         * is not fatal: the filter above keeps it out anyway. */
+        val known = kernels.map { kernel ->
+            val kept = kernel.facts.filter { it.key in KnownFactKeys }
+            if (kept.size == kernel.facts.size) kernel else kernel.copy(facts = kept)
+        }
+        if (known != kernels) write(known)
+        return Loaded(known, true)
     }
 
     private fun write(kernels: List<MeasuredKernel>): Boolean = runCatching {

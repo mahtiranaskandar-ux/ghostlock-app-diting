@@ -1,14 +1,12 @@
 package com.sesame.app.data
 
 import android.annotation.SuppressLint
-import android.content.ContentValues
 import android.content.Context
 import android.net.IpSecAlgorithm
 import android.net.IpSecManager
 import android.net.IpSecTransform
 import android.os.Build
 import android.os.SystemClock
-import android.provider.MediaStore
 import android.provider.OpenableColumns
 import android.system.Os
 import android.util.Log
@@ -24,11 +22,12 @@ import com.sesame.app.domain.model.physSourceFromLines
 import com.sesame.app.domain.model.MeasuredFactInfo
 import com.sesame.app.domain.model.MeasuredKernelInfo
 import com.sesame.app.domain.model.MeasurementMergeRow
-import com.sesame.app.domain.model.OffsetCandidate
 import com.sesame.app.data.ota.OtaPayloadExtractor
+import com.sesame.app.data.profile.OverlayFact
+import com.sesame.app.data.profile.OverlayRecord
+import com.sesame.app.data.profile.ProfileResolver
 import com.sesame.app.data.profile.PerDevicePhys
 import com.sesame.app.data.profile.Timer98260
-import com.sesame.app.domain.model.OffsetImportResult
 import com.sesame.app.domain.model.ParseResult
 import com.sesame.app.domain.model.PreflightFailure
 import com.sesame.app.domain.model.PreflightResult
@@ -41,6 +40,7 @@ import com.sesame.app.domain.model.RunLogState
 import com.sesame.app.domain.model.ShizukuStatus
 import com.sesame.app.domain.model.StrideCandidateOption
 import com.sesame.app.domain.model.StrideProbe
+import com.sesame.app.domain.model.StrideProbeOutcome
 import com.sesame.app.domain.model.VrKoMode
 import com.sesame.app.domain.repository.GhostlockRepository
 import com.sesame.app.domain.repository.ProfileConfigController
@@ -66,7 +66,6 @@ import java.util.concurrent.atomic.AtomicReference
 /** Android implementation of the domain repository. All platform I/O lives here. */
 class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private companion object {
-        const val LegacyOffsetsFileName = "offsets.json"
         const val FeasibleReportFileName = "offsets_feasible.json"
         const val OptionsReportFileName = "offsets_options.json"
         const val EditSessionPreferences = "ghostlock_edit_session"
@@ -89,7 +88,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         /** The generated document's release line, for the timer analyzer's template rule. */
         val ReleasePattern = Regex("(?m)^release\\s*=\\s*\"([^\"]+)\"")
         const val PrefForceAttackTest = "force_attack_test"
-        /** Tri-state vr.ko choices, stored as auto/on/off (legacy booleans are migrated). */
+        /** Tri-state vr.ko choices, stored as auto/on/off. */
         const val PrefVrKoTagClear = "vr_ko_tag_clear"
         const val PrefVrKoSelinuxBlock = "vrko_selinux_block"
 
@@ -151,19 +150,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         restoreForceAttackTest()
         restoreVrKoTagClear()
         restoreVrKoSelinuxBlock()
-        dropLegacyOffsetsCache()
-    }
-
-    /** The old JSON offsets cache is not compatible and is discarded. */
-    private fun dropLegacyOffsetsCache() {
-        runCatching { File(filesDir, LegacyOffsetsFileName).delete() }
     }
 
     override suspend fun snapshot(): KernelSnapshot {
         val release = System.getProperty("os.version", "unknown").orEmpty()
-        /* One-time move of the pre-import-copy selection before the support
-         * decision reads the copy. */
-        profileController.migrateLegacyExternalSelection(release)
         /* Shizuku is opt-in only: the toggle is the user's, never seeded from a
          * profile or inferred from a kernel property. */
         val shizukuActive = shizukuEnabled
@@ -264,6 +254,10 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     override suspend fun listRunLogs(): List<RunLogEntry> = withContext(Dispatchers.IO) {
         RunLogStore.list(appContext)
+    }
+
+    override suspend fun readRunLog(stamp: String): String? = withContext(Dispatchers.IO) {
+        RunLogStore.readLog(appContext, stamp)
     }
 
     override suspend fun exportRunLog(stamp: String, documentUri: String): Boolean =
@@ -425,7 +419,6 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         uefiPath: String?,
         vendorBootPath: String?,
         dtboPath: String?,
-        overwrite: Boolean,
         route: String?,
         onLog: (String) -> Unit,
     ): ParseResult {
@@ -459,11 +452,11 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             parsedFile.delete()
             feasibleFile.delete()
             optionsFile.delete()
-            /* The profile is generated for this phone. The v2 map key is the
-             * first non-generic identity (Build.DEVICE, then the vendor, then
-             * the boot image). When every identity is a mainline/vendor
-             * placeholder there is no unique codename: write the legacy v1
-             * all-device form instead of inventing a device key. */
+            /* The profile is generated for this phone. The `devices` map key is
+             * the first non-generic identity (Build.DEVICE, then the vendor,
+             * then the boot image). When every identity is a mainline/vendor
+             * placeholder there is no unique codename: write a device-less
+             * document (`devices = null`) instead of inventing a device key. */
             val deviceKey = DeviceIdentity.uniqueProfileKey()
             val deviceCandidates =
                 DeviceIdentity.candidates(Build.DEVICE, DeviceIdentity.aliases())
@@ -471,7 +464,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 onLog(
                     "identity: all candidates are generic " +
                         "(${deviceCandidates.joinToString(", ")}); " +
-                        "writing a v1 all-device profile",
+                        "writing a device-less document (devices = null)",
                 )
             }
             val args = buildList {
@@ -497,8 +490,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                     add(deviceKey)
                 }
                 /* --format conf: the extractor output is already the flattened
-                 * profile (no includes, credential template inlined), so the
-                 * stored document needs no legacy conversion. */
+                 * v3 document (no includes, credential template inlined), so
+                 * no conversion is needed. */
                 /* --anchor: the diting 5.10 line gets its lock-anchor triple
                  * derived from the image; other families warn and ignore it. */
                 /* --feasible-out: written before an ambiguity exit, so the app
@@ -586,7 +579,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 exit
             }
             val report = feasibleFile.takeIf { it.isFile }?.readText()?.let(FeasibleReport::parse)
-            val options = optionsFile.takeIf { it.isFile }?.readText()?.let(OptionSuperset::parse)
+            /* The options document is the app's picker source and the cut's
+             * base: merge the timer fragment into it too, so a cut carries the
+             * timer block. */
+            val optionsText = optionsFile.takeIf { it.isFile }?.readText()
+            val options = optionsText?.let { text ->
+                val merged = timerBlock?.let { mergeTimerFragment(text, it) } ?: text
+                OptionSuperset.parse(merged)
+            }
             if (code == 7) {
                 val routes = report?.routes.orEmpty()
                 if (routes.none { it.verdict == FeasibleReport.VerdictFeasible }) {
@@ -597,7 +597,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             if (code != 0 || !parsedFile.isFile) return ParseResult.Failed(code)
             val document = parsedFile.readText()
             val generated = timerBlock?.let { block ->
-                document.trimEnd() + "\n\n" + block.trimEnd() + "\n"
+                mergeTimerFragment(document, block) ?: document
             } ?: document
             val fresh = parseEntries(document) ?: return ParseResult.Failed(code, "invalid extractor output")
             /* The document is returned, never stored: the app keeps no profile
@@ -608,21 +608,27 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 .filter { (it["release"] as? String).orEmpty().isNotEmpty() }
             if (filtered.isEmpty()) return ParseResult.AlreadyPresent
             val releases = freshReleases(filtered)
-            /* A v2 document carries the pair as a per-device map; the presence
-             * checks must see this device's entry, not `getLongAt` on a map. */
+            /* The document is the cleaned v3 tree: the pair lives in the
+             * running device's `devices.<id>.phys` entry, and the anchor is
+             * `ghostlock.anchor`. The presence checks read those, not the
+             * retired top-level spellings. */
             val resolved = filtered.map { resolvedForDevice(it, deviceCandidates) }
             val missing = missingSidecarFields(resolved)
             val name = parsedDocumentName(releases)
+            val anchor = parseEntries(generated)
+                ?.firstNotNullOfOrNull { it.asValueMap() }
+                ?.let { ProfileResolver.anchorOf(it) }
             ParseResult.Parsed(
                 releases = releases,
                 missing = missing,
                 documentName = name,
                 route = report?.chosen ?: route,
                 anchor = anchorLine(captured),
-                hasAnchor = generated.contains("lock_anchor_image"),
+                hasAnchor = anchor?.first != null,
                 physSource = physSourceFromLines(captured),
-                physLoadPresent = resolved.any { it.getLongAt("kernel_phys_load") != null },
-                physOffsetPresent = resolved.any { it.getLongAt("kernel_phys_offset") != null },
+                physLoadPresent = resolved.any { ProfileResolver.physOf(it).first != null },
+                physOffsetPresent = resolved.any { ProfileResolver.physOf(it).second != null },
+                timerDerived = timerBlock != null,
                 documentText = generated,
                 options = options,
             )
@@ -640,7 +646,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     }
 
     /**
-     * Derives the image's `timer_98260` block (the timer route's per-image
+     * Derives the image's `timer` block (the timer route's per-image
      * constants) with the vendored timer analyzer. The block is optional
      * metadata: any failure logs and returns null, leaving a native-only
      * profile. It is validated here with the same parser the timer route's
@@ -714,18 +720,18 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         release: String,
         documentText: String,
         onLog: (String) -> Unit,
-    ): StrideProbe? {
+    ): StrideProbeOutcome {
         /* The probe frame is the generated document, built in memory; nothing
          * is selected or stored (measured-db-plan §1). */
         val blob = profileController.nativeDocumentFor(documentText, release)
-            ?: return null
+            ?: return StrideProbeOutcome.Failed("the probe document could not be rendered")
         val binary = File(appContext.applicationInfo.nativeLibraryDir, NativeBinaryName)
-        if (!binary.isFile) return null
+        if (!binary.isFile) return StrideProbeOutcome.Failed("the native probe binary is missing")
         val lines = mutableListOf<String>()
         val exit = runProcess(
             /* --enable-status-record selects the length-prefixed stdin frame
-             * (`read_glk1_frame_stdin`); without it the native reads the bare
-             * document and blocks on the app's length prefix. */
+             * (`read_profile_frame_stdin`); without it the native reads the
+             * bare document and blocks on the app's length prefix. */
             ProcessBuilder(
                 listOf(
                     binary.absolutePath,
@@ -755,10 +761,18 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
             frameStdin = true,
         )
         onLog("stride: probe exit=$exit captured=${lines.size}")
-        if (exit != 0) return null
+        if (exit != 0) {
+            /* Any non-zero exit is a step failure, not a verdict: the probe is
+             * required whenever it runs (the W1 ladder is sized by the stride),
+             * so the caller must not fall through to the save step. */
+            return StrideProbeOutcome.Failed("the probe exited $exit")
+        }
         val probe = parseStrideProbe(lines)
-        if (probe == null) onLog("stride: no candidate table")
-        return probe
+        if (probe == null) {
+            onLog("stride: no candidate table")
+            return StrideProbeOutcome.Failed("the probe produced no candidate table")
+        }
+        return StrideProbeOutcome.Probed(probe)
     }
 
     override fun applyLockSourceToDocument(
@@ -766,21 +780,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         keepAnchor: Boolean,
     ): String? = if (keepAnchor) documentText else stripLockAnchor(documentText)
 
-    override fun applyStrideToDocument(
-        documentText: String,
+    override fun materializeStride(documentText: String, value: Int): String? =
+        materializeDocumentStride(documentText, value.toLong())
+
+    override fun documentRequiresStride(documentText: String): Boolean {
+        val document = HoconSupport.parseValue(documentText).asValueMap() ?: return false
+        return ProfileResolver.requiresW1(ProfileResolver.pipelineOrder(document))
+    }
+
+    override suspend fun recordGenerationStride(
         release: String,
-        stride: Int?,
-    ): String? {
-        val entries = ProfileDocumentParser.entries(documentText) ?: return null
-        val targets = entries.filter { it["release"] == release }
-        if (targets.isEmpty()) return null
-        for (entry in targets) {
-            val snitch = entry.mutableChild("kernelsnitch")
-            if (stride != null) snitch["mm_struct_sz"] = stride.toLong() else snitch.remove("mm_struct_sz")
-            if (snitch.isEmpty()) entry.remove("kernelsnitch")
-        }
-        val document = if (entries.size == 1) entries.first() else ValueList().apply { addAll(entries) }
-        return HoconSupport.render(document)
+        value: Int,
+        evidence: String,
+    ): Boolean = withContext(Dispatchers.IO) {
+        measuredProfiles.recordProbeStride(release, value.toLong(), evidence)
     }
 
     private fun parseStrideProbe(lines: List<String>): StrideProbe? {
@@ -818,7 +831,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
 
     /** The extractor's first anchor decision line, or null when none ran. */
     private fun anchorLine(lines: List<String>): String? = lines.firstOrNull {
-        it.contains("lock anchor") && (it.startsWith("info:") || it.startsWith("warning:"))
+        it.contains("anchor") && (it.startsWith("info:") || it.startsWith("warning:"))
     }
 
     /**
@@ -972,7 +985,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         withDebugAttackLog("timer-probe", onLog) { archivedLog, _, _, writeSidecar ->
             val release = deviceRelease()
             val document = profileController.renderTimerDocument(release) ?: run {
-                archivedLog("<s> error: no timer_98260 profile for $release")
+                archivedLog("<s> error: no timer profile for $release")
                 return@withDebugAttackLog 1
             }
             writeSidecar("timer-profile.json", document.toByteArray(StandardCharsets.UTF_8))
@@ -1004,13 +1017,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         val code = withDebugAttackLog("timer", onLog) { archivedLog, _, _, writeSidecar ->
             val release = deviceRelease()
             val document = profileController.renderTimerDocument(release) ?: run {
-                archivedLog("<s> error: no way-2 timer_98260 profile for $release")
+                archivedLog("<s> error: no way-2 timer profile for $release")
                 return@withDebugAttackLog TimerVerdict.NotStarted
             }
             writeSidecar("timer-profile.json", document.toByteArray(StandardCharsets.UTF_8))
             /* The run log carries both: the exact runtime document the tool
-             * consumed, and the resolved profile source (the superset context
-             * — every route block, the `routes` order and the provenance). */
+             * consumed, and the resolved v3 document (every route block and the
+             * provenance). */
             runCatching { profileController.renderResolvedForDebug(release) }
                 .getOrNull()
                 ?.let { writeSidecar("profile.conf", it.toByteArray(StandardCharsets.UTF_8)) }
@@ -1069,13 +1082,20 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         /* The Shizuku service runs as uid 2000 and cannot write the app's run
          * folder; the module sidecar is a direct-entry diagnostic. Its AIDL also
          * carries no vr.ko mode, so that entry runs Auto. */
-        return withDebugAttackLog("shizuku", onLog, measure = true) { archivedLog, debugDir, _, writeSidecar ->
+        return withDebugAttackLog("shizuku", onLog, measure = true) { archivedLog, debugDir, runDir, writeSidecar ->
             archivedLog("<s> resolving profile")
             val release = System.getProperty("os.version", "").orEmpty()
             /* The Shizuku path runs GhostLock only (the order check below
-             * refuses a list without it); the wire carries that resolution so
-             * the native's cross-check covers this invocation too. */
-            val profileBlob = profileController.nativeDocument(config, "ghostlock")
+             * refuses a list without it); the document's `mode` carries that
+             * resolution so the native's cross-check covers this invocation too. */
+            val render = profileController.nativeDocumentWithOverlay(
+                config,
+                "ghostlock",
+                safeModeEnabled,
+                measuredFacts(release),
+            )
+            render?.let { logOverlay(it.overlay, archivedLog, runDir) }
+            val profileBlob = render?.bytes
             archivedLog(
                 "<s> profile resolved hasProfile=${config.hasProfile} " +
                     "blob=${profileBlob?.size ?: 0} invalid=${config.invalidPaths.size}",
@@ -1096,13 +1116,7 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 }
 
                 else -> {
-                    val order = config.pipelineOrder.ifEmpty { listOf("ghostlock") }
-                    if (config.pipelineOrder.isEmpty()) {
-                        archivedLog(
-                            "<s> pipeline=ghostlock (legacy default; profile has no " +
-                                "pipeline key)",
-                        )
-                    }
+                    val order = config.pipelineOrder
                     if ("ghostlock" !in order) {
                         archivedLog(
                             "<s> error: profile pipeline order=${order.joinToString(",")}; " +
@@ -1110,15 +1124,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         )
                         return@withDebugAttackLog 1
                     }
-                    /* Mirror the UserService patch so the dumped blob is the
-                     * effective one native will actually receive. */
-                    val runtimeBlob = if (safeModeEnabled) {
-                        NativeProfileDocument.patchSafeMode(profileBlob) ?: profileBlob
-                    } else {
-                        profileBlob
-                    }
-                    logProfileDigest(archivedLog, runtimeBlob)
-                    dumpRuntimeProfile(archivedLog, writeSidecar, release, runtimeBlob)
+                    logProfileDigest(archivedLog, profileBlob)
+                    dumpRuntimeProfile(archivedLog, writeSidecar, release, profileBlob)
                     archivedLog("<b> starting UserService")
                     resetRunState()
                     shizukuRunner.run(
@@ -1305,33 +1312,21 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
     private fun logProfileLayers(log: (String) -> Unit, config: ProfileConfig) {
         val layers = config.layers ?: return
         log("<k> profile layers: ${layers.describe()}")
-        if (layers.uncarriedKeys.isNotEmpty()) {
-            log(
-                "<k> warning: profile carries keys no wire section declares: " +
-                    layers.uncarriedKeys.joinToString(),
-            )
-        }
     }
 
     /**
-     * The digest the app just put in the blob native receives (§E.18); native
-     * recomputes and logs its own, and refuses the run on a mismatch.
+     * The document's identity: its sha256, quoted in the run log and matching
+     * the `profile.json` sidecar byte for byte, so a device failure is
+     * replayable host-side.
      */
     private fun logProfileDigest(log: (String) -> Unit, blob: ByteArray) {
-        val digest = NativeProfileDocument.digestOf(blob)
-        log(
-            if (digest == null) {
-                "<k> profile digest: absent"
-            } else {
-                "<k> profile digest=0x%016x".format(digest.toLong())
-            },
-        )
+        val text = String(blob, StandardCharsets.UTF_8)
+        log("<k> profile document ${blob.size}B sha256=${sha256Of(text)}")
     }
 
     /**
-     * Writes the effective runtime profile into the attempt folder: the resolved
-     * HOCON (`profile.conf`) and the exact GLK1 v2 bytes handed to native
-     * (`profile.bin`). No-op when debug export is disabled.
+     * Writes the exact document handed to the backend into the attempt folder
+     * (`profile.json`). No-op when debug export is disabled.
      */
     private fun dumpRuntimeProfile(
         log: (String) -> Unit,
@@ -1339,14 +1334,8 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         release: String,
         blob: ByteArray?,
     ) {
-        val conf = runCatching { profileController.renderResolvedForDebug(release) }.getOrNull()
-        val confWritten = conf?.let {
-            writeSidecar("profile.conf", it.toByteArray(StandardCharsets.UTF_8))
-        } ?: false
-        val blobWritten = blob?.let { writeSidecar("profile.bin", it) } ?: false
-        if (confWritten || blobWritten) {
-            log("<k> runtime profile written: profile.conf/profile.bin")
-        }
+        val written = blob?.let { writeSidecar("profile.json", it) } ?: false
+        if (written) log("<k> runtime profile written: profile.json ($release)")
     }
 
     override fun requestShizukuPermission() = shizukuRunner.requestPermission()
@@ -1622,25 +1611,16 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                         config.invalidPaths.take(6).joinToString(),
                 )
             }
-            /* The profile carries an ordered pipeline list; resolve it before
-             * W1. GhostLock is viable on its static verdict (the profile
-             * validator refuses a KDP list containing it). DirtyFrag needs the
-             * ROM preflight and the primitive probe (or a matching measured-DB
-             * record). No fallback after W1; a failed stage is restore/reboot. */
+            /* The document's ladder is resolved before W1. GhostLock is viable
+             * on its static verdict (the validator refuses a KDP document whose
+             * ladder contains it). DirtyFrag needs the ROM preflight and the
+             * primitive probe (or a matching measured-DB record). No fallback
+             * after W1; a failed stage is restore/reboot. */
             var moduleRun: ModuleRun? = null
             val pipeline = run {
-                val order = when {
-                    config.pipelineOrder.isEmpty() -> {
-                        onLog(
-                            "<k> pipeline=ghostlock (legacy default; profile has no " +
-                                "pipeline key)",
-                        )
-                        listOf("ghostlock")
-                    }
-                    else -> config.pipelineOrder
-                }
-                /* The DirtyFrag box: off trims the profile's ordered pipeline
-                 * to GhostLock for this run; the profile keeps the capability. */
+                val order = config.pipelineOrder
+                /* The DirtyFrag box: off trims the derived ladder to GhostLock
+                 * for this run; the document keeps the capability. */
                 val effectiveOrder = if (config.dirtyFragSelectable && !config.dirtyFragOn) {
                     onLog("<k> pipeline: dirtyfrag off (GhostLock only)")
                     order.filter { it != "dirtyfrag" }.ifEmpty { listOf("ghostlock") }
@@ -1700,9 +1680,13 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                                 "module pipeline is bundled-only " +
                                     "(the bundled profile is not authoritative)"
                             else -> {
+                                /* The module chain writes the larger stub (it
+                                 * carries the insmod prologue), so it is
+                                 * measured against that blob. */
                                 val rom = DirtyfragPlan.preflight(
                                     appContext,
                                     File("/system/lib64/libc++.so"),
+                                    moduleMode = true,
                                 )
                                 if (!rom.feasible) {
                                     "ROM preflight: " + rom.reasons.joinToString("; ")
@@ -1761,13 +1745,14 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
                 onLog("<b> pipeline=module: stage exited code=$moduleCode")
                 return moduleCode
             }
-            var profileBlob = profileController.nativeDocument(config, pipeline)
-                ?: error("profile is unavailable for $release")
-            // v2: safe_mode lives in the meta section; there is no fixed slot
-            // offset, so the blob is rescanned and rewritten.
-            if (safeModeEnabled) {
-                profileBlob = NativeProfileDocument.patchSafeMode(profileBlob) ?: profileBlob
-            }
+            val render = profileController.nativeDocumentWithOverlay(
+                config,
+                pipeline,
+                safeModeEnabled,
+                measuredFacts(release),
+            ) ?: error("profile is unavailable for $release")
+            logOverlay(render.overlay, onLog, runDir)
+            val profileBlob = render.bytes
             logProfileDigest(onLog, profileBlob)
             dumpRuntimeProfile(onLog, writeSidecar, release, profileBlob)
             val ksuOffset = AtomicLong()
@@ -1984,6 +1969,38 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         editSessionTargetRelease = null
     }
 
+    /* ---- measured overlay (plan decision 13, §3.3) ---- */
+
+    /** The measured DB's overlay facts for [release]; only the declared set. */
+    private fun measuredFacts(release: String): List<OverlayFact> =
+        measuredProfiles.kernel(release)?.profileFacts().orEmpty()
+            .map { OverlayFact(path = it.key, value = it.value, source = it.source) }
+
+    /**
+     * Logs every fact the overlay applied (document vs effective, with the
+     * source) and records the same provenance in the run-store meta. A
+     * disagreement is an extractor defect and gets its own warning.
+     */
+    private fun logOverlay(records: List<OverlayRecord>, log: (String) -> Unit, runDir: String?) {
+        if (records.isEmpty()) return
+        for (record in records) {
+            log(
+                "<k> overlay: ${record.path} document=${record.documentValue ?: "null"} " +
+                    "effective=${record.effectiveValue} (${record.source})",
+            )
+            if (record.disagrees) {
+                log(
+                    "<k> warning: ${record.path} measured ${record.effectiveValue} " +
+                        "disagrees with the document's ${record.documentValue}",
+                )
+            }
+        }
+        val line = records.joinToString("; ") {
+            "${it.path}:${it.documentValue ?: "null"}->${it.effectiveValue}(${it.source})"
+        }
+        runDir?.let { RunLogStore.appendMeta(File(it), "overlay=$line") }
+    }
+
     /* ---- measured database merge ---- */
 
     override suspend fun measurementMergeDiff(): List<MeasurementMergeRow> =
@@ -2050,8 +2067,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         runCatching { PerDevicePhys.resolveFor(entry, candidates).document }.getOrDefault(entry)
 
     private fun missingSidecarFields(entries: List<ValueMap>): Set<String> =
-        if (entries.isNotEmpty() && entries.all { it.getLongAt("kernel_phys_load") == null }) {
-            setOf("kernel_phys_load")
+        if (entries.isNotEmpty() && entries.all { ProfileResolver.physOf(it).first == null }) {
+            val device = entries.firstOrNull()?.get("devices").asValueMap()?.keys?.firstOrNull()
+            setOf(if (device != null) "devices.$device.phys.load" else "devices.*.phys.load")
         } else {
             emptySet()
         }
@@ -2083,13 +2101,9 @@ class AndroidGhostlockRepository(context: Context) : GhostlockRepository {
         vrKoSelinuxBlock = readVrKoMode(PrefVrKoSelinuxBlock)
     }
 
-    /**
-     * Reads a tri-state preference. The unreleased v2 build stored a boolean:
-     * true maps to Auto (never a forced On) and false to Off.
-     */
+    /** Reads a tri-state preference (`auto`/`on`/`off`). */
     private fun readVrKoMode(key: String): VrKoMode =
         when (val raw = preferences.all[key]) {
-            is Boolean -> if (raw) VrKoMode.AUTO else VrKoMode.OFF
             is String -> VrKoMode.fromWire(raw)
             else -> VrKoMode.AUTO
         }

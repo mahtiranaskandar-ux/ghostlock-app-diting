@@ -39,9 +39,10 @@ data class SessionState(
     @Stable
     data class SupportState(
         val hasProfile: Boolean = false,
+        /** The resolved document carries validation errors, so the run is blocked. */
+        val profileInvalid: Boolean = false,
         val release: String = "",
         val route: String? = null,
-        val fallback: String? = null,
         val importedProfilePresent: Boolean = false,
         val activeBuiltinProfile: String? = null,
         val layers: ProfileLayers? = null,
@@ -52,13 +53,13 @@ data class SessionState(
         /** The active native route's carriers, and the remembered choice. */
         val carrierCandidates: List<String> = emptyList(),
         val selectedCarrier: String? = null,
-        /** DirtyFrag is a choice when the profile's pipeline lists both entries. */
+        /** DirtyFrag is a choice when the document's ladder offers both engines. */
         val dirtyFragSelectable: Boolean = false,
         val dirtyFragOn: Boolean = false,
-        /** The profile's ordered pipeline (the DirtyFrag list's capability source). */
+        /** The document's derived ladder (the DirtyFrag capability source). */
         val pipelineOrder: List<String> = emptyList(),
         /**
-         * The module chain's pair manifest, when `pipeline` selects `module`.
+         * The module chain's pair manifest, when the ladder selects `module`.
          * The chain has no route to pick, so the home and the parameters screen
          * present this block instead of a route line.
          */
@@ -74,6 +75,8 @@ data class SessionState(
     data class AccessState(
         val shizukuEnabled: Boolean = false,
         val shizukuStatus: ShizukuStatus = ShizukuStatus.NOT_REQUIRED,
+        /** The manager package is installed; NOT_RUNNING alone folds "absent". */
+        val shizukuInstalled: Boolean = false,
         /** Root-manager choice (package name); null means Auto. */
         val selectedManagerPackage: String? = null,
     )
@@ -96,6 +99,8 @@ data class SessionState(
         val logLines: List<GhostlockLogLine> = emptyList(),
         val sheetVisible: Boolean = false,
         val sheetDismissible: Boolean = false,
+        /** Wall-clock start of the run, for the sheet's elapsed line. */
+        val startedAtMs: Long = 0,
     )
 
     /** The measured database and the facts that would change the profile. */

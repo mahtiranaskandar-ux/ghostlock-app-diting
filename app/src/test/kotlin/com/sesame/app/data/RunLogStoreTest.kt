@@ -241,4 +241,25 @@ class RunLogStoreTest {
         assertEquals(RunLogState.INTERRUPTED, RunLogState.fromToken(""))
         assertEquals(RunLogState.INTERRUPTED, RunLogState.fromToken("garbage"))
     }
+
+    @Test
+    fun `the overlay provenance survives the terminal state write`() {
+        val root = root()
+        val stamp = "20261009-130000"
+        val writer = RunLogStore.open(root, "direct", stamp)
+        val dir = File(root, stamp)
+        assertTrue(
+            RunLogStore.appendMeta(
+                dir,
+                "overlay=kernel.heap.stride:null->960(root-slabinfo)",
+            ),
+        )
+        writer.finish(RunLogState.COMPLETED)
+        writer.close()
+
+        val meta = RunLogStore.readMeta(dir)
+        assertEquals(RunLogState.COMPLETED, meta.state)
+        assertEquals("direct", meta.entry)
+        assertEquals("kernel.heap.stride:null->960(root-slabinfo)", meta.overlay)
+    }
 }

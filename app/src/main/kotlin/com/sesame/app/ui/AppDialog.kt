@@ -31,6 +31,8 @@ sealed interface AppDialog {
 
     data class ListDialog(
         override val titleRes: Int,
+        /** Optional explanation above the choices (the phys image prompts). */
+        val messageRes: Int = 0,
         val items: List<String> = emptyList(),
         val itemResIds: List<Int> = emptyList(),
         /** Optional success-grade chip per item (route picker). */

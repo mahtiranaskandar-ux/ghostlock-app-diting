@@ -288,24 +288,36 @@ pub struct Provenance<'a> {
     pub layouts: &'a LayoutFacts,
 }
 
-/// Builds the fact table for a `--format conf` profile. It mirrors the keys
-/// `render_conf` writes; it never changes them.
-pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable {
+/// Builds the fact table for a `--format conf` profile. It mirrors the v3
+/// document's key paths; it never changes them.
+pub fn explain_conf(
+    input: &ConfInputs<'_>,
+    prov: &Provenance<'_>,
+    device: Option<&str>,
+) -> FactTable {
     let mut table = FactTable::new();
     let major = prov
         .release
         .split('.')
         .next()
         .and_then(|part| part.parse::<u32>().ok());
+    let device_label = device.unwrap_or("<device>");
+    /* The document states a physical pair only when both a device name and a
+     * load are known (`document::build`); otherwise `devices = null`. */
+    let phys_stated = device.is_some() && input.phys.is_some();
 
     let (phys_source, phys_confidence) = phys_provenance(prov.phys_source);
     table.push(
-        "kernel_phys_load",
+        format!("devices.{device_label}.phys.load"),
         Fact::new(
-            hex_or_null(input.phys),
+            if phys_stated {
+                hex_or_null(input.phys)
+            } else {
+                "null".to_string()
+            },
             Domain::PhysicalAddress,
-            phys_source,
-            phys_confidence,
+            if phys_stated { phys_source } else { Source::Unknown },
+            if phys_stated { phys_confidence } else { Confidence::Unknown },
         ),
     );
     let (offset_source, offset_confidence) = if input.phys_offset.is_some() {
@@ -314,23 +326,28 @@ pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable 
         (Source::CompiledDefault, Confidence::Default)
     };
     table.push(
-        "kernel_phys_offset",
+        format!("devices.{device_label}.phys.offset"),
         Fact::new(
-            hex_or_null(input.phys_offset),
+            if phys_stated {
+                hex_or_null(input.phys_offset)
+            } else {
+                "null".to_string()
+            },
             Domain::PhysicalAddress,
-            offset_source,
-            offset_confidence,
+            if phys_stated { offset_source } else { Source::Unknown },
+            if phys_stated { offset_confidence } else { Confidence::Unknown },
         ),
     );
 
     if let Some(route) = input.route {
+        let carrier = carrier_name(route, input.route_geometry);
         let (source, confidence) = if prov.route_forced {
             (Source::Operator, Confidence::Default)
         } else {
             (Source::Disassembly, Confidence::Derived)
         };
         table.push(
-            "route",
+            "ghostlock.syscall",
             Fact::new(route, Domain::EnumValue, source, confidence),
         );
         if let Some((_, fields)) = CONF_ROUTE_FIELDS.iter().find(|(name, _)| *name == route) {
@@ -340,18 +357,22 @@ pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable 
                     .iter()
                     .find(|(key, _)| key == field)
                     .map(|(_, value)| value.to_string());
-                push_route_field(&mut table, route, field, value);
+                push_route_field(&mut table, route, carrier, field, value);
             }
         }
         for (key, value) in input.route_geometry {
-            let full = format!("route.{route}.{key}");
-            if !table.rows().iter().any(|row| row.key == full) {
-                push_route_field(&mut table, route, key, Some(value.to_string()));
+            /* The carrier selector is an input flag, not a document key. */
+            if *key == "compat_carrier" {
+                continue;
+            }
+            let path = route_fact_path(route, carrier, key);
+            if !table.rows().iter().any(|row| row.key == path) {
+                push_route_field(&mut table, route, carrier, key, Some(value.to_string()));
             }
         }
     } else {
         table.push(
-            "route",
+            "ghostlock.syscall",
             Fact::new("null", Domain::EnumValue, Source::Unknown, Confidence::Unknown),
         );
     }
@@ -360,7 +381,7 @@ pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable 
         let value = input.structs.get(*name).copied().flatten();
         let (source, confidence) = task_provenance(prov, name, value.is_some());
         table.push(
-            format!("task_struct.{key}"),
+            format!("kernel.struct.task.{key}"),
             Fact::new(
                 display_or_null(value),
                 Domain::FieldOffset,
@@ -370,6 +391,11 @@ pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable 
         );
     }
 
+    let ref_count = input
+        .cred
+        .iter()
+        .find(|(candidate, _)| candidate == "ref_count")
+        .and_then(|(_, value)| value.trim().parse::<u32>().ok());
     for key in CONF_CRED_FIELDS {
         let value = input
             .cred
@@ -377,13 +403,16 @@ pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable 
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value.clone())
             .unwrap_or_else(|| "null".to_string());
+        let Some(path) = cred_fact_path(key, ref_count) else {
+            continue;
+        };
         let (source, confidence) = if value == "null" {
             (Source::Unknown, Confidence::Unknown)
         } else {
             cred_provenance(prov, key, major)
         };
         table.push(
-            format!("cred.{key}"),
+            path,
             Fact::new(value, cred_domain(key), source, confidence),
         );
     }
@@ -400,8 +429,15 @@ pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable 
         } else {
             (Source::Kallsyms, Confidence::Derived)
         };
+        let symbol = match *key {
+            "selinux_enforcing" => "selinux_state",
+            "slide_nfulnl_logger" => "nf_logger",
+            "slide_loggers_0_1" => "loggers_0_1",
+            "slide_boot_id" => "boot_id",
+            other => other,
+        };
         table.push(
-            format!("offset.{key}"),
+            format!("kernel.symbols.{symbol}"),
             Fact::new(value, Domain::ImageOffset, source, confidence),
         );
     }
@@ -416,7 +452,7 @@ pub fn explain_conf(input: &ConfInputs<'_>, prov: &Provenance<'_>) -> FactTable 
         None
     };
     table.push(
-        "kernelsnitch.collisions",
+        "kernel.heap.collisions",
         Fact::new(
             display_or_null(collisions),
             Domain::EnumValue,
@@ -505,24 +541,106 @@ fn cred_domain(key: &str) -> Domain {
     }
 }
 
+/// The named ref slot a `refN_*` index denotes for the image's ref count.
+/// `None` for an index the layout does not carry.
+fn ref_slot(index: usize, ref_count: Option<u32>) -> Option<&'static str> {
+    match (ref_count, index) {
+        (Some(3), 0) => Some("user"),
+        (Some(3), 1) => Some("user_ns"),
+        (Some(3), 2) => Some("group_info"),
+        (Some(3), _) => None,
+        (_, 0) => Some("user"),
+        (_, 1) => Some("user_ns"),
+        (_, 2) => Some("ucounts"),
+        (_, 3) => Some("group_info"),
+        _ => None,
+    }
+}
+
+/// The v3 document path of one credential fact; `None` when the fact has no
+/// document key (a ref slot the image's layout does not carry).
+fn cred_fact_path(key: &str, ref_count: Option<u32>) -> Option<String> {
+    match key {
+        "copy_size" => Some("kernel.struct.cred.copy_size".to_string()),
+        "usage_offset" => Some("kernel.struct.cred.usage.offset".to_string()),
+        "usage_value" => Some("kernel.struct.cred.usage.value".to_string()),
+        "caps_offset" => Some("kernel.struct.cred.caps.offset".to_string()),
+        "caps_count" => Some("kernel.struct.cred.caps.count".to_string()),
+        "caps_value" => Some("kernel.struct.cred.caps.mask".to_string()),
+        "ref_count" => Some("kernel.struct.cred.refs".to_string()),
+        key if key.starts_with("ref")
+            && (key.ends_with("_offset") || key.ends_with("_image")) =>
+        {
+            let index = key
+                .as_bytes()
+                .get(3)
+                .copied()
+                .and_then(|digit| (b'0'..=b'9').contains(&digit).then(|| (digit - b'0') as usize))
+                .unwrap_or(3);
+            let field = if key.ends_with("_offset") { "offset" } else { "image" };
+            ref_slot(index, ref_count)
+                .map(|slot| format!("kernel.struct.cred.refs.{slot}.{field}"))
+        }
+        _ => Some(format!("kernel.struct.cred.{key}")),
+    }
+}
+
+/// The carrier a route's geometry describes (the document's selection rule).
+fn carrier_name(route: &str, geometry: &[(&'static str, i64)]) -> &'static str {
+    let compat = geometry
+        .iter()
+        .any(|(key, value)| *key == "compat_carrier" && *value == 1);
+    match route {
+        "select_stack" | "multicast_waiter" if compat => "compat",
+        _ => "native",
+    }
+}
+
+/// The v3 document path of one route-geometry fact.
+fn route_fact_path(route: &str, carrier: &str, key: &str) -> String {
+    match key {
+        "lock_anchor_image" => "ghostlock.anchor.image".to_string(),
+        "lock_anchor_bytes" => "ghostlock.anchor.bytes".to_string(),
+        "lock_anchor_stride" => "ghostlock.anchor.stride".to_string(),
+        "task_offset" => "kernel.struct.waiter.task".to_string(),
+        "lock_offset" => "kernel.struct.waiter.lock".to_string(),
+        "compact_waiter" => "kernel.struct.waiter.shape".to_string(),
+        "compat_futex_abi" => format!("ghostlock.syscalls.{route}.compat.futex_abi"),
+        "select_dst_depth" => format!("ghostlock.syscalls.{route}.compat.dst_depth"),
+        "compat_waiter_off" => format!("ghostlock.syscalls.{route}.compat.waiter_off"),
+        "compat_buffer_size" => format!("ghostlock.syscalls.{route}.compat.buffer_size"),
+        "waiter_off_plain" => "ghostlock.syscalls.sigreturn.native.waiter_off.plain".to_string(),
+        "waiter_off_sve" => "ghostlock.syscalls.sigreturn.native.waiter_off.sve".to_string(),
+        _ => format!("ghostlock.syscalls.{route}.{carrier}.{key}"),
+    }
+}
+
 fn route_field_domain(key: &str) -> Domain {
     match key {
         "lock_anchor_image" => Domain::ImageOffset,
-        "lock_anchor_bytes" | "lock_anchor_stride" | "buffer_size" => Domain::SizeOf,
-        "compact_waiter" => Domain::EnumValue,
+        "lock_anchor_bytes" | "lock_anchor_stride" | "buffer_size" | "compat_buffer_size" => {
+            Domain::SizeOf
+        }
+        "compact_waiter" | "compat_futex_abi" | "futex_abi" => Domain::EnumValue,
         "task_offset" | "lock_offset" => Domain::FieldOffset,
         _ => Domain::FrameDepth,
     }
 }
 
-fn push_route_field(table: &mut FactTable, route: &str, key: &str, value: Option<String>) {
+fn push_route_field(
+    table: &mut FactTable,
+    route: &str,
+    carrier: &str,
+    key: &str,
+    value: Option<String>,
+) {
     let (source, confidence) = if value.is_some() {
         (Source::Disassembly, Confidence::Derived)
     } else {
         (Source::Unknown, Confidence::Unknown)
     };
     table.push(
-        format!("route.{route}.{key}"),
+        route_fact_path(route, carrier, key),
         Fact::new(
             value.unwrap_or_else(|| "null".to_string()),
             route_field_domain(key),
@@ -545,6 +663,7 @@ mod tests {
         extra: &'a ConfExtraOffsets,
     ) -> ConfInputs<'a> {
         ConfInputs {
+            image_base: None,
             pipeline_order: &[],
             kdp: None,
             release: "6.1.25",
@@ -630,33 +749,33 @@ mod tests {
             release: "6.1.25-android14-11-g8744d1c0cf31",
             layouts: &layouts,
         };
-        let table = explain_conf(&inputs, &prov);
+        let table = explain_conf(&inputs, &prov, Some("test"));
 
-        let phys = row(&table, "kernel_phys_load");
+        let phys = row(&table, "devices.test.phys.load");
         assert_eq!(phys.value, "0xa8000000");
         assert_eq!(phys.source, Source::Bootloader);
         assert_eq!(phys.confidence, Confidence::Derived);
 
-        let cred_field = row(&table, "task_struct.cred");
+        let cred_field = row(&table, "kernel.struct.task.cred");
         assert_eq!(cred_field.source, Source::Btf);
         assert_eq!(cred_field.confidence, Confidence::Derived);
 
         // No BTF-derived source string for cred: on a BTF image the 5.x path
         // is BTF; this fixture is 6.1, where the template is the source.
-        let copy_size = row(&table, "cred.copy_size");
+        let copy_size = row(&table, "kernel.struct.cred.copy_size");
         assert_eq!(copy_size.source, Source::ReleaseTemplate);
         assert_eq!(copy_size.domain, Domain::SizeOf);
 
-        let offset = row(&table, "offset.init_task");
+        let offset = row(&table, "kernel.symbols.init_task");
         assert_eq!(offset.source, Source::Kallsyms);
         assert_eq!(offset.domain.label(), "image-offset");
 
-        let shift = row(&table, "route.select_stack.waiter_shift");
+        let shift = row(&table, "ghostlock.syscalls.select_stack.native.waiter_shift");
         assert_eq!(shift.value, "-2");
         assert_eq!(shift.domain, Domain::FrameDepth);
 
         let rendered = table.render();
-        assert!(rendered.contains("kernel_phys_load"));
+        assert!(rendered.contains("devices.test.phys.load"));
         assert!(rendered.contains("bootloader"));
         assert!(rendered.contains("btf"));
     }
@@ -682,18 +801,18 @@ mod tests {
             release: "5.10.236-android12-9-00003-gfb24cf99ad97",
             layouts: &layouts,
         };
-        let table = explain_conf(&inputs, &prov);
+        let table = explain_conf(&inputs, &prov, Some("test"));
 
-        let phys = row(&table, "kernel_phys_load");
+        let phys = row(&table, "devices.test.phys.load");
         assert_eq!(phys.source, Source::CompiledDefault);
         assert_eq!(phys.confidence, Confidence::Default);
-        let prio = row(&table, "task_struct.prio");
+        let prio = row(&table, "kernel.struct.task.prio");
         assert_eq!(prio.source, Source::ReleaseTemplate);
         assert_eq!(prio.confidence, Confidence::Heuristic);
-        let absent = row(&table, "task_struct.cred");
+        let absent = row(&table, "kernel.struct.task.cred");
         assert_eq!(absent.source, Source::Unknown);
         assert_eq!(absent.confidence, Confidence::Unknown);
-        let route = row(&table, "route");
+        let route = row(&table, "ghostlock.syscall");
         assert_eq!(route.source, Source::Operator);
     }
 }

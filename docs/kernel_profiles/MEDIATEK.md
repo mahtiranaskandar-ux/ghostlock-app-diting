@@ -6,8 +6,9 @@ This guide is for MediaTek users who extract the offsets by themselves but have 
 the device is listed with an exact `uname -r` match and runs, this guide does
 not apply.
 
-MediaTek kernels require two physical addresses that the kernel `Image` does not carry: `kernel_phys_load` (the
-kernel's physical load address) and `kernel_phys_offset` (the DRAM base, i.e. the
+MediaTek kernels require two physical addresses that the kernel `Image` does not carry. The profile document
+states them per device as `devices.<codename>.phys.load` (the kernel's physical load address) and
+`devices.<codename>.phys.offset` (the DRAM base, i.e. the
 linear map's `PHYS_OFFSET`). When they are missing or incorrect, the attack
 fails during W1: it is retried to its limit and then fails.
 
@@ -23,8 +24,8 @@ needed**:
 
 | value | source |
 |---|---|
-| `kernel_phys_load` | the header's `kernel_addr` field |
-| `kernel_phys_offset` | the `/memory` node of the DTB in the header's `dtb` section |
+| `devices.<codename>.phys.load` | the header's `kernel_addr` field (the extractor logs it as `kernel_phys_load`) |
+| `devices.<codename>.phys.offset` | the `/memory` node of the DTB in the header's `dtb` section (logged as `kernel_phys_offset`) |
 
 On MediaTek the `dtb` section is a DTBO table (the `dtbo.img` format); the
 extractor reads it directly. If a particular image has `dtb_size = 0` — the
@@ -40,23 +41,24 @@ then asks for `vendor_boot.img` (recommended) — attach it. If the `vendor_boot
 carries no usable `/memory` (or you skip it), the app asks for `dtbo.img` next.
 The parsed profile then contains both physical values if either image supplied
 them; finish the parse flow as usual. Skipping both leaves
-`kernel_phys_offset` empty, and the run fails at W1.
+`devices.<codename>.phys.offset` null, and the run fails at W1.
 
 ### On a PC
 
 ```sh
 ghostlock-extract boot.img --vendor-boot vendor_boot.img \
-    --iomem /dev/null --format conf --out profile.conf
+    --format conf --out profile.conf
 ```
 
-`--iomem /dev/null` matters on a PC: without it the tool reads the **build
-host's** `/proc/iomem` and silently produces a plausible wrong pair.
+The extractor takes the physical pair only from the images you attach (or
+`--phys`); it never reads the build host's `/proc/iomem`, so there is no host
+side-channel to disable.
 
 If the image carries no DTB, add the phone's `dtbo.img`:
 
 ```sh
 ghostlock-extract boot.img --vendor-boot vendor_boot.img --dtbo dtbo.img \
-    --iomem /dev/null --format conf --out profile.conf
+    --format conf --out profile.conf
 ```
 
 The tool prints which source it used:
@@ -120,8 +122,11 @@ kernel_phys_load = <value>
 kernel_phys_offset = <value>
 ```
 
-Open the app's **Advanced parameter overrides** page and set the two fields to
-those values. Saving applies them to the next run; no rebuild is required.
+The extractor writes them into the profile document as
+`devices.<codename>.phys.load` / `.offset`. In the app, set the two fields on the
+parameter page for that release (or generate the profile from the image, which
+fills them automatically). Saving applies them to the next run; no rebuild is
+required.
 
 ## Step 4 — run and verify
 
@@ -143,11 +148,11 @@ run the extractor with the device's `boot.img` plus its `vendor_boot.img`:
 
 ```sh
 ghostlock-extract boot.img --vendor-boot vendor_boot.img \
-    --iomem /dev/null --format conf --out profile.conf
+    --format conf --out profile.conf
 ```
 
 The extractor now emits **both** physical values from those images (adding
 `--dtbo` when the `vendor_boot` has no DTB). Prefer the image's embedded
 kallsyms; do not pass a device `/proc/kallsyms`. Only when no image carries a
-DTB does `kernel_phys_offset` need `--iomem` (a rooted device dump) or a
-hand-filled value, and `kernel_phys_load` can come from `--phys`.
+DTB does `kernel_phys_offset` stay `null`; fill it by hand (or with the value
+the rooted fallback prints) and `kernel_phys_load` can come from `--phys`.

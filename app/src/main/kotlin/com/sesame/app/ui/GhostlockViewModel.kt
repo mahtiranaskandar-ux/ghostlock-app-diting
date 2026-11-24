@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.provider.OpenableColumns
 import android.provider.Settings
 import android.os.Build
+import android.util.Log
 import androidx.core.net.toUri
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -22,9 +23,13 @@ import com.sesame.app.data.OptionPlan
 import com.sesame.app.data.OptionSuperset
 import com.sesame.app.data.RoutePlans
 import com.sesame.app.data.ScratchInAnchor
-import com.sesame.app.data.TimerBlockText
+import com.sesame.app.data.HoconSupport
+import com.sesame.app.data.asValueMap
+import com.sesame.app.data.TimerOnlyDocument
 import com.sesame.app.data.decision
+import com.sesame.app.domain.model.RunLogState
 import com.sesame.app.domain.model.generationPhysComplete
+import com.sesame.app.domain.model.physRule
 import com.sesame.app.domain.model.isMediaTekSoc
 import com.sesame.app.domain.model.isQualcommSoc
 import com.sesame.app.domain.model.ImportedEvidence
@@ -42,10 +47,10 @@ import com.sesame.app.domain.model.nextPhysImage
 import com.sesame.app.domain.model.CrashEvidenceInfo
 import com.sesame.app.domain.model.RouteCandidate
 import com.sesame.app.domain.model.ShizukuStatus
-import com.sesame.app.data.profile.RouteCarriers
 import com.sesame.app.data.profile.Timer98260
 import com.sesame.app.shizuku.TimerVerdict
 import com.sesame.app.domain.model.StrideProbe
+import com.sesame.app.domain.model.StrideProbeOutcome
 import com.sesame.app.domain.model.VrKoMode
 import com.sesame.app.domain.repository.GhostlockRepository
 import com.sesame.app.domain.repository.ProfileConfigController
@@ -120,7 +125,6 @@ sealed interface GhostlockEffect {
     data class OpenManager(val packageName: String) : GhostlockEffect
 }
 
-private const val OverwriteSummaryLimit = 12
 /** How often the report sheet re-reads the Shizuku verdict while it is open. */
 private const val CrashVerdictPollMs = 1_500L
 
@@ -160,7 +164,6 @@ private data class ParseRequest(
     val uefiPath: String? = null,
     val vendorBootPath: String? = null,
     val dtboPath: String? = null,
-    val overwrite: Boolean = false,
 )
 
 /**
@@ -180,8 +183,16 @@ private sealed interface ParseStep {
     ) : ParseStep
 
     data class Lock(val parse: ParseResult.Parsed) : ParseStep
-    data class Overwrite(val request: ParseRequest, val releases: List<String>) : ParseStep
 }
+
+/** The native tone tag (`<b> `, `<k> `, …) in a stored log line. */
+private val ToneTag = Regex("<(b|k|s|-)> ")
+
+/** A stored log can be long; the sheet replays its tail. */
+private const val MaxReplayedLogLines = 4000
+
+/** Logcat tag for the debug-only derivation check (`derive_test`). */
+private const val DeriveTestTag = "GhostlockDerive"
 
 class GhostlockViewModel(
     private val repository: GhostlockRepository,
@@ -240,6 +251,8 @@ class GhostlockViewModel(
         override fun openGeneration() = onOpenGeneration()
         override fun selectProfileFile() = onSelectProfileFile()
         override fun openParameters() = onOpenParameters()
+        override fun selectBuiltinAuto() = onSelectBuiltinProfile(null)
+        override fun clearImport() = onClearExternalProfile()
     }
 
     private val runSettingsActionsImpl = object : RunSettingsActions {
@@ -315,10 +328,6 @@ class GhostlockViewModel(
             this@GhostlockViewModel.onStrideOptionSelected(value)
 
         override fun onStrideUse() = this@GhostlockViewModel.onStrideUse()
-        override fun onStrideSkip() = this@GhostlockViewModel.onStrideSkip()
-        override fun onStridePickerDismiss() = this@GhostlockViewModel.onStridePickerDismiss()
-        override fun onOverwriteConfirm() = this@GhostlockViewModel.onOverwriteConfirm()
-        override fun onOverwriteDismiss() = this@GhostlockViewModel.onOverwriteDismiss()
     }
 
     private val generationActionsImpl = object : GenerationActions {
@@ -345,6 +354,7 @@ class GhostlockViewModel(
 
     private val measurementsActionsImpl = object : MeasurementsActions {
         override fun close() = onCloseMeasurements()
+        override fun openMerge() = onOpenMergePreview()
     }
 
     private val mergePreviewActionsImpl = object : MergePreviewActions {
@@ -423,6 +433,7 @@ class GhostlockViewModel(
         viewModelScope.launch {
             refreshSnapshot()
             markInterruptedRunLogs()
+            seedLastRunStatus()
             maybeNoticeInterruptedRun()
         }
         /* Best effort and off the main path: a no-shell device still records
@@ -498,8 +509,8 @@ class GhostlockViewModel(
                     support = state.session.support.copy(
                         release = config.release,
                         hasProfile = config.hasProfile,
+                        profileInvalid = config.invalidPaths.isNotEmpty(),
                         route = config.route,
-                        fallback = config.fallbackTo,
                         activeBuiltinProfile = profileController.activeBuiltinRelease(),
                         importedProfilePresent = profileController.importedProfileExists(),
                         layers = config.layers,
@@ -608,14 +619,49 @@ class GhostlockViewModel(
                 }
 
                 is ProfileImportResult.Rejected -> {
+                    /* Rejections are either a whole-document reason (schema,
+                     * no entry for this kernel) or per-field paths. Localize
+                     * both; the field lines keep the raw key for editing. */
+                    val fieldErrors = mutableListOf<String>()
+                    val documentErrors = mutableListOf<String>()
+                    for (error in result.errors) {
+                        val split = error.indexOf(": ")
+                        val path = if (split > 0) error.substring(0, split) else ""
+                        val labelRes = if (split > 0) fieldLabelRes(path) else null
+                        if (labelRes != null) {
+                            val rawReason = error.substring(split + 2)
+                            val reason = if (rawReason == "invalid") {
+                                application.getString(R.string.profile_field_invalid)
+                            } else {
+                                externalReasonText(rawReason, application)
+                            }
+                            fieldErrors += "${application.getString(labelRes)} ($path)：$reason"
+                        } else {
+                            documentErrors += externalReasonText(error, application)
+                        }
+                    }
+                    val message = buildString {
+                        if (documentErrors.isNotEmpty()) {
+                            append(documentErrors.joinToString("\n"))
+                        }
+                        if (fieldErrors.isNotEmpty()) {
+                            if (isNotEmpty()) append("\n\n")
+                            append(application.getString(R.string.profile_import_rejected_intro))
+                            append("\n")
+                            append(fieldErrors.joinToString("\n"))
+                        }
+                    }
                     mutableState.update {
                         it.copy(
                             overlay = it.overlay.copy(dialog = AppDialog.Notice(
                                 titleRes = R.string.profile_import_rejected_title,
-                                message = result.errors.joinToString("\n"),
+                                message = message,
                             )),
                         )
                     }
+                    /* A rejected import restores the previous selection; refresh
+                     * so the Home does not keep the pre-import state. */
+                    refreshSnapshot()
                 }
             }
         }
@@ -1253,7 +1299,7 @@ class GhostlockViewModel(
                 session = state.session.copy(
                     support = state.session.support.copy(
                         route = config.route,
-                        fallback = config.fallbackTo,
+                        profileInvalid = config.invalidPaths.isNotEmpty(),
                         activeBuiltinProfile = profileController.activeBuiltinRelease(),
                         importedProfilePresent = profileController.importedProfileExists(),
                         layers = config.layers,
@@ -1395,7 +1441,13 @@ class GhostlockViewModel(
         val snapshot = kernelSnapshot ?: return
         val config = resolvedProfile
         if (config == null || !config.hasProfile) {
-            appendLog("result: no profile is loaded; import or generate one")
+            appendLog(
+                if (state.value.session.support.importedProfilePresent) {
+                    "result: the imported profile is unusable; remove the import first"
+                } else {
+                    "result: no profile is loaded; import or generate one"
+                },
+            )
             return
         }
         /* The timer route is Shizuku-only, independent of the native toggle:
@@ -1469,7 +1521,7 @@ class GhostlockViewModel(
             clearLog()
             send(GhostlockEffect.KeepScreenAwake(true))
             mutableState.update {
-                it.copy(session = it.session.copy(run = it.session.run.copy(status = RunStatus.Running)))
+                it.copy(session = it.session.copy(run = it.session.run.copy(status = RunStatus.Running, startedAtMs = System.currentTimeMillis())))
             }
             RunStatusService.start(
                 application,
@@ -1599,7 +1651,11 @@ class GhostlockViewModel(
                 appendLog(
                     when {
                         config == null || !config.hasProfile ->
-                            "result: no profile is loaded; import or generate one"
+                            if (state.value.session.support.importedProfilePresent) {
+                                "result: the imported profile is unusable; remove the import first"
+                            } else {
+                                "result: no profile is loaded; import or generate one"
+                            }
 
                         else ->
                             "result: the loaded profile has ${config.invalidPaths.size} invalid field(s)"
@@ -1631,7 +1687,7 @@ class GhostlockViewModel(
              * "nothing new during execution". */
             clearLog()
             send(GhostlockEffect.KeepScreenAwake(true))
-            mutableState.update { it.copy(session = it.session.copy(run = it.session.run.copy(status = RunStatus.Running))) }
+            mutableState.update { it.copy(session = it.session.copy(run = it.session.run.copy(status = RunStatus.Running, startedAtMs = System.currentTimeMillis()))) }
             /* A foreground service keeps the app's uid out of the cached
              * (freezable) state if the KSU manager takes the foreground during
              * the handoff; the notification also carries the run status. */
@@ -1800,16 +1856,75 @@ class GhostlockViewModel(
     }
 
     /** Opens the run sheet on the last run's retained log. */
-    fun onOpenLastRunLog() {
-        if (state.value.session.run.logLines.isEmpty()) return
+    /**
+     * The last run's row is store-backed, not process-backed: the in-memory log
+     * dies with the process (and with a crashed boot), and the store is the
+     * authoritative record. The Home summary is seeded from the store on start;
+     * opening the row replays the stored log when this process has none.
+     */
+    private suspend fun seedLastRunStatus() {
+        val entry = runCatching { repository.listRunLogs() }.getOrNull()?.firstOrNull()
+            ?: return
+        val status = if (entry.state == RunLogState.COMPLETED) RunStatus.Success else RunStatus.Failure
         mutableState.update {
-            it.copy(
-                session = it.session.copy(
-                    run = it.session.run.copy(sheetVisible = true, sheetDismissible = !running),
-                ),
-            )
+            if (it.session.run.status != RunStatus.Idle) it
+            else it.copy(session = it.session.copy(run = it.session.run.copy(status = status)))
         }
     }
+
+    private fun replayLine(raw: String): GhostlockLogLine {
+        val tag = ToneTag.find(raw)
+        val entry = if (tag == null) {
+            formatLog(raw)
+        } else {
+            formatLog(tag.value + raw.removeRange(tag.range))
+        }
+        return GhostlockLogLine(entry.text.trimEnd('\n'), toneColor(entry.tone))
+    }
+
+    fun onOpenLastRunLog() {
+        if (state.value.session.run.logLines.isNotEmpty()) {
+            mutableState.update {
+                it.copy(
+                    session = it.session.copy(
+                        run = it.session.run.copy(sheetVisible = true, sheetDismissible = !running),
+                    ),
+                )
+            }
+            return
+        }
+        viewModelScope.launch(Dispatchers.IO) {
+            val entry = runCatching { repository.listRunLogs() }.getOrNull()?.firstOrNull()
+            if (entry == null) {
+                send(GhostlockEffect.Toast(R.string.home_run_none))
+                return@launch
+            }
+            val text = runCatching { repository.readRunLog(entry.stamp) }.getOrNull()
+            /* The stored file carries the native's tone tag *after* the elapsed
+             * marker (`[A+…] <b> …`), while the live formatter expects it at
+             * the start; move it there so the tag becomes a colour and is not
+             * shown as text. */
+            val lines = text.orEmpty().lineSequence()
+                .filter { it.isNotBlank() }
+                .map(::replayLine)
+                .toList()
+                .takeLast(MaxReplayedLogLines)
+            val status = if (entry.state == RunLogState.COMPLETED) RunStatus.Success else RunStatus.Failure
+            mutableState.update {
+                it.copy(
+                    session = it.session.copy(
+                        run = it.session.run.copy(
+                            logLines = lines,
+                            status = status,
+                            sheetVisible = true,
+                            sheetDismissible = true,
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+
 
     fun onOpenRunSettings() {
         nav.push(Screen.RunSettings)
@@ -1847,6 +1962,59 @@ class GhostlockViewModel(
         resetParseSession()
         pendingGeneratedProfile = null
         mutableState.update { it.copy(generation = it.generation.copy(step = GenerationStep.Idle)) }
+    }
+
+    /**
+     * Debug-only derivation check (`am start --ez derive_test true --es
+     * derive_image <local image path>`): runs the real `parseSource` path on the
+     * image and records whether the timer analyzer's block survives into the
+     * generated document and — the fix's contract — into the options superset's
+     * `document`, which `OptionSuperset.cut` clones for the exported profile.
+     * Writes `files/derive-test.txt` and one `derive_test:` log line per fact, so
+     * a device check needs no UI and no SAF export.
+     */
+    fun runDeriveTest(imagePath: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val out = StringBuilder()
+            fun record(line: String) {
+                appendLog("derive_test: $line")
+                Log.i(DeriveTestTag, line)
+                out.appendLine(line)
+            }
+            try {
+                val result = parseSourceUseCase(imagePath, onLog = { Log.i(DeriveTestTag, it) })
+                val options = when (result) {
+                    is ParseResult.Parsed -> result.options
+                    is ParseResult.Ambiguous -> result.options
+                    else -> null
+                }
+                val generated = (result as? ParseResult.Parsed)?.documentText
+                val generatedMap = generated?.let { HoconSupport.parseValue(it).asValueMap() }
+                record(
+                    "generated present=${generatedMap != null} " +
+                        "timer=${generatedMap?.get(Timer98260.BLOCK_KEY) != null} " +
+                        "fakeSupported=${generatedMap?.let { Timer98260.fakeSupported(it) }}",
+                )
+                val optionsDoc = options?.document
+                record(
+                    "options.document present=${optionsDoc != null} " +
+                        "timer=${optionsDoc?.get(Timer98260.BLOCK_KEY) != null} " +
+                        "fakeSupported=${optionsDoc?.let { Timer98260.fakeSupported(it) }}",
+                )
+                record(
+                    "result=${result.javaClass.simpleName} " +
+                        "timerDerived=${(result as? ParseResult.Parsed)?.timerDerived ?: false}",
+                )
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                record("error=${error.message}")
+            } finally {
+                runCatching {
+                    application.filesDir.resolve("derive-test.txt").writeText(out.toString())
+                }
+            }
+        }
     }
 
     fun onCloseExecutionSheet() {
@@ -2067,14 +2235,11 @@ class GhostlockViewModel(
                 }
             }
 
-            ParseStep.Idle, is ParseStep.Overwrite -> Unit
+            ParseStep.Idle -> Unit
         }
     }
 
-    /**
-     * Applies the chosen stride in memory and asks the user where to export the
-     * generated document. Nothing is stored by the app; the export is the save.
-     */
+    /** Ends the stepped flow on its failed step. */
     private fun markGenerationFailed() {
         mutableState.update { it.copy(generation = it.generation.copy(step = GenerationStep.Failed)) }
     }
@@ -2083,17 +2248,8 @@ class GhostlockViewModel(
         document: String,
         name: String?,
         release: String,
-        stride: Int?,
     ) {
-        val text = if (stride != null) {
-            repository.applyStrideToDocument(document, release, stride) ?: run {
-                appendLog("stride: could not update the generated document")
-                document
-            }
-        } else {
-            document
-        }
-        if (stride != null) appendLog("stride: kernelsnitch.mm_struct_sz = $stride")
+        val text = document
         val suggested = name?.takeIf { it.endsWith(".conf") }
             ?: exportDocumentName(release)
         if (nav.current == Screen.Generation) {
@@ -2171,20 +2327,16 @@ class GhostlockViewModel(
         finishStride(value)
     }
 
-    fun onStrideSkip() = finishStride(null)
-
-    /** Dismissing the sheet means the same as Skip, with the same log line. */
-    fun onStridePickerDismiss() = finishStride(null)
-
     /**
      * Applies the chosen stride to the in-memory generated document and asks
      * where to export it — in the measured-db model the export is the save.
      */
-    private fun finishStride(value: Int?) {
+    private fun finishStride(value: Int) {
         val parse = pendingStrideParse
         val document = pendingStrideDocument
         val name = pendingStrideName
         val release = pendingStrideRelease
+        val probe = pendingStrideProbe
         pendingStrideParse = null
         pendingStrideProbe = null
         pendingStrideDocument = null
@@ -2192,13 +2344,30 @@ class GhostlockViewModel(
         pendingStrideRelease = null
         mutableState.update { it.copy(overlay = it.overlay.copy(stridePicker = null)) }
         if (document == null || release == null) return
-        if (value == null) {
-            appendLog("stride left unset (native default + stride-agnostic scan)")
-        } else {
-            appendLog("stride chosen: $value")
+        /* The export carries the value: a generated profile must not depend on
+         * this device's measured database to find its slab stride. */
+        val materialized = repository.materializeStride(document, value)
+        if (materialized == null) {
+            appendLog("result: could not write the stride into the document; export cancelled")
+            return
         }
-        finishGeneratedProfile(document, name, release, value)
-        parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
+        val evidence = probe?.let {
+            "probe gcd=0x${it.gcd.toString(16)} rounds=${it.rounds} samples=${it.samples}"
+        } ?: "generation probe"
+        viewModelScope.launch {
+            val recorded = runCatching {
+                repository.recordGenerationStride(release, value, evidence)
+            }.getOrDefault(false)
+            appendLog(
+                if (recorded) {
+                    "stride: $value written into the profile (recorded as evidence)"
+                } else {
+                    "stride: $value written into the profile (a root measurement is already stored)"
+                },
+            )
+            finishGeneratedProfile(materialized, name, release)
+            parse?.takeIf { it.missing.isNotEmpty() }?.let(::showMissingSidecarNotice)
+        }
     }
 
     /** The root-measured stride for this kernel, when the measured DB has one. */
@@ -2249,12 +2418,15 @@ class GhostlockViewModel(
                     access = it.session.access.copy(
                         shizukuEnabled = snapshot.shizukuEnabled,
                         shizukuStatus = snapshot.shizukuStatus,
+                        shizukuInstalled = runCatching {
+                            repository.shizukuInstalled()
+                        }.getOrDefault(false),
                         selectedManagerPackage = repository.selectedManagerPackage(),
                     ),
                     support = it.session.support.copy(
                         hasProfile = loaded?.hasProfile ?: false,
+                        profileInvalid = loaded?.invalidPaths?.isNotEmpty() ?: false,
                         route = loaded?.route,
-                        fallback = loaded?.fallbackTo,
                         layers = loaded?.layers,
                         importedProfilePresent = profileController.importedProfileExists(),
                         routeCandidates = loaded?.routeCandidates.orEmpty(),
@@ -2286,16 +2458,16 @@ class GhostlockViewModel(
         send(GhostlockEffect.PickDocument(DocumentRequest.BootImage))
     }
 
-    /** The input image is staged; ask for the platform's recommended image
-     * before the first pass. */
+    /** The input image is staged; run the first pass on it alone.
+     *
+     * The image is all the analyzers need for the first pass: the 98260 timer
+     * analyzer never reads the physical pair, and the native extractor reports
+     * what the pair still needs. Prompting before any analysis asked for
+     * images the timer route does not require, and hid whether the timer was
+     * available (which decides whether those images are optional at all). */
     private fun beginParseInput(input: String) {
         pendingParse = ParseRequest(input)
-        val first = when {
-            isMediaTek() -> PhysImage.VENDOR_BOOT
-            isQualcomm() -> PhysImage.XBL
-            else -> null
-        }
-        if (first == null) launchParse() else showPhysPrompt(first, after = null)
+        launchParse()
     }
 
     private fun launchParse() {
@@ -2431,14 +2603,9 @@ class GhostlockViewModel(
                 val result = parseSourceUseCase(
                     request.input, request.xblPath, request.uefiPath,
                     request.vendorBootPath, request.dtboPath,
-                    request.overwrite, null, ::appendLog,
+                    null, ::appendLog,
                 )
             ) {
-                is ParseResult.RequiresOverwrite -> {
-                    parseStep = ParseStep.Overwrite(request, result.releases)
-                    showOverwriteDialog(result.releases)
-                }
-
                 is ParseResult.Ambiguous -> {
                     val feasible = result.routes.filter { it.verdict == "feasible" }
                     appendLog(
@@ -2460,7 +2627,7 @@ class GhostlockViewModel(
                 is ParseResult.Parsed -> advancePhys(result)
 
                 ParseResult.AlreadyPresent -> {
-                    appendLog("result: offsets already present")
+                    appendLog("result: no profile entry for this kernel")
                     showNotice(R.string.parse_result_title, R.string.offsets_already_exist)
                     markGenerationFailed()
                 }
@@ -2498,7 +2665,22 @@ class GhostlockViewModel(
         ) {
             /* Only MediaTek can reach this: its sidecars are the sole source
              * of the pair and the runtime has no default to fall back on.
-             * Elsewhere the sidecar advice is optional. */
+             * Elsewhere the sidecar advice is optional. The 98260 timer route
+             * never reads the pair, so a derived block still yields a usable
+             * timer-only profile instead of a partial GhostLock one. */
+            val timerOnly = if (result.timerDerived) {
+                TimerOnlyDocument.from(result.documentText)
+            } else {
+                null
+            }
+            if (timerOnly != null) {
+                appendLog(
+                    "warning: the physical layout is incomplete; " +
+                        "deriving the 98260 timer route only",
+                )
+                finishTimerOnly(result, timerOnly)
+                return
+            }
             appendLog(
                 "warning: the physical layout is incomplete; attach the missing image and re-parse",
             )
@@ -2550,10 +2732,34 @@ class GhostlockViewModel(
                 generation = it.generation.copy(step = GenerationStep.Confirm),
                 overlay = it.overlay.copy(dialog = AppDialog.ListDialog(
                     titleRes = title,
+                    /* Say what the image determines and what skipping means on
+                     * this platform: without the pair MediaTek cannot derive
+                     * the GhostLock route at all, while the other families use
+                     * a compiled default and treat the image as calibration. */
+                    messageRes = physPromptMessage(after),
                     itemResIds = listOf(attach, R.string.parse_phys_skip),
                 )),
             )
         }
+    }
+
+    /** The platform-specific meaning of the physical pair, for the image prompt. */
+    private fun physPromptMessage(after: ParseResult.Parsed?): Int {
+        val defaults = physRule(kernelSnapshot?.socName.orEmpty()).satisfiedByDefaults
+        return when {
+            !defaults && after?.timerDerived == true -> R.string.parse_phys_timer_hint
+            defaults -> R.string.parse_phys_default_hint
+            else -> R.string.parse_phys_required_hint
+        }
+    }
+
+    /** The timer-only outcome: no route, stride or lock plan applies. */
+    private suspend fun finishTimerOnly(result: ParseResult.Parsed, document: String) {
+        refreshSnapshot()
+        result.route?.let { appendLog("route: $it") }
+        appendLog("profile generated (98260 timer route only): ${result.releases.joinToString()}")
+        appendLog("result: profile generated; export it to use it")
+        continueParsed(result.copy(documentText = document), document, skipStride = true)
     }
 
     /** The Parsed branch once the image advice is satisfied. */
@@ -2562,6 +2768,7 @@ class GhostlockViewModel(
         if (document == null) {
             appendLog("result: the extractor produced no document")
             showNotice(R.string.parse_result_title, R.string.parse_failed)
+            markGenerationFailed()
             return
         }
         refreshSnapshot()
@@ -2700,19 +2907,20 @@ class GhostlockViewModel(
      * post-choice path: [document] is what will be exported (page mode has had
      * the `lock_anchor_*` triple removed in memory).
      */
-    private suspend fun continueParsed(result: ParseResult.Parsed, document: String) {
+    private suspend fun continueParsed(
+        result: ParseResult.Parsed,
+        document: String,
+        skipStride: Boolean = false,
+    ) {
         /* The live stride probe only makes sense for the running kernel; a
          * profile generated for another image skips it. */
         val runningRelease = kernelSnapshot?.kernelRelease
-        /* The generated document may carry the optional timer block; a
-         * single-route cut rendered from the option superset does not. Carry
-         * the block into whatever this path exports (metadata only: the
-         * native wire never carries it). */
-        val exportDocument = result.documentText?.let { source ->
-            TimerBlockText.extract(source)?.let { TimerBlockText.append(document, it) }
-        } ?: document
-        val strideProbe = if (runningRelease != null &&
-            runningRelease in result.releases
+        /* The cut is a whole document cloned from the (timer-merged) option
+         * superset, so the timer block travels with it. */
+        val exportDocument = document
+        val outcome: StrideProbeOutcome? = if (!skipStride && runningRelease != null &&
+            runningRelease in result.releases &&
+            repository.documentRequiresStride(exportDocument)
         ) {
             appendLog("stride: probing the mm_struct slab on the running kernel")
             /* The probe blocks for seconds to minutes. This is the generation
@@ -2738,7 +2946,10 @@ class GhostlockViewModel(
             try {
                 runCatching {
                     repository.probeStride(runningRelease, exportDocument, ::appendLog)
-                }.getOrNull()
+                }.getOrElse { error ->
+                    if (error is CancellationException) throw error
+                    StrideProbeOutcome.Failed(error.message ?: "probe error")
+                }
             } finally {
                 send(GhostlockEffect.KeepScreenAwake(false))
                 endOperation()
@@ -2753,41 +2964,60 @@ class GhostlockViewModel(
         } else {
             null
         }
-        if (strideProbe != null && runningRelease != null) {
-            pendingStrideParse = result
-            pendingStrideProbe = strideProbe
-            pendingStrideDocument = exportDocument
-            pendingStrideName = result.documentName
-            pendingStrideRelease = runningRelease
-            val recommendation = recommendStride(
-                strideProbe,
-                confirmedValue = rootMeasuredStride(runningRelease),
-            )
-            appendLog(
-                "stride: ${strideProbe.candidates.size} candidate(s), " +
-                    "gcd=0x${strideProbe.gcd.toString(16)}, " +
-                    "rounds=${strideProbe.rounds}, samples=${strideProbe.samples}",
-            )
-            mutableState.update {
-                it.copy(
-                    overlay = it.overlay.copy(stridePicker = StridePickerUiState(
-                        recommendation = recommendation,
-                        selectedValue = recommendation.recommendedValue,
-                        footerRes = R.string.stride_footer_export,
-                    )),
-                    session = it.session.copy(run = it.session.run.copy(sheetVisible = false)),
+        when (val step = strideStep(outcome)) {
+            is StrideStep.Picker -> {
+                val strideProbe = step.probe
+                /* Probed implies the probe ran, which implies runningRelease. */
+                val release = requireNotNull(runningRelease)
+                pendingStrideParse = result
+                pendingStrideProbe = strideProbe
+                pendingStrideDocument = exportDocument
+                pendingStrideName = result.documentName
+                pendingStrideRelease = release
+                val recommendation = recommendStride(
+                    strideProbe,
+                    confirmedValue = rootMeasuredStride(release),
+                )
+                appendLog(
+                    "stride: ${strideProbe.candidates.size} candidate(s), " +
+                        "gcd=0x${strideProbe.gcd.toString(16)}, " +
+                        "rounds=${strideProbe.rounds}, samples=${strideProbe.samples}",
+                )
+                mutableState.update {
+                    it.copy(
+                        overlay = it.overlay.copy(stridePicker = StridePickerUiState(
+                            recommendation = recommendation,
+                            selectedValue = recommendation.recommendedValue,
+                            footerRes = R.string.stride_footer_export,
+                        )),
+                        session = it.session.copy(run = it.session.run.copy(sheetVisible = false)),
+                    )
+                }
+            }
+
+            is StrideStep.Fail -> {
+                /* The probe ran (the document targets the running kernel) and
+                 * failed. A profile saved without its measured stride cannot be
+                 * imported or run, so end on the failed step — never the save
+                 * step, which would hand the user a dead profile. */
+                appendLog("result: stride probe failed: ${step.reason}; no profile generated")
+                mutableState.update {
+                    it.copy(session = it.session.copy(run = it.session.run.copy(sheetVisible = false)))
+                }
+                markGenerationFailed()
+                return
+            }
+
+            StrideStep.Save -> {
+                /* No stride picker: the save prompt takes over. Close the probe
+                 * sheet first so the SAF activity is not left behind a modal. */
+                mutableState.update { it.copy(session = it.session.copy(run = it.session.run.copy(sheetVisible = false))) }
+                finishGeneratedProfile(
+                    exportDocument,
+                    result.documentName,
+                    runningRelease ?: result.releases.firstOrNull() ?: "profile",
                 )
             }
-        } else {
-            /* No stride picker: the save prompt takes over. Close the probe
-             * sheet first so the SAF activity is not left behind a modal. */
-            mutableState.update { it.copy(session = it.session.copy(run = it.session.run.copy(sheetVisible = false))) }
-            finishGeneratedProfile(
-                exportDocument,
-                result.documentName,
-                runningRelease ?: result.releases.firstOrNull() ?: "profile",
-                null,
-            )
         }
         if (result.missing.isNotEmpty()) {
             appendLog(
@@ -2795,48 +3025,6 @@ class GhostlockViewModel(
                     "attach the platform image or fill the fields manually",
             )
         }
-    }
-
-    fun onOverwriteConfirm() {
-        mutableState.update { it.copy(overlay = it.overlay.copy(overwriteVisible = false, overwriteMessage = "")) }
-        confirmPendingOperation()
-    }
-
-    fun onOverwriteDismiss() {
-        parseStep = ParseStep.Idle
-        running = false
-        appendLog("result: overwrite cancelled")
-        mutableState.update {
-            it.copy(
-                generation = it.generation.copy(step = GenerationStep.Idle),
-                overlay = it.overlay.copy(overwriteVisible = false, overwriteMessage = ""),
-                session = it.session.copy(run = it.session.run.copy(running = false, sheetDismissible = true)),
-            )
-        }
-    }
-
-    private fun confirmPendingOperation() {
-        val step = parseStep as? ParseStep.Overwrite ?: return
-        parseStep = ParseStep.Idle
-        pendingParse = step.request.copy(overwrite = true)
-        launchParse()
-    }
-
-    private fun showOverwriteDialog(releases: List<String>) {
-        mutableState.update {
-            it.copy(
-                generation = it.generation.copy(step = GenerationStep.Confirm),
-                overlay = it.overlay.copy(overwriteVisible = true, overwriteMessage = overwriteSummary(releases)),
-                session = it.session.copy(run = it.session.run.copy(sheetVisible = false)),
-            )
-        }
-    }
-
-    /** Keeps the confirmation readable when a document carries many releases. */
-    private fun overwriteSummary(releases: List<String>): String {
-        val head = releases.take(OverwriteSummaryLimit).joinToString("\n")
-        val rest = releases.size - OverwriteSummaryLimit
-        return if (rest > 0) "$head\n… (+$rest)" else head
     }
 
     private fun dismissDialog() {

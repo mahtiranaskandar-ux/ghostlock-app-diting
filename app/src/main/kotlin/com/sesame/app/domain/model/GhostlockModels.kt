@@ -48,11 +48,9 @@ enum class LogTone { Default, Error, Success, Warning, Progress, Kotlin, Shizuku
 
 data class LogEntry(val text: String, val tone: LogTone)
 
-data class OffsetCandidate(val release: String, val document: String)
-
 /** One root-measured fact, as the read-only measurements screen shows it. */
 data class MeasuredFactInfo(
-    /** Dotted profile path (`kernelsnitch.mm_struct_sz`). */
+    /** Dotted profile path (`kernel.heap.stride`). */
     val key: String,
     val value: Long,
     /** Only `root-slabinfo` today; the screen shows it verbatim. */
@@ -172,17 +170,14 @@ data class ProfileLayers(
     /** Release the builtin layer resolved through; null when nothing matched. */
     val builtinRelease: String? = null,
     /**
-     * True when the builtin layer is the **bundled** asset for the device's own
-     * release — the case where the bundled profile is authoritative and a
-     * shadowing import is not applied.
+     * True when the selection is the **bundled** asset for the device's own
+     * release (no external selection or built-in pick above it).
      */
     val bundledAuthoritative: Boolean = false,
     /** True when a builtin release was selected by hand instead of auto-matched. */
     val builtinSelected: Boolean = false,
     /** Build identity of the running app (`BuildConfig.GIT_SHA`). */
     val build: String = "",
-    /** Keys the resolved profile carries that no wire section declares. */
-    val uncarriedKeys: List<String> = emptyList(),
     /** The imported copy applied to this resolution. */
     val externalApplied: Boolean = false,
     /** Why the imported copy could not be used. */
@@ -248,8 +243,9 @@ data class RouteCandidate(
     /** The Shizuku-delivered timer backend rather than a native route. */
     val timer: Boolean = false,
     /**
-     * The carriers this route's branch lists (`native`/`compat`), primary
-     * first. Empty for the timer and for the legacy single-carrier flag form.
+     * The carriers this route's branch states (`native`/`compat`), primary
+     * first. Empty for the timer and for a route that declares no carrier
+     * block.
      */
     val carriers: List<String> = emptyList(),
 )
@@ -268,48 +264,46 @@ data class ProfileConfig(
     val roots: List<ProfileFieldNode> = emptyList(),
     /** General (execution tuning) subset exposed by the parameters screen. */
     val general: List<ExecutionFieldValue> = emptyList(),
-    /** Explicit route from the profile; null means geometry inference. */
+    /** The picker's resolved route; null when none is viable. */
     val route: String? = null,
-    /** Declared fallback route ("none"/"<route>"); null means unset. */
-    val fallbackTo: String? = null,
     /**
      * The routes this profile can run on the device, in the profile's order.
      * A native branch plus the timer block is already a two-candidate profile.
      */
     val routeCandidates: List<RouteCandidate> = emptyList(),
     /**
-     * The picker's choice — a native route name or `timer_98260`. Null when no
+     * The picker's choice — a syscall name or the timer engine. Null when no
      * route resolved. The default is the first candidate; a stored choice that
      * is no longer viable is cleared at load.
      */
     val selectedRoute: String? = null,
     /**
-     * The carriers the active native route lists, and the remembered choice
-     * among them. Empty/null for the legacy single-carrier form (the branch's
-     * `compat_carrier` flag decides) and for the timer selection.
+     * The carriers the active native route states (the branch's `native` and
+     * `compat` blocks), and the remembered choice among them. Empty for the
+     * timer selection.
      */
     val carrierCandidates: List<String> = emptyList(),
     val selectedCarrier: String? = null,
-    /** True when the profile's pipeline names both DirtyFrag and GhostLock. */
+    /** True when the document's ladder offers both DirtyFrag and GhostLock. */
     val dirtyFragSelectable: Boolean = false,
     /** The remembered DirtyFrag choice; false = GhostLock only for this run. */
     val dirtyFragOn: Boolean = false,
-    /** The profile's ordered pipeline preference; empty = legacy ghostlock. */
+    /** The document's derived ladder. */
     val pipelineOrder: List<String> = emptyList(),
-    /** The module chain's pair manifest, when the pipeline selects `module`. */
+    /** The module chain's pair manifest, when the ladder selects `module`. */
     val module: ModuleConfig? = null,
     /** Dotted paths whose resolved value violates the geometry rules. */
     val invalidPaths: Set<String> = emptySet(),
 ) {
     companion object {
-        /** Routes a profile may declare ("" is the inference fallback). */
+        /** The native syscall vocabulary. */
         val Routes = listOf("tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn")
 
         /**
          * Route-independent execution tuning paths the general editor always
          * exposes. Route-specific tuning is appended dynamically from the
-         * resolved profile for the active route (plus its fallback), so a
-         * profile never shows another route's knobs.
+         * resolved document for the active route, so a profile never shows
+         * another route's knobs.
          */
         val GeneralPaths = listOf(
             "execution.heap.prepare_max_attempts",
@@ -334,21 +328,6 @@ data class ProfileConfig(
             "execution.handoff.enforce_poll_interval_ms",
         )
     }
-}
-
-data class KernelOffsets(
-    val release: String,
-    val scalars: Map<String, Long?>,
-    val symbols: Map<String, Long?>,
-    val structFields: Map<String, Long?>,
-)
-
-sealed interface OffsetImportResult {
-    data class Imported(val releases: List<String>) : OffsetImportResult
-    data class RequiresOverwrite(val releases: List<String>) : OffsetImportResult
-    data object AlreadyPresent : OffsetImportResult
-    data class MissingIncludes(val files: List<String>) : OffsetImportResult
-    data class Failed(val reason: String) : OffsetImportResult
 }
 
 /** One route verdict from the extractor's `--feasible-out` report. */
@@ -384,9 +363,23 @@ data class StrideProbe(
     val decided: Boolean,
 )
 
+/**
+ * The stride probe's outcome. Applicability is the caller's decision (the probe
+ * runs only when the document targets the running kernel), so a probe that ran
+ * either produced a table or failed. A failure must not be mistaken for
+ * "skipped": a profile saved without its measured stride cannot be imported or
+ * run, so the generation flow ends in the failed step instead of the save step.
+ */
+sealed interface StrideProbeOutcome {
+    data class Probed(val probe: StrideProbe) : StrideProbeOutcome
+
+    /** The probe ran but produced no usable table (killed, non-zero, empty). */
+    data class Failed(val reason: String) : StrideProbeOutcome
+}
+
 sealed interface ParseResult {
     /** Fields only an xbl_config/uefi sidecar can supply (e.g.
-     * `kernel_phys_load`) that the parsed profile is still missing. */
+     * `devices.<id>.phys.load`) that the parsed profile is still missing. */
     data class Parsed(
         val releases: List<String>,
         val missing: Set<String> = emptySet(),
@@ -401,10 +394,12 @@ sealed interface ParseResult {
         /** Extractor's canonical phys source (`xbl_config FDT`, `uefi memory
          * map`, `vendor_boot …`, `MediaTek DRAM base`, `--phys`, `unset`). */
         val physSource: String? = null,
-        /** The parsed document carries `kernel_phys_load`. */
+        /** The parsed document states the device pair under `devices`. */
         val physLoadPresent: Boolean = false,
-        /** The parsed document carries `kernel_phys_offset`. */
+        /** The parsed document carries the per-device physical pair. */
         val physOffsetPresent: Boolean = false,
+        /** The image's `timer` block was derived and validated. */
+        val timerDerived: Boolean = false,
         /**
          * The generated document itself. The app stores no profile: the caller
          * probes it, applies the chosen stride in memory and requires an export
@@ -426,11 +421,6 @@ sealed interface ParseResult {
         val routes: List<RouteVerdict>,
         /** The option superset, when the extractor wrote one. */
         val options: OptionSuperset? = null,
-    ) : ParseResult
-
-    data class RequiresOverwrite(
-        val releases: List<String>,
-        val missing: Set<String> = emptySet(),
     ) : ParseResult
 
     data object AlreadyPresent : ParseResult

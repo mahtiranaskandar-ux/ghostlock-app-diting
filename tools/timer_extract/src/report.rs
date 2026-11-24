@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
-//! Output rendering for the 98260 extractor: the human report, the
-//! `timer_98260` HOCON block, and the store-superset JSON object.
+//! Output rendering for the 98260 extractor: the human report, the cleaned
+//! `timer` fragment, and the timer evidence object.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -291,19 +291,6 @@ fn profile_fields(analysis: &Analysis) -> Vec<(&'static str, Option<(String, &'s
     ]
 }
 
-/// `DATA_SYMBOLS` macro name -> the profile field name.
-fn data_field_name(macro_name: &str) -> &str {
-    match macro_name {
-        "SELINUX_STATE_STATIC" => "selinux_state",
-        "PANIC_ON_WARN_STATIC" => "panic_on_warn",
-        "ROOT_USER_STATIC" => "root_user",
-        "INIT_USER_NS_STATIC" => "init_user_ns",
-        "INIT_UCOUNTS_STATIC" => "init_ucounts",
-        "INIT_GROUPS_STATIC" => "init_groups",
-        other => other,
-    }
-}
-
 fn require_real(analysis: &Analysis) -> Result<()> {
     let missing = analysis.check_real_path();
     if missing.is_empty() {
@@ -328,21 +315,32 @@ fn require_fake(analysis: &Analysis) -> Result<()> {
     }
 }
 
-/// One field of the `timer_98260` block.
-enum FieldValue {
-    /// A plain integer (HOCON will read it as a number).
-    Num(u64),
-    /// A 64-bit kernel address: quoted hex in HOCON, `"0x..."` in JSON.
-    Hex(u64),
-    /// A quoted string (the trigger shape).
-    Str(&'static str),
+/// The cleaned facts the timer engine owns. This is the document fragment the
+/// app and the store merge into the v3 document — never a second profile
+/// spelling: `kernel.symbols` (the five the timer tool needs),
+/// `kernel.struct.cred` (the security sid and the reference offsets) and the
+/// `timer` block, all image-relative.
+struct FragFacts {
+    symbols: Vec<(&'static str, Option<u64>)>,
+    usage_size: Option<u32>,
+    uid: Option<u32>,
+    security: Option<u32>,
+    caps_offset: Option<u32>,
+    caps_count: Option<u32>,
+    security_sid: Option<u32>,
+    refs: Vec<(&'static str, Option<u32>)>,
+    trigger: &'static str,
+    timer_offset: u64,
+    task_alloc_low_bits: u64,
+    object_size: u64,
+    task_alloc_size: u64,
+    node_offset: Option<u64>,
+    cred_request_size: u64,
+    cred_alloc_size: u64,
+    trace_gfp: Option<(u32, u32)>,
 }
 
-/// The block's fields, in display order, for both renderers.
-fn block_fields(
-    analysis: &Analysis,
-    endgame: Endgame,
-) -> Result<Vec<(&'static str, FieldValue)>> {
+fn frag_facts(analysis: &Analysis, endgame: Endgame) -> Result<FragFacts> {
     if endgame.includes_fake() {
         require_fake(analysis)?;
     } else {
@@ -351,161 +349,286 @@ fn block_fields(
     let sizes = analysis
         .sizes
         .ok_or_else(|| ExtractError::new("sizes not derived"))?;
-    let layout = analysis
-        .layout
-        .ok_or_else(|| ExtractError::new("layout not derived"))?;
     let sites = analysis
         .sites
         .ok_or_else(|| ExtractError::new("trace sites not derived"))?;
-    let static_site = analysis
-        .site("static_timer_site")
-        .ok_or_else(|| ExtractError::new("static_timer_site not derived"))?;
     let trigger = analysis
         .trigger
         .as_ref()
         .ok_or_else(|| ExtractError::new("exec trigger shape not derived"))?;
-    let mut out: Vec<(&'static str, FieldValue)> = vec![
-        ("version", FieldValue::Num(1)),
-        ("trigger", FieldValue::Str(trigger.shape.as_str())),
-        ("timer_site_lower_21bit", FieldValue::Num(sites.timer_low21())),
-        ("timer_object_size", FieldValue::Num(sizes.timer_alloc)),
-        ("cred_request_size", FieldValue::Num(sizes.cred_req)),
-        ("cred_alloc_size", FieldValue::Num(sizes.cred_alloc)),
-        ("cred_uid_offset", FieldValue::Num(layout.cred_uid as u64)),
-    ];
-    if endgame.includes_fake() {
-        out.push(("static_timer_site", FieldValue::Hex(static_site)));
-        out.push((
-            "task_alloc_site_lower_21bit",
-            FieldValue::Num(sites.copy_process_low21()),
-        ));
-        out.push(("task_alloc_size", FieldValue::Num(sizes.task_bytes)));
-        out.push(("task_cred_offset", FieldValue::Hex(layout.task_cred as u64)));
-        for (field, macro_name) in [
-            ("selinux_state", "SELINUX_STATE_STATIC"),
-            ("panic_on_warn", "PANIC_ON_WARN_STATIC"),
-            ("root_user", "ROOT_USER_STATIC"),
-            ("init_user_ns", "INIT_USER_NS_STATIC"),
-            ("init_ucounts", "INIT_UCOUNTS_STATIC"),
-            ("init_groups", "INIT_GROUPS_STATIC"),
-        ] {
-            if let Some(Some(value)) = analysis.data_symbols.get(macro_name) {
-                out.push((field, FieldValue::Hex(*value)));
-            }
-        }
-        if let Some(cred) = analysis.cred {
-            out.push((
-                "cred_usage_size",
-                FieldValue::Num(cred.usage_size as u64),
-            ));
-            out.push((
-                "cred_caps_offset",
-                FieldValue::Num(cred.caps_offset as u64),
-            ));
-            out.push(("cred_caps_count", FieldValue::Num(cred.caps_count as u64)));
-            out.push((
-                "cred_security_offset",
-                FieldValue::Num(cred.security_offset as u64),
-            ));
-            out.push(("cred_user_offset", FieldValue::Num(cred.user_offset as u64)));
-            if let Some(offset) = cred.user_ns_offset {
-                out.push(("cred_user_ns_offset", FieldValue::Num(offset as u64)));
-            }
-            if let Some(offset) = cred.ucounts_offset {
-                out.push(("cred_ucounts_offset", FieldValue::Num(offset as u64)));
-            }
-            out.push((
-                "cred_group_info_offset",
-                FieldValue::Num(cred.group_info_offset as u64),
-            ));
-            if let Some(offset) = cred.sid_offset {
-                out.push(("security_sid_offset", FieldValue::Num(offset as u64)));
-            }
-        }
-    }
-    if let Some(node) = analysis.timer_node_off {
-        out.push(("timer_node_offset", FieldValue::Num(node)));
-    }
-    if let (Some(offset), Some(size)) = (analysis.trace_gfp_off, analysis.trace_gfp_size) {
-        out.push(("page_alloc_gfp_offset", FieldValue::Num(offset as u64)));
-        out.push(("page_alloc_gfp_size", FieldValue::Num(size as u64)));
-    }
-    Ok(out)
+    let relative = |value: u64| analysis.text_base.and_then(|base| value.checked_sub(base));
+    let symbols = [
+        ("panic_on_warn", "PANIC_ON_WARN_STATIC"),
+        ("root_user", "ROOT_USER_STATIC"),
+        ("init_user_ns", "INIT_USER_NS_STATIC"),
+        ("init_ucounts", "INIT_UCOUNTS_STATIC"),
+        ("init_groups", "INIT_GROUPS_STATIC"),
+    ]
+    .into_iter()
+    .map(|(field, macro_name)| {
+        let value = analysis
+            .data_symbols
+            .get(macro_name)
+            .copied()
+            .flatten()
+            .and_then(relative);
+        (field, value)
+    })
+    .collect();
+    let (usage_size, uid, security, caps_offset, caps_count, security_sid, refs) =
+        match &analysis.cred {
+        Some(cred) => (
+            Some(cred.usage_size),
+            analysis.layout.map(|layout| layout.cred_uid),
+            Some(cred.security_offset),
+            Some(cred.caps_offset),
+            Some(cred.caps_count),
+            cred.sid_offset,
+            vec![
+                ("user", Some(cred.user_offset)),
+                ("user_ns", cred.user_ns_offset),
+                ("ucounts", cred.ucounts_offset),
+                ("group_info", Some(cred.group_info_offset)),
+            ],
+        ),
+        None => (
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            vec![
+                ("user", None),
+                ("user_ns", None),
+                ("ucounts", None),
+                ("group_info", None),
+            ],
+        ),
+    };
+    Ok(FragFacts {
+        symbols,
+        usage_size,
+        uid,
+        security,
+        caps_offset,
+        caps_count,
+        security_sid,
+        refs,
+        trigger: trigger.shape.as_str(),
+        timer_offset: sites.timer_site,
+        task_alloc_low_bits: sites.copy_process_low21(),
+        object_size: sizes.timer_alloc,
+        task_alloc_size: sizes.task_bytes,
+        node_offset: analysis.timer_node_off,
+        cred_request_size: sizes.cred_req,
+        cred_alloc_size: sizes.cred_alloc,
+        trace_gfp: match (analysis.trace_gfp_off, analysis.trace_gfp_size) {
+            (Some(offset), Some(size)) => Some((offset, size)),
+            _ => None,
+        },
+    })
 }
 
-fn render_fields_hocon(
-    out: &mut String,
-    fields: &[(&'static str, FieldValue)],
-    indent: usize,
-) {
-    let pad = "  ".repeat(indent);
-    for (key, value) in fields {
-        match value {
-            FieldValue::Num(value) => {
-                let _ = writeln!(out, "{pad}{key} = {value}");
-            }
-            FieldValue::Hex(value) => {
-                let _ = writeln!(out, "{pad}{key} = \"{}\"", hex64(*value));
-            }
-            FieldValue::Str(value) => {
-                let _ = writeln!(out, "{pad}{key} = \"{value}\"");
-            }
-        }
+fn hex_or_null(value: Option<u64>) -> String {
+    match value {
+        Some(value) => format!("\"{}\"", hex64(value)),
+        None => "null".to_string(),
     }
 }
 
-fn fields_json(fields: &[(&'static str, FieldValue)]) -> Value {
-    let mut map = Map::new();
-    for (key, value) in fields {
-        let json_value = match value {
-            FieldValue::Num(value) => json!(*value),
-            FieldValue::Hex(value) => json!(hex64(*value)),
-            FieldValue::Str(value) => json!(*value),
-        };
-        map.insert((*key).to_string(), json_value);
-    }
-    Value::Object(map)
-}
-
-/// The `timer_98260` block, as a HOCON object body (two-space indent).
-///
-/// 64-bit kernel addresses are quoted hex strings: a HOCON number cannot
-/// represent them (`0xffffffc008191af8` exceeds the signed 64-bit range and
-/// the parser would silently turn it into a string anyway).  Plain integers
-/// stay numbers, because the app's parser reads `0x...` as a string.
+/// The cleaned fragment as HOCON (the app's `--emit-timer-conf` output): the
+/// `kernel` facts the timer owns and the `timer` block, image-relative.
 pub fn render_timer_conf(analysis: &Analysis, endgame: Endgame) -> Result<String> {
-    let fields = block_fields(analysis, endgame)?;
+    let facts = frag_facts(analysis, endgame)?;
     let mut out = String::new();
-    let _ = writeln!(out, "timer_98260 {{");
-    render_fields_hocon(&mut out, &fields, 1);
+    let _ = writeln!(out, "kernel {{");
+    let _ = writeln!(out, "  symbols {{");
+    for (name, value) in &facts.symbols {
+        let _ = writeln!(out, "    {name} = {}", hex_or_null(*value));
+    }
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "  struct {{");
+    let _ = writeln!(out, "    cred {{");
+    let _ = writeln!(out, "      usage {{");
+    let _ = writeln!(
+        out,
+        "        size = {}",
+        facts.usage_size.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string())
+    );
+    let _ = writeln!(out, "      }}");
+    let _ = writeln!(
+        out,
+        "      uid = {}",
+        facts.uid.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string())
+    );
+    let _ = writeln!(
+        out,
+        "      security = {}",
+        facts.security.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string())
+    );
+    let _ = writeln!(out, "      caps {{");
+    let _ = writeln!(
+        out,
+        "        offset = {}",
+        facts.caps_offset.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string())
+    );
+    let _ = writeln!(
+        out,
+        "        count = {}",
+        facts.caps_count.map(|value| value.to_string()).unwrap_or_else(|| "null".to_string())
+    );
+    let _ = writeln!(out, "      }}");
+    match facts.security_sid {
+        Some(value) => {
+            let _ = writeln!(out, "      security_sid = {value}");
+        }
+        None => {
+            let _ = writeln!(out, "      security_sid = null");
+        }
+    }
+    let _ = writeln!(out, "      refs {{");
+    for (name, value) in &facts.refs {
+        let _ = writeln!(out, "        {name} {{");
+        match value {
+            Some(value) => {
+                let _ = writeln!(out, "          offset = {value}");
+            }
+            None => {
+                let _ = writeln!(out, "          offset = null");
+            }
+        }
+        let _ = writeln!(out, "        }}");
+    }
+    let _ = writeln!(out, "      }}");
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "}}");
+    let _ = writeln!(out, "timer {{");
+    let _ = writeln!(out, "  trigger = \"{}\"", facts.trigger);
+    let _ = writeln!(out, "  match_bits = 21");
+    let _ = writeln!(out, "  sites {{");
+    let _ = writeln!(out, "    timer {{");
+    let _ = writeln!(out, "      offset = \"{}\"", hex64(facts.timer_offset));
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "    task_alloc {{");
+    let _ = writeln!(
+        out,
+        "      low_bits = \"{}\"",
+        hex64(facts.task_alloc_low_bits)
+    );
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "  object_size = {}", facts.object_size);
+    let _ = writeln!(out, "  task_alloc_size = {}", facts.task_alloc_size);
+    match facts.node_offset {
+        Some(value) => {
+            let _ = writeln!(out, "  node_offset = {value}");
+        }
+        None => {
+            let _ = writeln!(out, "  node_offset = null");
+        }
+    }
+    let _ = writeln!(out, "  cred {{");
+    let _ = writeln!(out, "    request_size = {}", facts.cred_request_size);
+    let _ = writeln!(out, "    alloc_size = {}", facts.cred_alloc_size);
+    let _ = writeln!(out, "  }}");
+    let _ = writeln!(out, "  trace {{");
+    let _ = writeln!(out, "    gfp {{");
+    match facts.trace_gfp {
+        Some((offset, size)) => {
+            let _ = writeln!(out, "      offset = {offset}");
+            let _ = writeln!(out, "      size = {size}");
+        }
+        None => {
+            let _ = writeln!(out, "      offset = null");
+            let _ = writeln!(out, "      size = null");
+        }
+    }
+    let _ = writeln!(out, "    }}");
+    let _ = writeln!(out, "  }}");
     let _ = writeln!(out, "}}");
     Ok(out)
 }
 
-/// The canonical backend document, timer-only projection: the app's full
-/// renderer adds the `kernel` and `native` blocks; the timer tool ignores
-/// them, so this document is a complete input for it.
+/// The canonical backend document, timer-only projection: the cleaned fragment
+/// plus the document's identity keys. The app's full renderer adds the rest;
+/// the timer tool ignores them, so this is a complete input for it.
 pub fn render_document(analysis: &Analysis, endgame: Endgame) -> Result<Value> {
     let release = analysis
         .release
         .clone()
         .ok_or_else(|| ExtractError::new("image carries no kernel release string"))?;
-    let kernel_major = release
-        .split('.')
-        .next()
-        .and_then(|major| major.parse::<u64>().ok());
-    let fields = block_fields(analysis, endgame)?;
-    let mut document = Map::new();
-    document.insert("release".to_string(), json!(release));
-    document.insert("schema_version".to_string(), json!(2));
-    if let Some(major) = kernel_major {
-        document.insert("kernel_major".to_string(), json!(major));
-    }
-    document.insert("timer_98260".to_string(), fields_json(&fields));
-    Ok(Value::Object(document))
+    let facts = frag_facts(analysis, endgame)?;
+    let symbols: Map<String, Value> = facts
+        .symbols
+        .iter()
+        .map(|(name, value)| {
+            (
+                (*name).to_string(),
+                value.map(|value| json!(hex64(value))).unwrap_or(Value::Null),
+            )
+        })
+        .collect();
+    let refs: Map<String, Value> = facts
+        .refs
+        .iter()
+        .map(|(name, value)| {
+            (
+                (*name).to_string(),
+                json!({ "offset": value.map(|value| json!(value)).unwrap_or(Value::Null) }),
+            )
+        })
+        .collect();
+    let timer = json!({
+        "trigger": facts.trigger,
+        "match_bits": 21,
+        "sites": {
+            "timer": { "offset": hex64(facts.timer_offset) },
+            "task_alloc": { "low_bits": hex64(facts.task_alloc_low_bits) },
+        },
+        "object_size": facts.object_size,
+        "task_alloc_size": facts.task_alloc_size,
+        "node_offset": facts.node_offset.map(|value| json!(value)).unwrap_or(Value::Null),
+        "cred": {
+            "request_size": facts.cred_request_size,
+            "alloc_size": facts.cred_alloc_size,
+        },
+        "trace": {
+            "gfp": match facts.trace_gfp {
+                Some((offset, size)) => json!({ "offset": offset, "size": size }),
+                None => json!({ "offset": Value::Null, "size": Value::Null }),
+            },
+        },
+    });
+    Ok(json!({
+        "schema_version": 3,
+        "release": release,
+        "devices": Value::Null,
+        "kernel": {
+            "symbols": Value::Object(symbols),
+            "struct": {
+                "cred": {
+                    "uid": facts.uid.map(|value| json!(value)).unwrap_or(Value::Null),
+                    "security": facts.security.map(|value| json!(value)).unwrap_or(Value::Null),
+                    "usage": {
+                        "size": facts.usage_size.map(|value| json!(value)).unwrap_or(Value::Null),
+                    },
+                    "caps": {
+                        "offset": facts.caps_offset.map(|value| json!(value)).unwrap_or(Value::Null),
+                        "count": facts.caps_count.map(|value| json!(value)).unwrap_or(Value::Null),
+                    },
+                    "security_sid": facts.security_sid.map(|value| json!(value)).unwrap_or(Value::Null),
+                    "refs": Value::Object(refs),
+                },
+            },
+        },
+        "ghostlock": Value::Null,
+        "timer": timer,
+    }))
 }
 
-/// The `timer_98260` object for the store's options superset.
+/// The timer evidence object for the store's options superset.
 pub fn render_superset(analysis: &Analysis) -> Value {
     let real = analysis.check_real_path();
     let fake = analysis.check_fake_path();
@@ -573,31 +696,6 @@ pub fn render_superset(analysis: &Analysis) -> Value {
             }),
         );
     }
-    let mut profile = Map::new();
-    if let Some(sizes) = analysis.sizes {
-        profile.insert("timer_object_size".to_string(), json!(sizes.timer_alloc));
-        profile.insert("cred_request_size".to_string(), json!(sizes.cred_req));
-        profile.insert("cred_alloc_size".to_string(), json!(sizes.cred_alloc));
-        profile.insert("task_alloc_size".to_string(), json!(sizes.task_bytes));
-    }
-    if let Some(layout) = analysis.layout {
-        profile.insert("task_cred_offset".to_string(), json!(hex64(layout.task_cred as u64)));
-        profile.insert("cred_uid_offset".to_string(), json!(layout.cred_uid));
-    }
-    if let Some(sites) = analysis.sites {
-        profile.insert("timer_site_lower_21bit".to_string(), json!(sites.timer_low21()));
-        profile.insert(
-            "task_alloc_site_lower_21bit".to_string(),
-            json!(sites.copy_process_low21()),
-        );
-    }
-    for (macro_name, value) in &analysis.data_symbols {
-        if let Some(value) = value {
-            profile.insert(data_field_name(macro_name).to_string(), json!(hex64(*value)));
-        }
-    }
-    object.insert("profile".to_string(), Value::Object(profile));
-
     let sources: Map<String, Value> = analysis
         .sources
         .iter()
@@ -605,14 +703,6 @@ pub fn render_superset(analysis: &Analysis) -> Value {
         .collect();
     object.insert("sources".to_string(), Value::Object(sources));
 
-    /* The block the ship script renders into the profile asset (the real path
-     * until the fake endgame is verified; the store record above carries what
-     * is derivable). */
-    if analysis.check_real_path().is_empty() {
-        if let Ok(fields) = block_fields(analysis, Endgame::Real) {
-            object.insert("block".to_string(), fields_json(&fields));
-        }
-    }
     if !analysis.corroborated.is_empty() {
         let corroborated: Map<String, Value> = analysis
             .corroborated

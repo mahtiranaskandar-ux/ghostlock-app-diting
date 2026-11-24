@@ -12,6 +12,4 @@ import com.sesame.app.ui.StridePickerUiState
 data class OverlayState(
     val dialog: AppDialog? = null,
     val stridePicker: StridePickerUiState? = null,
-    val overwriteVisible: Boolean = false,
-    val overwriteMessage: String = "",
 )

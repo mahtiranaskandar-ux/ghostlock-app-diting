@@ -66,20 +66,22 @@ struct Cli {
     /// kernel physical load address (hex or decimal); overrides defaults
     #[arg(long, value_parser = parse_int)]
     phys: Option<u64>,
-    /// the phone codename the physical pair belongs to; --format conf and the
-    /// cut emit schema v2 with `kernel_phys_load = { <device> = <value> }`.
-    /// With --options-out the superset records this device's derivation; the
-    /// store harness runs once per device and merges the entries.
+    /// the phone codename the physical pair belongs to; --format conf records
+    /// it as `devices.<codename>.phys`. With --options-out the superset records
+    /// this device's derivation; the store harness runs once per device and
+    /// merges the entries.
     #[arg(long)]
     device: Option<String>,
-    /// output format: text (JSON), json, or conf (flattened GLK profile HOCON)
+    /// output format: text (JSON), json, or conf (the cleaned v3 profile
+    /// document, HOCON)
     #[arg(long, value_parser = ["text", "json", "conf"], default_value = "text")]
     format: String,
     /// route written to --format conf; defaults to the analysis suggestion
     #[arg(long, value_parser = ["tcp_zerocopy", "select_stack", "multicast_waiter", "sigreturn"])]
     route: Option<String>,
-    /// deprecated single-choice pipeline override; the profile now carries an
-    /// ordered list. Mutually exclusive with --pipeline-order.
+    /// single-pipeline override for diagnostics and tests; the profile's ladder
+    /// is derived from `kernel.dirtyfrag` / `kernel.kdp` / `ghostlock.module` /
+    /// `timer`. Mutually exclusive with --pipeline-order.
     #[arg(long, value_parser = ["ghostlock", "dirtyfrag"])]
     pipeline: Option<String>,
     /// ordered pipeline preference (`dirtyfrag,ghostlock`), highest first;
@@ -118,7 +120,7 @@ struct Cli {
     #[arg(long)]
     explain: bool,
     /// scan .bss for a usable lock-anchor region and report the
-    /// route.select_stack.lock_anchor_* triple instead of offsets
+    /// `ghostlock.anchor` triple (image/bytes/stride) instead of offsets
     #[arg(long)]
     anchor_scan: bool,
     /// minimum symbol extent considered by --anchor-scan
@@ -1658,6 +1660,7 @@ fn run(cli: &Cli) -> Result<i32> {
              * null so the native's compiled default applies. */
             phys_offset: kernel_phys_offset,
             phys_source,
+            image_base: Some(base),
             symbols: &symbol_offsets,
             structs: &struct_offsets,
             pipeline_order: &pipeline_order,
@@ -1733,25 +1736,6 @@ fn run(cli: &Cli) -> Result<i32> {
                     );
                 }
             }
-            let common_text = report::render_conf(&report::ConfInputs {
-                release: release_text,
-                phys: kernel_phys_load,
-                phys_offset: kernel_phys_offset,
-                phys_source,
-                symbols: &symbol_offsets,
-                structs: &struct_offsets,
-                pipeline_order: &[],
-                kdp: pipeline_facts.kdp,
-                route: None,
-                route_geometry: &[],
-                cred: &cred,
-                extra_offsets: &extra_offsets,
-                layouts: Some(&layouts),
-                stage1: stage1.map(|stage| report::Stage1Conf {
-                    w1_scratch: None,
-                    ..stage
-                }),
-            });
             let initialized = selinux_fields.as_ref().map(|(_, initialized, _)| *initialized);
             let input = options::Input {
                 release: release_text,
@@ -1759,6 +1743,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 phys_load: kernel_phys_load,
                 phys_offset: kernel_phys_offset,
                 phys_source,
+                image_base: Some(base),
                 device: cli.device.as_deref(),
                 verdicts: &route_verdicts,
                 pipeline_facts: &pipeline_facts,
@@ -1768,7 +1753,7 @@ fn run(cli: &Cli) -> Result<i32> {
                 initialized,
                 kernel: &boot.kernel,
                 rel_symbols: &rel_symbols,
-                common_profile: &common_text,
+                facts: &inputs,
             };
             let superset = options::build(&input);
             if let Some(path) = &cli.options_out {
@@ -1793,7 +1778,10 @@ fn run(cli: &Cli) -> Result<i32> {
                 release: release_text,
                 layouts: &layouts,
             };
-            eprint!("{}", fact::explain_conf(&inputs, &provenance).render());
+            eprint!(
+                "{}",
+                fact::explain_conf(&inputs, &provenance, cli.device.as_deref()).render()
+            );
         }
         let feasible_routes = option_superset
             .routes
@@ -1801,11 +1789,13 @@ fn run(cli: &Cli) -> Result<i32> {
             .filter(|route| route.verdict == "feasible")
             .count();
         if cli.route.is_none() && feasible_routes > 1 {
-            options::render_superset(
-                &option_superset,
-                options::PlanKind::Auto,
-                cli.device.as_deref(),
-            )
+            options::render_superset(&option_superset)
+            .map(|body| {
+                format!(
+                    "# GhostLock kernel profile: {release_text} (HOCON, self-contained, route superset).\n\
+                     # The app's route picker reads this document; a run still cuts one route.\n{body}"
+                )
+            })
             .unwrap_or_else(|| report::render_conf_with_device(&inputs, cli.device.as_deref()))
         } else {
             report::render_conf_with_device(&inputs, cli.device.as_deref())
@@ -2028,14 +2018,12 @@ register provenance across branches; supply it in the profile (see the design do
         match anchor::profile_triple(&a) {
             Some((image, bytes, stride)) => {
                 out.push_str(&format!(
-                    "  => lock_anchor_image = {}   (place under the selected route)\n",
-                    image
+                    "  => ghostlock.anchor {{ image = {}, bytes = {}, stride = {} }}\n",
+                    image, bytes, stride
                 ));
                 out.push_str(&format!(
-                    "     lock_anchor_bytes = {}   (safe prefix 0x{:x} rounded down)\n",
-                    bytes, a.safe_len
+                    "     (bytes is the safe prefix 0x{:x} rounded down)\n\n", a.safe_len
                 ));
-                out.push_str(&format!("     lock_anchor_stride = {}\n\n", stride));
             }
             None => {
                 out.push_str("  => no triple: the safe prefix is shorter than one lock slot\n\n")

@@ -15,7 +15,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 /**
- * The editor export must keep a schema-v2 physical map: the running device's
+ * The editor export must keep a schema-v3 physical map: the running device's
  * entry takes the edited value, every other device entry survives, and a
  * load-only source (the diting `uefi` case) keeps its `null` offset.
  */
@@ -53,7 +53,12 @@ class EditorPhysMapTest {
         val release = "5.10.198-android12-9-00085-g226a9632f13d-ab11136126"
         val asset = AssetConfigLoader(context).load("kernel_profiles/$release.conf")
         val raw = HoconSupport.parseValue(asset).asValueMap() ?: error("no bundle")
-        raw["kernel_phys_offset"] = null
+        /* The 5.10.198 pair is mapped per device; clear the running device's
+         * offset so the export is the load-only case. */
+        val devices = raw["devices"].asValueMap()
+        val entry = devices?.values?.firstOrNull().asValueMap()
+        val phys = entry?.get("phys").asValueMap()
+        phys?.put("offset", null)
         val externalText = HoconSupport.render(raw)
         val external = FakeExternalProfileStore().also { it.writeImportedProfile(externalText) }
         val controller = AndroidProfileConfigController(
@@ -67,10 +72,11 @@ class EditorPhysMapTest {
 
         val document = entry(controller.renderResolved(release) ?: error("no render"))
         assertEquals(3, (document["schema_version"] as Number).toInt())
-        assertTrue(document["kernel_phys_load"] is Map<*, *>)
-        assertNull(document["kernel_phys_offset"])
-        val diting = PerDevicePhys.resolveFor(document, listOf("diting")).document
-        assertEquals(2818572288L, diting["kernel_phys_load"])
-        assertNull(diting["kernel_phys_offset"])
+        assertTrue(document["devices"] is Map<*, *>)
+        val (load, offset) = com.sesame.app.data.profile.ProfileResolver.physOf(
+            PerDevicePhys.resolveFor(document, listOf("diting")).document,
+        )
+        assertEquals(2818572288L, load)
+        assertNull(offset)
     }
 }

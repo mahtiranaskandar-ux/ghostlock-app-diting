@@ -27,7 +27,9 @@ class DirtyfragRomPreflightTest {
         assertTrue("missing stub asset ${stub.absolutePath}", stub.isFile)
 
         val layout = DirtyfragPlan.inspect(lib)
-        val reasons = DirtyfragPlan.checkCave(layout, stub.length().toInt())
+        /* The DirtyFrag pipeline's stub (the plain blob; the module chain has
+         * its own, larger asset and is checked with that one). */
+        val reasons = DirtyfragPlan.checkCave(layout, stub.length().toInt(), 0x50)
         println(
             "libcxx $path exec=0x${layout.execOffset.toString(16)} " +
                 "filesz=0x${layout.execFilesz.toString(16)} hook=0x${layout.hook.toString(16)} " +

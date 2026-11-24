@@ -14,11 +14,10 @@ class ParseSourceUseCase(private val repository: GhostlockRepository) {
         uefiPath: String? = null,
         vendorBootPath: String? = null,
         dtboPath: String? = null,
-        overwrite: Boolean = false,
         route: String? = null,
         onLog: (String) -> Unit = {},
     ) = repository.parseSource(
-        input, xblPath, uefiPath, vendorBootPath, dtboPath, overwrite, route, onLog,
+        input, xblPath, uefiPath, vendorBootPath, dtboPath, route, onLog,
     )
 }
 

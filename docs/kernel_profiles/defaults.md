@@ -3,7 +3,10 @@
 These are the execution-tuning defaults every kernel shares. The resolver loads
 them from `execution-tuning.conf` and `execution-<route>.conf` as presets, merges
 the built-in profile, imported offsets, and user overrides, and hands the result
-to native; anything a profile omits falls back to the values here.
+to native; anything a profile omits falls back to the values here. In the
+profile document these keys live under `ghostlock.execution.` (e.g.
+`ghostlock.execution.race.route_wait_ms`); a document's own value wins and a
+`null` means "use the preset".
 
 Field-name suffixes encode units: `_ms` for milliseconds, `_us` for
 microseconds. The "Impact" and "Rationale" columns explain the trade-offs rather

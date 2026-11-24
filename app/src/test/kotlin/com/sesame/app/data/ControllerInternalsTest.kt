@@ -24,9 +24,8 @@ import java.nio.file.Files
 @Config(sdk = [35])
 class ControllerInternalsTest {
     private val context: Application = RuntimeEnvironment.getApplication()
-    /* A profile that still carries a fallback route (tcp_zerocopy -> select_stack):
-     * the r8 cuts gave the page-free profiles `fallback { to = "none" }`, so only
-     * the six untouched tcp_zerocopy assets can exercise the fallback tuning. */
+    /* A bundled 6.1.138 profile with a native route: any such asset exercises
+     * the general route-tuning projection this class checks. */
     private val release = "6.1.138-android14-11-g151cf2b6bfbe-ab13719792"
 
     private fun withController(
@@ -63,8 +62,8 @@ class ControllerInternalsTest {
             assertTrue(treePaths.none { it.startsWith("execution.selected_cpus.") })
 
             val generalPaths = config.general.map { it.path }
-            assertTrue(generalPaths.any { it.startsWith("execution.routes.tcp_zerocopy.") })
             assertTrue(generalPaths.any { it.startsWith("execution.routes.select_stack.") })
+            assertTrue(generalPaths.none { it.startsWith("execution.routes.sigreturn.") })
         }
 
     @Test

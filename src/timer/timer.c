@@ -58,7 +58,7 @@
 #include <sys/stat.h>
 
 #include "kbuilds.h"
-#include "profile_json.h"
+#include "profile_fields.h"
 
 #define TR "/sys/kernel/tracing"
 /* The compiled victim preference, used only when the platform exposes no

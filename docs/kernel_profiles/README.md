@@ -24,11 +24,10 @@ Every built-in profile lives in `app/src/main/assets/kernel_profiles/`:
 - `index.conf` — the list of built-in kernels. New profiles must be added here.
 - `<uname-r>.conf` — one complete profile per kernel; the file name must match
   `uname -r` exactly.
-- `execution-tuning.conf` — tuning shared by every kernel.
+- `execution-tuning.conf` — tuning shared by every kernel. The resolved
+  document nests it under `ghostlock.execution`.
 - `execution-<route>.conf` — tuning for a single attack route. The resolver
   loads these presets; device profiles don't `include` them.
-- `credential-6x.conf`, `kernelsnitch-6x.conf` — credential template and
-  KernelSnitch values shared by 6.x kernels.
 - `*-template.conf` — annotated reference templates. You can load them manually
   from the debug page, but they never participate in device matching.
 - `docs/kernel_profiles/templates/` — templates grouped by kernel family.
@@ -80,14 +79,16 @@ and doesn't repeat the field reference.
    `off_slide_loggers_0_1` are derived by the built-in arm64 disassembler, and
    the route is suggested from kernel evidence (`--route` overrides it).
    MediaTek images have no `xbl_config.img` and usually no embedded BTF: pass
-   the matching `vendor_boot.img` to read `kernel_phys_load` from its header and
-   `kernel_phys_offset` from the `/memory` node of its embedded DTB (add
-   `--dtbo` when that image carries no DTB). Without them the load falls back
+   the matching `vendor_boot.img` to read the physical load from its header and
+   the DRAM base from the `/memory` node of its embedded DTB (add `--dtbo` when
+   that image carries no DTB). The document states the result as
+   `devices.<codename>.phys.load/offset` (the extractor's own log still says
+   `kernel_phys_load`/`kernel_phys_offset`). Without them the load falls back
    to the kallsyms `_text` link base and `--phys`.
 
 5. **Transcribe field by field, then check your work.**
    Field meanings and requirements are in the
-   [Profile schema](PROFILE_SCHEMA.md). Confirm every required `off_*` is
+   [Profile schema](PROFILE_SCHEMA.md). Confirm every required `kernel.symbols.*` is
    non-zero and that the task/cred layout comes from the same image.
 
 6. **Change `execution` only with device evidence.**
@@ -117,8 +118,9 @@ in the next run:
 
 - **Parameter override page (general overrides)** - adjust `execution.*` tuning,
   such as attempt counts, wait/timeout values, and core selection.
-- **Advanced override page** - change `route` / `fallback.to` and any numeric
-  path (stored as sparse HOCON); handy for trying new offsets or geometry.
+- **Route matrix** - choose the syscall and its carrier
+  (`ghostlock.syscall` / `.carrier`); the anchor and every geometry block come
+  from the document. There is no route fallback and no `fallback.to`.
 - **Export config** - write the fully merged HOCON to a folder you pick (SAF)
   and use it as the starting point for a new profile.
 

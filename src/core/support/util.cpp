@@ -483,8 +483,9 @@ namespace ghostlock::support {
         post_ctx.memfds.assign(mm_objs_per_slab, 0);
     }
 
-    /* Page-free Stage 1/3: W1's value source. A profile that states
-     * `w1_scratch.image` writes the scratch alias through the same +0x100
+    /* Page-free Stage 1/3: W1's value source. A document that states
+     * `ghostlock.anchor.scratch` writes the scratch alias through the same
+     * +0x100
      * construction the page value used, so W1's write is identical apart from
      * where its value comes from. Returns 0 when a stated scratch has no
      * direct-map alias: the caller must refuse rather than fall back to a page
@@ -535,8 +536,8 @@ namespace ghostlock::support {
         uintptr_t default_fops = payload_base + kernel::FOPS_TABLE_OFF;
         uintptr_t credential_fops =
                 payload_base + (tcp_layout ? kernel::TCP_CRED_COPY_OFF : kernel::CRED_COPY_OFF);
-        /* Page-free Stage 1: W1's value source. A profile that states
-         * `w1_scratch.image` writes the scratch alias through the same +0x100
+        /* Page-free Stage 1: W1's value source. A document that states
+         * `ghostlock.anchor.scratch` writes the scratch alias through the same +0x100
          * construction as the page value; everything else on this page stays as
          * it was (the page is still prepared at this stage). */
         uintptr_t zero_value_override = 0;
@@ -1077,7 +1078,7 @@ namespace ghostlock::support {
             /* A value-carrying write with no value source: page-free cannot
              * produce it, and the page is gone by contract. */
             pr_error("page-free write has no value source (zero/preserve_child "
-                     "without w1_scratch.image)\n");
+                     "without ghostlock.anchor.scratch)\n");
             return 0;
         }
         const memory::PayloadWriteLayout write_layout = memory::payload_write_layout(

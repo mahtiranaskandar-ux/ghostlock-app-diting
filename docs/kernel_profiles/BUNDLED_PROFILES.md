@@ -14,7 +14,7 @@ Current mix: 59 page-free, 2 half-page, 7 page-based.
   lock comes from an anchor, the W1 value from a sprayed page; *page*: `tcp_zerocopy`, page-based by
   construction.
 - **Verified** — *device*: the full chain completed on that exact build; *QEMU*: the ten
-  `offset.*`, the anchor and the stride were checked against the same image running under QEMU.
+  `kernel.symbols.*`, the anchor and the stride were checked against the same image running under QEMU.
 
 | Kernel (`uname -r`) | Route | Page-free | Verified | Devices |
 |---|---|---|---|---|
@@ -90,7 +90,7 @@ Current mix: 59 page-free, 2 half-page, 7 page-based.
 Notes:
 
 - `QEMU (9/10)`: on 6.12 the `security_hook_heads` symbol no longer exists, so nine of the ten
-  `offset.*` values can be checked, and all nine match.
+  `kernel.symbols.*` values can be checked, and all nine match.
 - The seven `tcp_zerocopy` rows marked *unverified* were kept from upstream unchanged; this branch
   has no runtime witness for them.
 - The **5.10** profiles are provided by this fork; upstream does not cover the 5.10 family.

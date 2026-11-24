@@ -47,6 +47,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import kotlinx.coroutines.delay
 import com.sesame.app.R
 import com.sesame.app.domain.model.CrashEvidenceInfo
 import com.sesame.app.ui.nav.NavController
@@ -166,7 +167,6 @@ internal fun GhostlockApp(
                                 }
                             }
 
-                            overlay.overwriteVisible -> overlayActions.onOverwriteDismiss()
                             overlay.dialog != null -> overlayActions.onDialogDismiss()
                             else -> {
                                 if (nav.canPop) {
@@ -217,7 +217,6 @@ internal fun GhostlockApp(
                     }
                 }
                 GhostlockDialog(state = session, overlay = overlay, actions = overlayActions)
-                GhostlockOverwriteDialog(overlay = overlay, actions = overlayActions)
                 RunLogPickerDialog(report = report, actions = reportActions)
                 StridePickerDialog(overlay = overlay, actions = overlayActions)
                 GhostlockExecutionSheet(state = session, report = report, actions = reportActions)
@@ -289,8 +288,26 @@ private fun GhostlockExecutionSheet(
         },
         content = {
             if (!state.run.sheetDismissible) {
+                /* The design's "running · mm:ss": the elapsed comes from the
+                 * run's start stamp, re-read once a second while it runs. */
+                var now by remember { mutableStateOf(System.currentTimeMillis()) }
+                LaunchedEffect(state.run.startedAtMs, state.run.sheetDismissible) {
+                    while (!state.run.sheetDismissible) {
+                        now = System.currentTimeMillis()
+                        delay(1_000)
+                    }
+                }
+                val elapsedMs = if (state.run.startedAtMs > 0) {
+                    (now - state.run.startedAtMs).coerceAtLeast(0)
+                } else {
+                    0
+                }
                 Text(
-                    text = stringResource(R.string.action_running),
+                    text = stringResource(
+                        R.string.action_running_elapsed,
+                        (elapsedMs / 60_000).toInt(),
+                        ((elapsedMs / 1_000) % 60).toInt(),
+                    ),
                     modifier = Modifier.padding(bottom = 8.dp),
                     style = MiuixTheme.textStyles.body2,
                     color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
@@ -305,13 +322,14 @@ private fun GhostlockExecutionSheet(
             )
             /* The run's visible verdict and the two terminal actions. The
              * manager itself is never auto-launched by the app: on a late-load
-             * ROM its own restart is what takes the foreground mid-handoff. */
+             * ROM its own restart is what takes the foreground mid-handoff.
+             * The verdict gets its own row: beside two long action labels it
+             * wrapped mid-word on a phone. */
             if (state.run.sheetDismissible) {
-                Row(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(top = 12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
                 ) {
                     if (state.run.status != RunStatus.Idle) {
                         Text(
@@ -322,21 +340,25 @@ private fun GhostlockExecutionSheet(
                                     R.string.run_status_failed
                                 },
                             ),
-                            modifier = Modifier.weight(1f),
                             style = MiuixTheme.textStyles.body2,
                             color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
                         )
-                    } else {
-                        Spacer(Modifier.weight(1f))
+                        Spacer(Modifier.height(4.dp))
                     }
-                    TextButton(
-                        text = stringResource(R.string.run_log_export),
-                        onClick = actions::onOpenExportRunLog,
-                    )
-                    TextButton(
-                        text = stringResource(R.string.run_notif_open_manager),
-                        onClick = actions::onOpenManager,
-                    )
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(
+                            text = stringResource(R.string.run_log_export),
+                            onClick = actions::onOpenExportRunLog,
+                        )
+                        TextButton(
+                            text = stringResource(R.string.run_notif_open_manager),
+                            onClick = actions::onOpenManager,
+                        )
+                    }
                 }
             }
         },
@@ -368,6 +390,16 @@ private fun GhostlockDialog(
                 is AppDialog.RouteMatrix -> RouteMatrixContent(state, actions)
 
                 is AppDialog.ListDialog -> {
+                    if (dialog.messageRes != 0) {
+                        Text(
+                            text = stringResource(dialog.messageRes),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(bottom = 12.dp),
+                            style = MiuixTheme.textStyles.body2,
+                            color = MiuixTheme.colorScheme.onSurfaceVariantSummary,
+                        )
+                    }
                     val items = dialog.items.ifEmpty { dialog.itemResIds.map { stringResource(it) } }
                     val leading = dialog.leadingResId
                     val offset = if (leading != null) 1 else 0
@@ -1054,7 +1086,10 @@ private fun StridePickerDialog(
         show = true,
         title = stringResource(R.string.stride_title),
         summary = stringResource(R.string.stride_subtitle, recommendation.samples),
-        onDismissRequest = actions::onStridePickerDismiss,
+        /* The stride is mandatory for a W1-ladder profile: outside-tap and Back
+         * do nothing, so an accidental gesture cannot throw away the probe.
+         * The only exit is choosing a value and pressing Use. */
+        onDismissRequest = {},
         content = {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Card(modifier = Modifier.fillMaxWidth()) {
@@ -1171,25 +1206,15 @@ private fun StridePickerDialog(
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                Row(
+                TextButton(
+                    text = picker.selectedValue
+                        ?.let { stringResource(R.string.stride_use, it) }
+                        ?: stringResource(R.string.stride_use_none),
+                    enabled = picker.selectedValue != null,
+                    onClick = actions::onStrideUse,
+                    colors = ButtonDefaults.textButtonColorsPrimary(),
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                ) {
-                    TextButton(
-                        text = picker.selectedValue
-                            ?.let { stringResource(R.string.stride_use, it) }
-                            ?: stringResource(R.string.stride_use_none),
-                        enabled = picker.selectedValue != null,
-                        onClick = actions::onStrideUse,
-                        colors = ButtonDefaults.textButtonColorsPrimary(),
-                        modifier = Modifier.weight(1f),
-                    )
-                    TextButton(
-                        text = stringResource(R.string.stride_skip),
-                        onClick = actions::onStrideSkip,
-                        modifier = Modifier.weight(1f),
-                    )
-                }
+                )
                 Text(
                     text = stringResource(picker.footerRes),
                     style = MiuixTheme.textStyles.body2,
@@ -1227,37 +1252,6 @@ private fun strideReasonText(reason: StrideReason): String = when (reason) {
     StrideReason.Tie -> stringResource(R.string.stride_reason_tie)
     is StrideReason.Single -> stringResource(
         if (reason.samples > 0) R.string.stride_reason_single else R.string.stride_reason_none,
-    )
-}
-
-/** `20261009-212803 · Shizuku · interrupted · 42 KB` */
-
-@Composable
-private fun GhostlockOverwriteDialog(
-    overlay: OverlayState,
-    actions: OverlayActions,
-) {
-    OverlayDialog(
-        show = overlay.overwriteVisible,
-        title = stringResource(R.string.overwrite_title),
-        summary = stringResource(R.string.overwrite_message, overlay.overwriteMessage),
-        onDismissRequest = actions::onOverwriteDismiss,
-        content = {
-            Row(modifier = Modifier.fillMaxWidth()) {
-                TextButton(
-                    modifier = Modifier.weight(1f),
-                    text = stringResource(R.string.cancel),
-                    onClick = actions::onOverwriteDismiss,
-                )
-                Spacer(modifier = Modifier.width(12.dp))
-                TextButton(
-                    modifier = Modifier.weight(1f),
-                    text = stringResource(R.string.overwrite_yes),
-                    colors = ButtonDefaults.textButtonColorsPrimary(),
-                    onClick = actions::onOverwriteConfirm,
-                )
-            }
-        },
     )
 }
 

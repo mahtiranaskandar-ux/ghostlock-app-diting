@@ -1,238 +1,143 @@
 package com.sesame.app.data.profile
 
-import com.sesame.app.data.NativeProfileDocument
+import com.sesame.app.data.ValueMap
+import com.sesame.app.data.asValueMap
 import com.sesame.app.data.valueMapOf
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class Timer98260Test {
-    private fun realBlock() = valueMapOf(
-        "version" to 1L,
+    private fun block(overrides: Map<String, Any?> = emptyMap()): ValueMap = valueMapOf(
         "trigger" to "killable",
-        "timer_site_lower_21bit" to 507136L,
-        "timer_object_size" to 264L,
-        "cred_request_size" to 168L,
-        "cred_alloc_size" to 192L,
-        "cred_uid_offset" to 4L,
-        "timer_node_offset" to 120L,
-        "page_alloc_gfp_offset" to 20L,
-        "page_alloc_gfp_size" to 4L,
+        "match_bits" to 21L,
+        "sites" to valueMapOf(
+            "timer" to valueMapOf("offset" to "0x191af8"),
+            "task_alloc" to valueMapOf("low_bits" to "0xab680"),
+        ),
+        "object_size" to 264L,
+        "task_alloc_size" to 4800L,
+        "node_offset" to 120L,
+        "cred" to valueMapOf("request_size" to 176L, "alloc_size" to 192L),
+        "trace" to valueMapOf("gfp" to valueMapOf("offset" to 24L, "size" to 8L)),
+    ).apply { putAll(overrides) }
+
+    private fun symbols(): ValueMap = valueMapOf(
+        "selinux_state" to "0x222a000", "panic_on_warn" to "0x1fd0000",
+        "root_user" to "0x2001000", "init_user_ns" to "0x2000000",
+        "init_ucounts" to "0x2003000", "init_groups" to "0x2002000",
+        "init_task" to "0x1ff0000", "init_cred" to "0x2002000",
+        "root_task_group" to "0x21d5000", "empty_zero_page" to "0x21cf000",
+        "selinux_blob_sizes" to "0x15b5000", "security_hook_heads" to "0x15b3000",
+        "nf_logger" to "0x1fe2000", "loggers_0_1" to "0x1fe1000",
+        "boot_id" to "0x22cc000",
     )
 
-    private fun fakeBlock(): Map<String, Any?> = LinkedHashMap(realBlock()).apply {
-        put("static_timer_site", "0xffffffc00827bd00")
-        put("task_alloc_site_lower_21bit", 1206088L)
-        put("task_alloc_size", 4736L)
-        put("task_cred_offset", "0x780")
-        put("selinux_state", "0xffffffc00aa42b90")
-        put("panic_on_warn", "0xffffffc00a789dc0")
-        put("root_user", "0xffffffc00a7af5e0")
-        put("init_user_ns", "0xffffffc00a7af678")
-        put("init_groups", "0xffffffc00a7b0b08")
-        put("cred_usage_size", 4L)
-        put("cred_caps_offset", 40L)
-        put("cred_caps_count", 5L)
-        put("cred_security_offset", 120L)
-        put("cred_user_offset", 128L)
-        put("cred_user_ns_offset", 136L)
-        put("cred_group_info_offset", 144L)
-        put("security_sid_offset", 4L)
+    private fun document(
+        symbols: Any? = symbols(),
+        imageBase: Any? = "0xffffffc008000000",
+        block: Any? = block(),
+        ucounts: Any? = valueMapOf("offset" to 144L, "image" to null),
+    ): ValueMap = valueMapOf(
+        "kernel" to valueMapOf(
+            "image_base" to imageBase,
+            "symbols" to symbols,
+            "struct" to valueMapOf(
+                "cred" to valueMapOf(
+                    "security" to 120L,
+                    "security_sid" to 4L,
+                    "usage" to valueMapOf("offset" to null, "size" to 4L, "value" to 1L),
+                    "caps" to valueMapOf("offset" to 40L, "count" to 5L, "mask" to "0x1ffffffffff"),
+                    "refs" to valueMapOf(
+                        "user" to valueMapOf("offset" to 128L, "image" to null),
+                        "user_ns" to valueMapOf("offset" to 136L, "image" to null),
+                        "ucounts" to ucounts,
+                        "group_info" to valueMapOf("offset" to 152L, "image" to null),
+                    ),
+                ),
+            ),
+        ),
+        "timer" to block,
+    )
+
+    @Test
+    fun `a complete block parses into the tool's facts`() {
+        val (parsed, errors) = Timer98260.parse(block())
+        assertEquals(emptyList<ConfigError>(), errors)
+        requireNotNull(parsed)
+        assertEquals(TimerTrigger.KILLABLE, parsed.trigger)
+        assertEquals(21L, parsed.matchBits)
+        assertEquals(0x191af8uL, parsed.timerOffset)
+        assertEquals(0xab680uL, parsed.taskAllocLowBits)
+        assertEquals(264L, parsed.objectSize)
+        assertEquals(4800L, parsed.taskAllocSize)
+        assertEquals(120L, parsed.nodeOffset)
+        assertEquals(176L, parsed.credRequestSize)
+        assertEquals(192L, parsed.credAllocSize)
+        assertEquals(24L, parsed.gfpOffset)
+        assertEquals(8L, parsed.gfpSize)
+        assertEquals("real,fake", parsed.endgameLabel)
     }
 
     @Test
-    fun `a real block parses and validates`() {
-        val (config, errors) = Timer98260.parse(realBlock())
-        assertTrue(errors.toString(), errors.isEmpty())
-        assertNotNull(config)
-        assertEquals("real", config!!.endgameLabel)
-        assertEquals(507136L, config.timerSiteLower21Bit)
-        assertEquals(264L, config.timerObjectSize)
-        assertEquals(168L, config.credRequestSize)
-        assertEquals(192L, config.credAllocSize)
-        assertEquals(4L, config.credUidOffset)
-        assertEquals(120L, config.timerNodeOffset)
-        assertEquals(TraceLayout(20L, 4L), config.trace)
-        assertNull(config.cred)
+    fun `core_state is the other trigger`() {
+        val (parsed, errors) = Timer98260.parse(block(mapOf("trigger" to "core_state")))
+        assertEquals(emptyList<ConfigError>(), errors)
+        assertEquals(TimerTrigger.CORE_STATE, parsed?.trigger)
     }
 
     @Test
-    fun `a real,fake block parses the overlay and the hex fields`() {
-        val (config, errors) = Timer98260.parse(fakeBlock())
-        assertTrue(errors.toString(), errors.isEmpty())
-        assertNotNull(config)
-        assertEquals("real,fake", config!!.endgameLabel)
-        assertTrue(config.fakeSupported)
-        assertEquals(0xffffffc00827bd00uL, config.staticTimerSite)
-        assertEquals(0x780uL, config.taskCredOffset)
-        assertEquals(0xffffffc00aa42b90uL, config.dataSymbols["selinux_state"])
-        assertEquals(5L, config.cred?.capsCount)
-        assertEquals(4L, config.cred!!.sidOffset)
+    fun `absence is not an error but the block is unavailable`() {
+        assertEquals(null to emptyList<ConfigError>(), Timer98260.parse(null))
+        assertFalse(Timer98260.fakeSupported(valueMapOf("kernel" to null, "timer" to null)))
     }
 
     @Test
-    fun `the trigger is carried into the config`() {
-        val (core, coreErrors) = Timer98260.parse(
-            realBlock() + valueMapOf("trigger" to "core_state"),
-        )
-        assertTrue(coreErrors.toString(), coreErrors.isEmpty())
-        assertEquals(TimerTrigger.CORE_STATE, core!!.trigger)
-        val (fake, fakeErrors) = Timer98260.parse(fakeBlock())
-        assertTrue(fakeErrors.toString(), fakeErrors.isEmpty())
-        assertEquals(TimerTrigger.KILLABLE, fake!!.trigger)
+    fun `the block's fixed values are enforced`() {
+        fun fields(vararg overrides: Pair<String, Any?>) =
+            Timer98260.validate(block(overrides.toMap())).map { it.fieldPath }
+
+        assertTrue("timer.match_bits" in fields("match_bits" to 20L))
+        assertTrue("timer.trigger" in fields("trigger" to "surprise"))
+        assertTrue("timer.object_size" in fields("object_size" to 8L))
+        assertTrue("timer.task_alloc_size" in fields("task_alloc_size" to 100L))
+        assertTrue("timer.node_offset" in fields("node_offset" to 4L))
+        assertTrue("timer.sites.task_alloc.low_bits" in fields(
+            "sites" to valueMapOf(
+                "timer" to valueMapOf("offset" to "0x191af8"),
+                "task_alloc" to valueMapOf("low_bits" to "0x200000"),
+            ),
+        ))
+        assertTrue("timer.bogus" in fields("bogus" to 1L))
+        assertTrue("timer.trace.gfp.size" in fields(
+            "trace" to valueMapOf("gfp" to valueMapOf("offset" to 24L, "size" to 2L)),
+        ))
     }
 
     @Test
-    fun `the trigger is validated`() {
-        fun errorsOf(block: Map<String, Any?>) = Timer98260.validate(block)
-
-        // a legacy real-only block predates the key and keeps the default
-        assertTrue(errorsOf(realBlock() - "trigger").isEmpty())
-        // a fake block must carry it
-        assertTrue(
-            errorsOf(fakeBlock() - "trigger")
-                .any { it.fieldPath == "timer_98260.trigger" },
-        )
-        // unknown or non-string values are refused
-        assertTrue(
-            errorsOf(realBlock() + valueMapOf("trigger" to "both"))
-                .any { it.fieldPath == "timer_98260.trigger" },
-        )
-        assertTrue(
-            errorsOf(realBlock() + valueMapOf("trigger" to 2L))
-                .any { it.fieldPath == "timer_98260.trigger" },
-        )
-    }
-
-    @Test
-    fun `absence of the block is not an error`() {
-        val (config, errors) = Timer98260.parse(null)
-        assertTrue(errors.isEmpty())
-        assertNull(config)
-    }
-
-    @Test
-    fun `unknown and malformed fields are refused`() {
-        fun errorsOf(block: Map<String, Any?>) = Timer98260.validate(block)
-
-        assertTrue(
-            errorsOf(realBlock() + valueMapOf("surprise" to 1L))
-                .any { it.fieldPath == "timer_98260.surprise" },
-        )
-        assertTrue(
-            errorsOf(realBlock() - "cred_uid_offset")
-                .any { it.fieldPath == "timer_98260.cred_uid_offset" },
-        )
-        // any fake key selects the fake set: a lone data symbol is refused
-        assertTrue(
-            errorsOf(realBlock() + valueMapOf("selinux_state" to "0xffffffc00aa42b90"))
-                .any { it.fieldPath == "timer_98260.static_timer_site" },
-        )
-        assertTrue(
-            errorsOf(realBlock() + valueMapOf("timer_site_lower_21bit" to 0x200000L))
-                .any { it.fieldPath == "timer_98260.timer_site_lower_21bit" },
-        )
-        // the fake static site must agree with the masked site
-        assertTrue(
-            errorsOf(fakeBlock() + valueMapOf("static_timer_site" to "0xffffffc00827bd08"))
-                .any { it.fieldPath == "timer_98260.static_timer_site" },
-        )
-        assertTrue(
-            errorsOf(fakeBlock() + valueMapOf("static_timer_site" to "0xffffffc01807bd00"))
-                .isEmpty(),
-        )
-        // the cred offset must fall inside the task object
-        assertTrue(
-            errorsOf(fakeBlock() + valueMapOf("task_cred_offset" to "0x2000"))
-                .any { it.fieldPath == "timer_98260.task_cred_offset" },
-        )
-        assertTrue(
-            errorsOf(realBlock() - "page_alloc_gfp_offset")
-                .any { it.fieldPath == "timer_98260.page_alloc_gfp_offset" },
-        )
-        assertTrue(
-            errorsOf(realBlock() + valueMapOf("page_alloc_gfp_size" to 2L))
-                .any { it.fieldPath == "timer_98260.page_alloc_gfp_size" },
-        )
-        // fake without the cred overlay keys
-        assertTrue(
-            errorsOf(fakeBlock() - "cred_caps_offset")
-                .any { it.fieldPath == "timer_98260.cred_caps_offset" },
-        )
-        // the old nested cred object is not a known key
-        assertTrue(
-            errorsOf(fakeBlock() + valueMapOf("cred" to valueMapOf("caps_offset" to 40L)))
-                .any { it.fieldPath == "timer_98260.cred" },
-        )
-        // hex-string form and number form agree
-        assertTrue(errorsOf(fakeBlock() + valueMapOf("timer_object_size" to "264")).isEmpty())
-        // a ucounts overlay requires init_ucounts
-        val withUcounts = LinkedHashMap(fakeBlock()).apply {
-            put("cred_ucounts_offset", 144L)
-            put("cred_group_info_offset", 152L)
+    fun `the fake group needs the shared kernel facts`() {
+        assertTrue(Timer98260.fakeSupported(document()))
+        /* No image base: the tool cannot reconstruct the VAs. */
+        assertFalse(Timer98260.fakeSupported(document(imageBase = null)))
+        /* A required symbol is absent. */
+        assertFalse(Timer98260.fakeSupported(document(symbols = null)))
+        /* The credential overlay is incomplete. */
+        val noSid = document().apply {
+            val struct = this["kernel"].asValueMap()!!["struct"].asValueMap()!!
+            (struct["cred"].asValueMap()!!)["security_sid"] = null
         }
+        assertFalse(Timer98260.fakeSupported(noSid))
+        /* ucounts needs init_ucounts. */
+        val symbolsWithoutUcounts = symbols().apply { remove("init_ucounts") }
+        assertFalse(Timer98260.fakeSupported(document(symbols = symbolsWithoutUcounts)))
+        /* ...and a cred without ucounts does not. */
         assertTrue(
-            errorsOf(withUcounts).any { it.fieldPath == "timer_98260.init_ucounts" },
+            Timer98260.fakeSupported(
+                document(symbols = symbolsWithoutUcounts, ucounts = null),
+            ),
         )
-    }
-
-    @Test
-    fun `the resolver accepts the block as a known top-level key`() {
-        val errors = ProfileResolver.validateMerged(
-            valueMapOf("timer_98260" to realBlock()), "select_stack", "none",
-        )
-        assertTrue(errors.none { it.fieldPath == "timer_98260" })
-        val unknownKeyErrors = ProfileResolver.validateMerged(
-            valueMapOf("timer_98260" to (realBlock() + valueMapOf("surprise" to 1L))),
-            "select_stack", "none",
-        )
-        assertTrue(unknownKeyErrors.any { it.fieldPath == "timer_98260.surprise" })
-    }
-
-    /**
-     * The native wire must not see the block: the same profile with and without
-     * it produces the identical binary document (and therefore the same wire
-     * digest). The block ships through the canonical JSON document instead.
-     */
-    @Test
-    fun `the native document is byte-identical with and without the block`() {
-        val base = valueMapOf(
-            "release" to "6.1.138-test",
-            "schema_version" to 3L,
-            "kernel_major" to 6L,
-            "route" to valueMapOf("select_stack" to valueMapOf("waiter_shift" to -2L)),
-            "offset" to valueMapOf("init_task" to 123L),
-        )
-        fun binary(profile: Map<String, Any?>) = NativeProfileDocument.from(
-            release = "6.1.138-test",
-            route = "select_stack",
-            fallbackTo = null,
-        ) { path -> ProfileResolver.nativeValue(profile, "select_stack", null, path) }.toBinary()
-
-        assertArrayEquals(binary(base), binary(base + valueMapOf("timer_98260" to fakeBlock())))
-    }
-
-    @Test
-    fun `the canonical document carries the block with hex strings and numbers`() {
-        val merged = valueMapOf(
-            "release" to "5.10.236-test",
-            "schema_version" to 3L,
-            "kernel_major" to 5L,
-            "route" to valueMapOf("select_stack" to valueMapOf("waiter_shift" to -2L)),
-            "timer_98260" to fakeBlock(),
-        )
-        val document = ProfileDocument.render(merged)
-        assertTrue(document.contains("\"release\": \"5.10.236-test\""))
-        assertTrue(document.contains("\"timer_98260\""))
-        assertTrue(document.contains("\"static_timer_site\": \"0xffffffc00827bd00\""))
-        assertTrue(document.contains("\"timer_site_lower_21bit\": 507136"))
-        assertTrue(document.contains("\"page_alloc_gfp_offset\": 20"))
-        assertTrue(document.contains("\"kernel\""))
-        assertTrue(document.contains("\"native\""))
-        // canonical: sorted keys and stable byte-for-byte output
-        assertEquals(document, ProfileDocument.render(merged))
     }
 }

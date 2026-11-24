@@ -3,9 +3,7 @@ package com.sesame.app.data
 import android.app.Application
 import androidx.core.content.edit
 import kotlinx.coroutines.runBlocking
-import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -26,9 +24,10 @@ class ExporterAgreementTest {
     private val context: Application = RuntimeEnvironment.getApplication()
 
     private fun isModuleOnly(file: String): Boolean {
-        val document = HoconSupport.parseValue(
+        val authored = HoconSupport.parseValue(
             AssetConfigLoader(context).load("kernel_profiles/$file"),
         ).asValueMap() ?: return false
+        val document = authored
         val order = com.sesame.app.data.profile.ProfileResolver.pipelineOrder(document)
         return "module" in order &&
             !com.sesame.app.data.profile.ProfileResolver.requiresW1(order)
@@ -57,8 +56,8 @@ class ExporterAgreementTest {
             .filterNot { (_, file) -> isModuleOnly(file) }
             .map { it.first }
             .toSortedSet()
-        val actual = exporterDir.listFiles { file -> file.isFile && file.name.endsWith(".bin") }
-            .orEmpty().map { it.name.removeSuffix(".bin") }.toSortedSet()
+        val actual = exporterDir.listFiles { file -> file.isFile && file.name.endsWith(".json") }
+            .orEmpty().map { it.name.removeSuffix(".json") }.toSortedSet()
         assertEquals("exported set must match the index (excluding templates)", expected, actual)
 
         val root = Files.createTempDirectory("exporter-agreement").toFile()
@@ -73,12 +72,19 @@ class ExporterAgreementTest {
                 deviceCodename = null,
             )
             for (release in expected) {
-                val appBytes = controller.nativeDocument(controller.load(release))
-                assertNotNull("$release: app has no native document", appBytes)
-                assertArrayEquals(
+                val appText = String(
+                    checkNotNull(controller.nativeDocument(controller.load(release))) {
+                        "$release: app has no native document"
+                    },
+                    Charsets.UTF_8,
+                )
+                /* Both sides are the same resolved map through the same
+                 * renderer; the exporter is device-neutral, so the device entry
+                 * is absent on both. */
+                assertEquals(
                     "$release: exporter differs from the app",
-                    appBytes,
-                    File(exporterDir, "$release.bin").readBytes(),
+                    appText,
+                    File(exporterDir, "$release.json").readText(),
                 )
             }
         } finally {

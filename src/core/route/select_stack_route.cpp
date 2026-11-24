@@ -428,7 +428,7 @@ namespace ghostlock::route {
          * both waiter shapes -- the anchor is not a compact-only object. The
          * default is the fake rt_mutex in the reclaimed payload page (the
          * behaviour every build before this one had). With
-         * route.select_stack.lock_anchor_image set, point it at an
+         * `ghostlock.anchor.image` set, point it at an
          * image-relative zero, writable, reference-free region instead, so
          * rt_mutex_enqueue's descent exits on its first test whatever that
          * page happens to contain. data_alias() maps the image offset to the

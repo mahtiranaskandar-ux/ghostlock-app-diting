@@ -14,7 +14,6 @@ import org.junit.Test
  */
 class ModuleBlockerTest {
     private val module = ModuleConfig(
-        version = 1,
         asset = "modules/5.4.233-qgki-gbb70cde46897.ko",
         assetSha256 = "64981aad" + "0".repeat(56),
         vendorFiles = listOf("/vendor/lib64/libstagefrighthw.so"),

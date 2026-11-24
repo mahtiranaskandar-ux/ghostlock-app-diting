@@ -8,7 +8,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::Ordering;
@@ -26,11 +25,6 @@ pub struct Meta {
     /// Empty on a legacy root-sidecar entry.
     pub devices: Vec<String>,
     pub image: Option<PathBuf>,
-    /// The entry's recorded pipeline choice (`meta.txt` `pipeline = ...`).
-    /// The extractor requires `--pipeline` when both are feasible, so every
-    /// maximal invocation passes the entry's own choice, as the ship script
-    /// does.
-    pub pipeline: Option<String>,
 }
 
 impl Meta {
@@ -60,7 +54,6 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
     let mut device = None;
     let mut devices: Vec<String> = Vec::new();
     let mut image = None;
-    let mut pipeline = None;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -73,7 +66,6 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
         match key.trim() {
             "release" => release = Some(value.trim_matches('"').to_string()),
             "corpus" => corpus = Some(value.to_string()),
-            "pipeline" => pipeline = Some(value.trim_matches('"').to_string()),
             "phys" => phys = parse_phys(value),
             "device" => device = Some(value.trim_matches('"').to_string()),
             "devices" => devices.extend(
@@ -133,7 +125,6 @@ pub fn parse_meta(dir: &Path) -> Option<Meta> {
         device,
         devices,
         image,
-        pipeline,
     })
 }
 
@@ -236,13 +227,18 @@ pub fn options_path(meta: &Meta) -> PathBuf {
 ///
 /// An entry with `devices/<codename>/` sets runs the extractor once per device
 /// and merges the per-device derivations into one superset: the first device's
-/// run supplies the shared top-level sections, and `devices[]` collects all.
+/// run supplies the shared sections, `document.devices` collects every pair in
+/// the schema shape, and `device_analysis` collects the per-pair evidence.
 pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
     if meta.devices.is_empty() {
         return run_options_one(bin, meta, &meta.dir, None, out);
     }
     let mut base: Option<serde_json::Value> = None;
-    let mut merged: Vec<serde_json::Value> = Vec::new();
+    let mut analysis: Vec<serde_json::Value> = Vec::new();
+    /* The document is the one home of the physical pair, keyed by codename in
+     * the schema shape. Each per-device run carries its own entry; the merged
+     * document carries all of them. */
+    let mut pairs = serde_json::Map::new();
     let mut last: Option<Run> = None;
     for device in &meta.devices {
         let dir = sidecar_dir_for(meta, Some(device));
@@ -265,11 +261,34 @@ pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
             panic!("{}: invalid {device} superset JSON: {err}", meta.release)
         });
         let entries = value
-            .get("devices")
+            .get("device_analysis")
             .and_then(|entries| entries.as_array())
             .cloned()
             .unwrap_or_default();
-        merged.extend(entries);
+        analysis.extend(entries);
+        /* A device with no derived pair still appears in the document map with
+         * a null pair (the native's compiled default applies). */
+        let doc_devices = value
+            .get("document")
+            .and_then(|document| document.get("devices"))
+            .and_then(|devices| devices.as_object());
+        let names: Vec<String> = value
+            .get("device_analysis")
+            .and_then(|entries| entries.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.get("device").and_then(|name| name.as_str()))
+            .map(str::to_string)
+            .collect();
+        for name in names {
+            let entry = doc_devices
+                .and_then(|devices| devices.get(&name))
+                .cloned()
+                .unwrap_or_else(|| {
+                    serde_json::json!({"phys": {"load": null, "offset": null}})
+                });
+            pairs.insert(name, entry);
+        }
         match &base {
             None => base = Some(value),
             Some(base_value) => {
@@ -287,35 +306,38 @@ pub fn run_options(bin: &str, meta: &Meta, out: &Path) -> Run {
                         meta.release
                     );
                 }
-                /* The `w1_scratch` and top-level phys are pair-dependent; every
-                 * other common block is image-level and must agree. */
-                if let (Some(a), Some(b)) = (
-                    base_value.get("profile").and_then(|v| v.as_object()),
-                    value.get("profile").and_then(|v| v.as_object()),
-                ) {
-                    for (block, entries) in a {
-                        if block.is_empty() || block == "w1_scratch" {
-                            continue;
-                        }
-                        assert_eq!(
-                            Some(entries),
-                            b.get(block),
-                            "{}: profile block {block:?} differs between devices",
-                            meta.release
-                        );
-                    }
-                }
+                /* The pair is the only per-device part of the document; every
+                 * other block is image-level and must agree. */
+                assert_eq!(
+                    without_devices(base_value.get("document").unwrap_or(&base_value)),
+                    without_devices(value.get("document").unwrap_or(&value)),
+                    "{}: the document differs between devices outside `devices`",
+                    meta.release
+                );
             }
         }
         last = Some(run);
     }
     let mut base = base.expect("at least one device");
-    if !merged.is_empty() {
-        base["devices"] = serde_json::Value::Array(merged);
+    base["device_analysis"] = serde_json::Value::Array(analysis);
+    if !pairs.is_empty() {
+        if let Some(document) = base.get_mut("document").and_then(|d| d.as_object_mut()) {
+            document.insert("devices".to_string(), serde_json::Value::Object(pairs));
+        }
     }
     let text = serde_json::to_string_pretty(&base).expect("serialize merged superset");
     std::fs::write(out, text + "\n").expect("write merged superset");
     last.expect("at least one device run")
+}
+
+/// A document with its per-device pair map blanked, for the cross-device
+/// equality check. A non-object document is returned unchanged.
+fn without_devices(document: &serde_json::Value) -> serde_json::Value {
+    let mut document = document.clone();
+    if let Some(map) = document.as_object_mut() {
+        map.insert("devices".to_string(), serde_json::Value::Null);
+    }
+    document
 }
 
 fn run_options_one(bin: &str, meta: &Meta, sidecars: &Path, device: Option<&str>, out: &Path) -> Run {
@@ -337,42 +359,6 @@ fn run_options_one(bin: &str, meta: &Meta, sidecars: &Path, device: Option<&str>
         .collect();
     let output = command.output().expect("run extractor");
     let _ = std::fs::remove_file(&profile);
-    Run {
-        exit: output.status.code(),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        args,
-    }
-}
-
-/// The CLI's default conf render for a route: `--anchor` with no operator
-/// flags, which follows the same auto plan as the cut.
-pub fn run_auto_conf(bin: &str, meta: &Meta, route: &str) -> Run {
-    let device = meta.device.clone().or_else(|| meta.devices.first().cloned());
-    run_auto_conf_for(bin, meta, route, device.as_deref())
-}
-
-/// The CLI's default conf render for one explicit device sidecar set.
-pub fn run_auto_conf_for(bin: &str, meta: &Meta, route: &str, device: Option<&str>) -> Run {
-    let dir = sidecar_dir_for(meta, device);
-    let mut command = build_command(bin, meta, &dir);
-    command
-        .arg("--format")
-        .arg("conf")
-        .arg("--route")
-        .arg(route)
-        .arg("--anchor");
-    if let Some(pipeline) = &meta.pipeline {
-        command.arg("--pipeline").arg(pipeline);
-    }
-    if let Some(device) = device {
-        command.arg("--device").arg(device);
-    }
-    let args: Vec<String> = command
-        .get_args()
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let output = command.output().expect("run extractor");
     Run {
         exit: output.status.code(),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -405,35 +391,6 @@ pub fn run_no_disasm(bin: &str, meta: &Meta, route: &str) -> Run {
     }
 }
 
-/// Strip comments and split a profile into top-level blocks (by name).
-pub fn blocks(text: &str) -> BTreeMap<String, BTreeSet<String>> {
-    let mut out: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    let mut current: Option<String> = None;
-    for raw in text.lines() {
-        let line = raw.split('#').next().unwrap_or("").trim();
-        if line.is_empty() {
-            continue;
-        }
-        if let Some(name) = &current {
-            out.entry(name.clone())
-                .or_default()
-                .insert(line.to_string());
-            if line == "}" {
-                current = None;
-            }
-        } else if let Some(rest) = line.strip_suffix('{') {
-            current = Some(rest.trim().to_string());
-        } else if line == "}" {
-            // unbalanced; ignore
-        } else {
-            out.entry(String::new())
-                .or_default()
-                .insert(line.to_string());
-        }
-    }
-    out
-}
-
 /// Run `f` over `items` on a small worker pool. Each entry's extractor
 /// invocations are independent subprocesses, so the corpus tests parallelize
 /// for the same reason the generator does. Panics propagate when the scope
@@ -453,4 +410,65 @@ pub fn par_for_each<T: Sync, F: Fn(&T) + Sync>(items: &[T], workers: usize, f: F
             });
         }
     });
+}
+
+/// The value at a dotted path in the cleaned profile text. Blocks are
+/// `name {` … `}`; leaves are `key = value`. Strings keep their quotes.
+pub fn profile_value(text: &str, path: &str) -> Option<String> {
+    let parts: Vec<&str> = path.split('.').collect();
+    let mut stack: Vec<String> = Vec::new();
+    for raw in text.lines() {
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line == "}" {
+            stack.pop();
+            continue;
+        }
+        if line.ends_with("{}") {
+            continue;
+        }
+        if let Some(name) = line.strip_suffix('{') {
+            stack.push(name.trim().to_string());
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if stack.len() + 1 == parts.len()
+            && stack.iter().zip(parts.iter()).all(|(opened, wanted)| opened == wanted)
+            && key.trim() == parts[parts.len() - 1]
+        {
+            return Some(value.trim().to_string());
+        }
+    }
+    None
+}
+
+/// A dotted-path string value without its HOCON quotes.
+pub fn profile_string(text: &str, path: &str) -> Option<String> {
+    profile_value(text, path).map(|value| value.trim_matches('"').to_string())
+}
+
+/// Deep-merge a document fragment into a document; a null in the fragment is
+/// "no opinion" and never overwrites, matching the app's `deepMergeValues`.
+pub fn merge_document(base: &mut serde_json::Value, patch: &serde_json::Value) {
+    let (Some(base), Some(patch)) = (base.as_object_mut(), patch.as_object()) else {
+        return;
+    };
+    for (key, value) in patch {
+        match base.get_mut(key) {
+            Some(slot) => {
+                if value.is_object() && slot.is_object() {
+                    merge_document(slot, value);
+                } else if !value.is_null() {
+                    *slot = value.clone();
+                }
+            }
+            None => {
+                base.insert(key.clone(), value.clone());
+            }
+        }
+    }
 }

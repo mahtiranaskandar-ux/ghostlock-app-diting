@@ -1,8 +1,8 @@
 //! Pipeline feasibility for the two root chains.
 //!
 //! This module measures the image-side facts that decide which pipeline a
-//! profile may select. It does not choose between them: both are reported with
-//! a three-valued verdict, and the profile author records the choice.
+//! document may select. It does not choose between them: both are reported with
+//! a three-valued verdict, and the document's ladder derives from those facts.
 //!
 //! - `ghostlock`: the W1 -> W2 -> W3 credential chain. It is infeasible on a
 //!   KDP image (the forged `init_cred` pointer is rejected at the next LSM
@@ -16,8 +16,9 @@
 //!
 //! The facts are recorded in the option superset and the generation log. The
 //! extractor derives the default order (`dirtyfrag` first when both are
-//! feasible); the profile carries that order, and the app resolves it at run
-//! time before W1. The order is a policy, not an author prompt.
+//! feasible); the document's ladder derives from the facts, and the app
+//! resolves it at run time before W1. The order is a policy, not an author
+//! prompt.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -210,8 +211,8 @@ pub fn verdicts(facts: &PipelineFacts, routes: &[RouteVerdict]) -> Vec<PipelineO
 
 /// The default pipeline order: `dirtyfrag` first when both are feasible (the
 /// 2026-11-10 A/B measured it faster), the one feasible pipeline otherwise,
-/// empty when neither is. A documented policy; a profile may carry an
-/// explicit override order.
+/// empty when neither is. A documented policy; `--pipeline-order` overrides it
+/// for diagnostics.
 pub fn default_order(verdicts: &[PipelineOption]) -> Vec<String> {
     let feasible: Vec<&str> = verdicts
         .iter()

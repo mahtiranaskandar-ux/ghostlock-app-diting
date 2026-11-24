@@ -1,33 +1,13 @@
 package com.sesame.app.data.route
 
 /**
- * Semantic route selector, mirroring the native `kRoute*` wire values.
- * `0` (native `kRouteAuto`) is intentionally absent: a resolved profile must
- * declare its route explicitly.
+ * The four native syscall families. `token` is the document's spelling; `wire`
+ * is the historical GLK1 id, kept only for the cross-language catalog test and
+ * old notes — the v3 document and the native JSON reader use the token.
  */
-enum class RouteKind(
-    val wire: UInt,
-    val token: String,
-    private val empty: RouteConfig,
-    private val builder: ((String) -> Long?) -> RouteConfig,
-) {
-    TCP_ZEROCOPY(1u, "tcp_zerocopy", TcpConfig.EMPTY, { value -> TcpConfig.from(value) }),
-    SELECT_STACK(2u, "select_stack", SelectConfig.EMPTY, { value -> SelectConfig.from(value) }),
-    MULTICAST_WAITER(3u, "multicast_waiter", MulticastConfig.EMPTY, { value ->
-        MulticastConfig.from(value)
-    }),
-
-    /** rt_sigreturn fpsimd-copy stamp; the pre-5.10.136 waiter geometry. */
-    SIGRETURN(4u, "sigreturn", SigreturnConfig.EMPTY, { value -> SigreturnConfig.from(value) }),
-    ;
-
-    fun emptyConfig(): RouteConfig = empty
-
-    fun buildConfig(value: (String) -> Long?): RouteConfig = builder(value)
-
-    companion object {
-        fun fromToken(token: String?): RouteKind? = values().firstOrNull { it.token == token }
-
-        fun fromWire(wire: UInt): RouteKind? = values().firstOrNull { it.wire == wire }
-    }
+enum class RouteKind(val wire: UInt, val token: String) {
+    TCP_ZEROCOPY(1u, "tcp_zerocopy"),
+    SELECT_STACK(2u, "select_stack"),
+    MULTICAST_WAITER(3u, "multicast_waiter"),
+    SIGRETURN(4u, "sigreturn"),
 }

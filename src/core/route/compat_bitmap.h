@@ -55,7 +55,7 @@ namespace ghostlock::route::compat {
         /* The profile's measured compat-select buffer depth (0x1e0). */
         uint32_t select_dst_depth = 0;
         /* The profile's derived ABI (0 = futex_time32, 1 = futex_time64).
-         * Absent => the legacy home table decides; a novel 6.x home needs
+         * Absent => the built-in home table decides; a novel 6.x home needs
          * the key. */
         std::optional<uint8_t> futex_abi;
     };

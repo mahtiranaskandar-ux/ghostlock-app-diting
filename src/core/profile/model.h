@@ -48,7 +48,7 @@ namespace ghostlock::profile {
         Sigreturn = 4,
     };
 
-    /* Wire values for the v2 binary transport and the v1 JSON converter. */
+    /* Wire values for the route catalog and the JSON profile reader. */
     inline constexpr uint8_t kRouteAuto = std::to_underlying(RouteKind::Auto);
     inline constexpr uint8_t kRouteTcpZerocopy =
             std::to_underlying(RouteKind::TcpZerocopy);
@@ -80,19 +80,19 @@ namespace ghostlock::profile {
         return kRouteAuto;
     }
 
-    /* Wire v2 model objects, one per transport section. Signedness/width mirror
-     * Kotlin (uint8_t->UByte, uint32_t->UInt, uint64_t->ULong, int32_t->Int).
-     * Fields with a runtime fallback are std::optional: absence means "not
-     * provided", distinct from a provided 0 (kernel_phys_load = 0 is
-     * meaningful). The wire carries presence by key occurrence. */
+    /* The decoded document's model objects, one per transport section.
+     * Signedness/width mirror Kotlin (uint8_t->UByte, uint32_t->UInt,
+     * uint64_t->ULong, int32_t->Int). Fields with a runtime fallback are
+     * std::optional: `null` means "not provided", distinct from a provided 0
+     * (kernel_phys_load = 0 is meaningful). */
     struct ProfileMeta {
         uint8_t kernel_major = 0;
-        uint8_t recommend_shizuku = 0;
+        /* Reserved: the document carries no route fallback (the app resolves
+         * the ladder before W1), so this is always 0. */
         uint8_t fallback_route = 0;
         uint8_t safe_mode = 0;
         /* The app's resolved pipeline (1 = GhostLock, 2 = DirtyFrag). Absent on
-         * a document that predates the cross-check; the native then keeps the
-         * legacy behaviour. */
+         * the parse/preview documents, which skip the cross-check. */
         std::optional<uint32_t> pipeline;
     };
 
@@ -194,7 +194,7 @@ namespace ghostlock::profile {
         std::optional<uint32_t> select_waiter_home;
         std::optional<uint32_t> select_select_dst_depth;
         /* The compat select carrier's futex ABI: 0 = futex_time32,
-         * 1 = futex_time64. Absent => the legacy home table decides
+         * 1 = futex_time64. Absent => the built-in home table decides
          * (0x1b0/0x1c0); a 6.x home is not in that table, so the derived
          * profiles carry the key. */
         std::optional<uint8_t> select_compat_futex_abi;
@@ -282,7 +282,7 @@ namespace ghostlock::profile {
         std::optional<uint8_t> compat_carrier;
         std::optional<uint32_t> waiter_home;
         std::optional<uint32_t> select_dst_depth;
-        /* 0 = futex_time32, 1 = futex_time64; absent => the native's legacy
+        /* 0 = futex_time32, 1 = futex_time64; absent => the native's built-in
          * home table. The 6.x carrier carries it because a novel home cannot
          * be mapped back to an ABI. */
         std::optional<uint8_t> compat_futex_abi;
@@ -400,7 +400,7 @@ namespace ghostlock::profile {
             /* A per-image waiter layout is authoritative when present: the
              * compact shape with a wake_state field is 5.15/6.1, the
              * non-compact shape is 6.6/6.12. The release predicate below
-             * remains for profiles that predate the key. */
+             * covers a document that leaves the per-image shape null. */
             if (values_.waiter.compact.has_value()) {
                 return *values_.waiter.compact != 0 &&
                        values_.waiter.wake_state.has_value();
@@ -478,12 +478,11 @@ namespace ghostlock::profile {
 
         /* Whether the device's `rt_mutex_waiter` is the compact 5.x-6.1 shape,
          * the one the multicast and sigreturn routes stamp as an eleven-word
-         * strip. The per-image `waiter_layout.compact` is authoritative; the
-         * release family is the fallback for profiles that predate it (5.x and
-         * 6.1 compact, 6.6+ the `rt_waiter_node` shape). The legacy
-         * `compact_waiter` flag is route-specific and is deliberately not
-         * consulted. A profile that states neither is non-compact, so the
-         * route guard fails closed. */
+         * strip. The per-image `waiter.compact` is authoritative; the release
+         * family is the fallback when the document leaves it null (5.x and
+         * 6.1 compact, 6.6+ the `rt_waiter_node` shape). The route-local
+         * `compact_waiter` flag is deliberately not consulted. A document that
+         * states neither is non-compact, so the route guard fails closed. */
         [[nodiscard]] bool waiter_is_compact() const noexcept {
             if (!loaded_) return false;
             if (values_.waiter.compact.has_value()) {

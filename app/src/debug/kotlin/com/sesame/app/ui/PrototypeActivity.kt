@@ -152,7 +152,7 @@ private val statusMocks = listOf(
     StatusMock(
         chip = "阻断",
         title = "配置需要修正",
-        summary = "the profile's kernel_phys_* map does not name diting",
+        summary = "the profile's devices.<codename>.phys map does not name diting",
         detail = null,
         kind = ProtoStatusKind.Blocked,
         barLabel = "去处理",
@@ -471,11 +471,11 @@ private fun ValidationMock() {
             insideMargin = PaddingValues(horizontal = 16.dp, vertical = 4.dp),
         ) {
             ErrorRow(
-                path = "route.select_stack.waiter_shift",
+                path = "ghostlock.syscalls.select_stack.native.waiter_shift",
                 rule = "当前 -4 · 必须在 -2..2",
             )
             ErrorRow(
-                path = "cred.security_offset",
+                path = "kernel.struct.cred.security",
                 rule = "当前 128 · 必须 ≥ 136",
             )
         }

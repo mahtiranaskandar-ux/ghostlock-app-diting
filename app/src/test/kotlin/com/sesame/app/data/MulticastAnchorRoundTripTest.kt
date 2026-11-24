@@ -1,25 +1,16 @@
 package com.sesame.app.data
 
 import com.sesame.app.data.profile.ProfileMerger
-import com.sesame.app.data.profile.ProfileResolver
-import com.sesame.app.data.route.MulticastConfig
-import com.sesame.app.data.route.RouteConfig
-import com.sesame.app.data.route.RouteKind
+import com.sesame.app.data.profile.ProfileTransport
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
- * Guards `route.multicast_waiter.lock_anchor_*` across the whole Kotlin half of
- * the profile pipeline: merged value map -> `ProfileResolver` -> `Profile` ->
- * GLK1 bytes -> decode. The multicast section carries its own copies of the
- * three keys for the same reason the sigreturn section does -- the decoder
- * never merges across routes, so a multicast profile that borrowed
- * `route.select_stack.lock_anchor_*` would not round-trip.
- *
- * The values below are a synthetic transport vector, not any device's approved
- * anchor: the real trio is per-build profile data and is always stated by the
- * profile, never by code or a test.
+ * Guards the multicast branch's geometry and the shared anchor through the
+ * Kotlin half of the pipeline: authored map -> merge/conversion -> transport
+ * document. The strip's task/lock offsets are one fact and live in
+ * `kernel.struct.waiter`; the branch states only its own copy depths.
  */
 class MulticastAnchorRoundTripTest {
     private val release = "5.10.synthetic-anchor-vector"
@@ -27,30 +18,29 @@ class MulticastAnchorRoundTripTest {
     private val anchorBytes = 0x600L
     private val anchorStride = 0x20L
 
-    /** A document as an imported profile delivers it. */
     private fun document(withAnchor: Boolean): ValueMap {
-        val branch = valueMapOf(
-            "waiter_off" to 48L,
-            "buffer_size" to 264L,
-            "task_offset" to 48L,
-            "lock_offset" to 56L,
-        )
-        if (withAnchor) {
-            branch["lock_anchor_image"] = anchor
-            branch["lock_anchor_bytes"] = anchorBytes
-            branch["lock_anchor_stride"] = anchorStride
+        val anchorBlock = if (withAnchor) {
+            valueMapOf(
+                "image" to "0x" + anchor.toString(16),
+                "bytes" to anchorBytes,
+                "stride" to anchorStride,
+                "scratch" to null,
+            )
+        } else {
+            null
         }
-        return valueMapOf(
-            "release" to release,
-            "schema_version" to 1L,
-            "kernel_major" to 5L,
-            "route" to valueMapOf("multicast_waiter" to branch),
-            "fallback" to valueMapOf("to" to "none"),
+        return CleanedProfileFixture.document(
+            release = release,
+            route = "multicast_waiter",
+            branch = valueMapOf(
+                "waiter_off" to 48L,
+                "buffer_size" to 264L,
+            ),
+            anchor = anchorBlock,
         )
     }
 
-    /** Runs the real resolution chain and returns the resolved native document. */
-    private fun nativeProfile(document: ValueMap): Profile {
+    private fun transport(document: ValueMap): ValueMap {
         val merged = ProfileMerger.resolveMerged(
             deviceRelease = release,
             builtin = null,
@@ -58,164 +48,51 @@ class MulticastAnchorRoundTripTest {
             tuningExecution = null,
             routePresets = emptyMap(),
         )
-        val route = "multicast_waiter"
-        val profile = Profile.fromValueMap(
-            release = release,
-            route = RouteKind.fromToken(route),
-            fallbackTo = RouteKind.fromToken("none"),
-        ) { path -> ProfileResolver.nativeValue(merged, route, "none", path) }
-        assertNotNull("resolution must produce a document", profile)
-        return profile!!
+        return HoconSupport.parseValue(
+            ProfileTransport.render(merged, route = "multicast_waiter"),
+        ).asValueMap()!!
     }
 
     @Test
-    fun `anchor reaches the native document and survives the wire`() {
-        val profile = nativeProfile(document(withAnchor = true))
-        val config = profile.document.routeConfig as MulticastConfig
-
-        assertEquals(
-            "resolved value must land in the document",
-            anchor.toULong(),
-            config.geometry.lockAnchorImage,
-        )
-
-        val decoded = NativeProfileDocument.fromBinary(profile.toBinary())
-        assertNotNull("wire must decode", decoded)
-        val wire = (decoded!!.routeConfig as MulticastConfig).geometry
-        assertEquals("anchor must survive encode+decode", anchor.toULong(), wire.lockAnchorImage)
-        assertEquals("geometry length must survive", anchorBytes.toULong(), wire.lockAnchorBytes)
-        assertEquals("geometry stride must survive", anchorStride.toULong(), wire.lockAnchorStride)
-        /* The neighbours must be untouched by the new keys. */
-        assertEquals(48, wire.waiterOff)
-        assertEquals(264u, wire.bufferSize)
-        assertEquals(48u, wire.taskOffset)
-        assertEquals(56u, wire.lockOffset)
+    fun `the anchor and the branch geometry reach the document`() {
+        val document = transport(document(withAnchor = true))
+        val anchorBlock = (document["ghostlock"] as ValueMap)["anchor"] as ValueMap
+        assertEquals("0x" + anchor.toString(16), anchorBlock["image"])
+        assertEquals(anchorBytes, (anchorBlock["bytes"] as Number).toLong())
+        assertEquals(anchorStride, (anchorBlock["stride"] as Number).toLong())
+        val syscalls = (document["ghostlock"] as ValueMap)["syscalls"] as ValueMap
+        val native = ((syscalls["multicast_waiter"] as ValueMap)["native"] as ValueMap)
+        assertEquals(48L, (native["waiter_off"] as Number).toLong())
+        assertEquals(264L, (native["buffer_size"] as Number).toLong())
+        /* task/lock are the shared waiter layout, not branch copies. */
+        val waiter = (((document["kernel"] as ValueMap)["struct"] as ValueMap)["waiter"] as ValueMap)
+        assertEquals(48L, (waiter["task"] as Number).toLong())
+        assertEquals(56L, (waiter["lock"] as Number).toLong())
     }
 
     @Test
-    fun `absence keeps the previous behaviour`() {
-        val profile = nativeProfile(document(withAnchor = false))
-        val config = profile.document.routeConfig as MulticastConfig
-        assertEquals(
-            "omitted anchor must stay absent, not become 0",
-            null,
-            config.geometry.lockAnchorImage,
-        )
-        val decoded = NativeProfileDocument.fromBinary(profile.toBinary())!!
-        val wire = (decoded.routeConfig as MulticastConfig).geometry
-        /* Absent keys must stay absent: native reads presence as "the anchored
-         * route", and a 0 smuggled through here would name a zero-length
-         * region (or, for the image, the kernel's own base). */
-        assertEquals(null, wire.lockAnchorImage)
-        assertEquals(null, wire.lockAnchorBytes)
-        assertEquals(null, wire.lockAnchorStride)
-    }
-
-    /**
-     * The golden profile shape as HOCON text, not a hand-built map: parse ->
-     * merge -> resolver -> wire. A key that vanishes in any of those links
-     * leaves a profile that validates and runs with the page behaviour.
-     */
-    @Test
-    fun `a golden HOCON profile carries the trio`() {
-        val text = """
-            release = "$release"
-            schema_version = 1
-            kernel_major = 5
-            route {
-              multicast_waiter {
-                waiter_off = 48
-                buffer_size = 264
-                task_offset = 48
-                lock_offset = 56
-                lock_anchor_image = $anchor
-                lock_anchor_bytes = $anchorBytes
-                lock_anchor_stride = $anchorStride
-              }
-            }
-            fallback { to = "none" }
-        """.trimIndent()
-        val parsed = HoconSupport.parseValue(text).asValueMap()
-        assertNotNull("the golden profile must parse", parsed)
-
-        val profile = nativeProfile(parsed!!)
-        val config = profile.document.routeConfig as MulticastConfig
-        assertEquals(anchor.toULong(), config.geometry.lockAnchorImage)
-        assertEquals(anchorBytes.toULong(), config.geometry.lockAnchorBytes)
-        assertEquals(anchorStride.toULong(), config.geometry.lockAnchorStride)
-
-        val wire = (NativeProfileDocument.fromBinary(profile.toBinary())!!.routeConfig as MulticastConfig)
-            .geometry
-        assertEquals(anchor.toULong(), wire.lockAnchorImage)
-        assertEquals(anchorBytes.toULong(), wire.lockAnchorBytes)
-        assertEquals(anchorStride.toULong(), wire.lockAnchorStride)
-    }
-
-    @Test
-    fun `entries and apply are the same round trip`() {
-        val values = mapOf(
-            "mcast.waiter_off" to 48L,
-            "mcast.buffer_size" to 264L,
-            "mcast.task_offset" to 48L,
-            "mcast.lock_offset" to 56L,
-            "mcast.compat_carrier" to 1L,
-            "mcast.compat_waiter_off" to 0xa8L,
-            "mcast.compat_buffer_size" to 0x104L,
-            "mcast.compat_futex_abi" to 1L,
-            "lock_anchor_image" to anchor,
-            "lock_anchor_bytes" to anchorBytes,
-            "lock_anchor_stride" to anchorStride,
-        )
-        val config = MulticastConfig.from { values[it] }
-        assertEquals(
-            "the wire schema must declare exactly the eleven keys",
-            setOf(
-                "waiter_off", "buffer_size", "task_offset", "lock_offset",
-                "compat_carrier", "compat_waiter_off", "compat_buffer_size", "compat_futex_abi",
-                "lock_anchor_image", "lock_anchor_bytes", "lock_anchor_stride",
-            ),
-            config.keys().toSet(),
-        )
-        val entries = config.entries().toMap()
-        assertEquals(1.toULong(), entries["compat_carrier"])
-        assertEquals(0xa8L.toULong(), entries["compat_waiter_off"])
-        assertEquals(0x104L.toULong(), entries["compat_buffer_size"])
-        assertEquals(1.toULong(), entries["compat_futex_abi"])
-        assertEquals(anchor.toULong(), entries["lock_anchor_image"])
-        assertEquals(anchorBytes.toULong(), entries["lock_anchor_bytes"])
-        assertEquals(anchorStride.toULong(), entries["lock_anchor_stride"])
-
-        var reapplied: RouteConfig = MulticastConfig.EMPTY
-        for ((key, value) in config.entries()) reapplied = reapplied.apply(key, value)
-        assertEquals("apply must rebuild what entries emitted", config, reapplied)
-    }
-
-    /**
-     * The compat variant's geometry (docs/analysis/compat-multicast-carrier-plan.md)
-     * must survive the same chain: HOCON map -> resolver -> Kotlin config ->
-     * GLK1 bytes -> decode. A key dropped here leaves a profile that validates
-     * and then runs the 64-bit route on a kernel where it cannot land.
-     */
-    @Test
-    fun `a compat multicast profile carries its geometry through the wire`() {
+    fun `the compat carrier states its own geometry`() {
         val document = document(withAnchor = true)
-        val branch = (document["route"] as ValueMap)["multicast_waiter"] as ValueMap
-        branch["compat_carrier"] = 1L
-        branch["compat_waiter_off"] = 0xa8L
-        branch["compat_buffer_size"] = 0x104L
-        branch["compat_futex_abi"] = 1L
-        val profile = nativeProfile(document)
-        val config = profile.document.routeConfig as MulticastConfig
-        assertEquals(1, config.geometry.compatCarrier?.toInt())
-        assertEquals(0xa8, config.geometry.compatWaiterOff)
-        assertEquals(0x104, config.geometry.compatBufferSize?.toInt())
-        assertEquals(1, config.geometry.compatFutexAbi?.toInt())
+        val ghostlock = document["ghostlock"] as ValueMap
+        ghostlock["carrier"] = "compat"
+        val branch = (ghostlock["syscalls"] as ValueMap)["multicast_waiter"] as ValueMap
+        branch["native"] = null
+        branch["compat"] = valueMapOf(
+            "waiter_off" to 0xa8L,
+            "buffer_size" to 0x104L,
+            "futex_abi" to "time64",
+        )
+        val rendered = transport(document)
+        val syscalls = (rendered["ghostlock"] as ValueMap)["syscalls"] as ValueMap
+        val compat = ((syscalls["multicast_waiter"] as ValueMap)["compat"] as ValueMap)
+        assertEquals(0xa8L, (compat["waiter_off"] as Number).toLong())
+        assertEquals(0x104L, (compat["buffer_size"] as Number).toLong())
+        assertEquals("time64", compat["futex_abi"])
+    }
 
-        val wire = (NativeProfileDocument.fromBinary(profile.toBinary())!!.routeConfig as MulticastConfig)
-            .geometry
-        assertEquals(1, wire.compatCarrier?.toInt())
-        assertEquals(0xa8, wire.compatWaiterOff)
-        assertEquals(0x104, wire.compatBufferSize?.toInt())
-        assertEquals(1, wire.compatFutexAbi?.toInt())
+    @Test
+    fun `an absent anchor stays absent`() {
+        val document = transport(document(withAnchor = false))
+        assertNull((document["ghostlock"] as ValueMap)["anchor"])
     }
 }

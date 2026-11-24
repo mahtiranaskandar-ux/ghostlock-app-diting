@@ -1,25 +1,21 @@
 /* SPDX-License-Identifier: MIT
  *
- * Canonical JSON profile document reader for the timer tool.
- *
- * The app renders the merged, validated profile as a canonical JSON document
- * (a HOCON subset: quoted keys/strings, numbers, objects/arrays, no includes,
- * comments or substitutions).  The timer tool reads only `release` and the
- * `timer_98260` block; the `kernel` and `native` blocks belong to the other
- * backends and are ignored.
- *
- * The parser is deliberately small and strict: bounded size and depth, no
- * duplicate keys, integers only, unknown keys inside the block refused, and
- * 64-bit values accepted either as numbers or as "0x..." strings (the app's
- * renderer uses the string form because HOCON/JSON numbers cannot carry a
- * kernel VA above 2^63).
+ * The 98260 timer tool's document mapper: the app-rendered canonical JSON to
+ * the tool's `timer_profile`. The tree parser is the shared
+ * `core/profile/json.{c,h}`; this unit owns only the timer engine's keys
+ * (`timer`, plus the `kernel` facts the fake-cred overlay shares with the
+ * ghostlock engine).
  */
-#ifndef TIMER_PROFILE_JSON_H
-#define TIMER_PROFILE_JSON_H
+#ifndef TIMER_PROFILE_FIELDS_H
+#define TIMER_PROFILE_FIELDS_H
 
 #include <stddef.h>
 
 #include "kbuilds.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 /* The fake-cred overlay, in bytes from the start of the cred object. */
 struct cred_layout
@@ -68,4 +64,8 @@ int timer_profile_parse(const char *text, size_t len, struct timer_profile *out,
 int timer_profile_load(const char *path, struct timer_profile *out, char *err,
                        size_t errlen);
 
-#endif /* TIMER_PROFILE_JSON_H */
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* TIMER_PROFILE_FIELDS_H */

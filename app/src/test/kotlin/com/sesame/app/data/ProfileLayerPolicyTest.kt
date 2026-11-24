@@ -3,6 +3,7 @@ package com.sesame.app.data
 import android.app.Application
 import android.content.SharedPreferences
 import androidx.core.content.edit
+import com.sesame.app.data.profile.ProfileResolver
 import com.sesame.app.domain.model.ProfileConfig
 import com.sesame.app.domain.model.ProfileImportResult
 import com.sesame.app.domain.repository.ProfileConfigController
@@ -80,7 +81,6 @@ class ProfileLayerPolicyTest {
         assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
 
         val config = controller.load(bundledRelease)
-
         assertTrue(config.hasProfile)
         assertEquals(4242L, generalValue(config, routeWaitPath))
         val layers = checkNotNull(config.layers)
@@ -105,82 +105,6 @@ class ProfileLayerPolicyTest {
         assertTrue(config.hasProfile)
         assertEquals(4242L, generalValue(config, routeWaitPath))
         assertTrue(config.layers!!.externalApplied)
-    }
-
-    @Test
-    fun `import stores only the copy, not the reference keys`() = runBlocking {
-        val uri = external.add(
-            "content://profiles/wins.conf",
-            document(bundledRelease, routeWaitMs = 4242),
-        )
-        assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
-
-        assertTrue(controller.importedProfileExists())
-        for (key in listOf(
-            AndroidProfileConfigController.PrefExternalUri,
-            AndroidProfileConfigController.PrefExternalName,
-            AndroidProfileConfigController.PrefExternalRelease,
-            AndroidProfileConfigController.PrefExternalSha256,
-            AndroidProfileConfigController.PrefExternalParent,
-            AndroidProfileConfigController.PrefExternalParentSha256,
-        )) {
-            assertFalse("$key must not be written by the import", preferences.contains(key))
-        }
-    }
-
-    @Test
-    fun `the old selection migrates into the copy once`() = runBlocking {
-        val uri = external.add(
-            "content://profiles/old.conf",
-            document(bundledRelease, routeWaitMs = 4242),
-        )
-        preferences.edit(commit = true) {
-            putString(AndroidProfileConfigController.PrefExternalUri, uri)
-            putString(AndroidProfileConfigController.PrefExternalName, "old.conf")
-            putString(AndroidProfileConfigController.PrefExternalRelease, bundledRelease)
-            putString(AndroidProfileConfigController.PrefExternalSha256, "sha")
-            putString(AndroidProfileConfigController.PrefExternalParent, "parent")
-            putString(AndroidProfileConfigController.PrefExternalParentSha256, "parent-sha")
-        }
-
-        val config = controller.load(bundledRelease)
-
-        assertTrue(config.hasProfile)
-        assertEquals(4242L, generalValue(config, routeWaitPath))
-        assertTrue(controller.importedProfileExists())
-        assertFalse(preferences.contains(AndroidProfileConfigController.PrefExternalUri))
-        assertFalse(preferences.contains(AndroidProfileConfigController.PrefExternalParentSha256))
-    }
-
-    @Test
-    fun `an unreadable old selection is dropped, not guessed`() = runBlocking {
-        preferences.edit(commit = true) {
-            putString(AndroidProfileConfigController.PrefExternalUri, "content://missing/doc.conf")
-            putString(AndroidProfileConfigController.PrefExternalRelease, bundledRelease)
-        }
-
-        val config = controller.load(bundledRelease)
-
-        assertFalse(controller.importedProfileExists())
-        assertFalse(preferences.contains(AndroidProfileConfigController.PrefExternalUri))
-        /* The bundled profile applies again: the old reference is gone. */
-        assertTrue(config.hasProfile)
-        assertFalse(config.layers!!.externalApplied)
-    }
-
-    @Test
-    fun `a copy plus stale old keys deletes the keys without a read`() = runBlocking {
-        external.writeImportedProfile(document(bundledRelease, routeWaitMs = 4242))
-        preferences.edit(commit = true) {
-            putString(AndroidProfileConfigController.PrefExternalUri, "content://whatever/doc.conf")
-        }
-        /* A read would fail; the copy must win and the stale key must go. */
-        external.documents.clear()
-
-        assertTrue(controller.load(bundledRelease).hasProfile)
-
-        assertTrue(controller.importedProfileExists())
-        assertFalse(preferences.contains(AndroidProfileConfigController.PrefExternalUri))
     }
 
     @Test
@@ -265,6 +189,54 @@ class ProfileLayerPolicyTest {
     }
 
     @Test
+    fun `a copy from an older schema is refused and removal restores the bundle`() = runBlocking {
+        /* The upgrade path: the copy was valid when it was imported, and this
+         * build reads only the current schema. The selection is kept and fails
+         * closed — never a silent bundle fallback — and removing it is the
+         * only way out. */
+        external.imported = document(bundledRelease, routeWaitMs = 4242)
+            .replace("schema_version = 3", "schema_version = 2")
+
+        val refused = controller.load(bundledRelease)
+
+        assertFalse(refused.hasProfile)
+        val layers = checkNotNull(refused.layers)
+        assertFalse(layers.externalApplied)
+        assertNotNull(layers.externalError)
+        assertTrue(layers.externalError!!.contains("unsupported profile schema 2"))
+        assertTrue(controller.importedProfileExists())
+
+        val after = controller.clearExternalProfile(bundledRelease)
+
+        assertFalse(controller.importedProfileExists())
+        assertTrue(after.hasProfile)
+        assertEquals(bundledRouteWaitMs, generalValue(after, routeWaitPath))
+        assertTrue(after.layers!!.bundledAuthoritative)
+    }
+
+    @Test
+    fun `a copy that only fails a newer rule is invalid until it is removed`() = runBlocking {
+        /* The stride requirement postdates the v3 import path: a copy imported
+         * before it still parses and merges, but the field is refused now —
+         * the same "saved selection is unusable" state, reached through
+         * invalidPaths instead of a null profile. */
+        external.imported = document(bundledRelease, routeWaitMs = 4242)
+            .replace("    stride = 960", "    stride = null")
+
+        val stale = controller.load(bundledRelease)
+
+        assertTrue(stale.hasProfile)
+        assertTrue(stale.invalidPaths.contains("kernel.heap.stride"))
+        assertEquals(4242L, generalValue(stale, routeWaitPath))
+
+        val after = controller.clearExternalProfile(bundledRelease)
+
+        assertTrue(after.hasProfile)
+        assertTrue(after.invalidPaths.isEmpty())
+        assertEquals(bundledRouteWaitMs, generalValue(after, routeWaitPath))
+    }
+
+    @Test
     fun `the same selection applies again once the document is readable`() = runBlocking {
         val uri = external.add(
             "content://profiles/wins.conf",
@@ -324,12 +296,16 @@ class ProfileLayerPolicyTest {
 
         assertTrue(config.hasProfile)
         assertTrue(config.invalidPaths.isEmpty())
-        assertTrue(config.pipelineOrder.isEmpty())
+        /* No pipeline list: the document's own verdict derives the fixed
+         * ladder (this fixture states no DirtyFrag verdict, so GhostLock). */
+        assertEquals(listOf("dirtyfrag", "ghostlock"), config.pipelineOrder)
     }
 
     @Test
     fun `a copy without the required execution block gets the preset defaults`() = runBlocking {
-        val text = removeTopLevelBlock(document(bundledRelease, routeWaitMs = 4242), "execution")
+        /* The cleaned asset states `ghostlock.execution = null`: the presets
+         * fill it. */
+        val text = AssetConfigLoader(context).load("kernel_profiles/$bundledRelease.conf")
         val uri = external.add("content://profiles/no-execution.conf", text)
 
         assertNotNull(controller.selectExternalProfile(uri, bundledRelease))
@@ -350,7 +326,31 @@ class ProfileLayerPolicyTest {
         assertTrue(
             result.toString(),
             result is ProfileImportResult.Rejected &&
-                result.errors.any { it.startsWith("offset.init_task") },
+                result.errors.any { it.startsWith("kernel.symbols.init_task") },
+        )
+        /* The rejected copy is not kept: the bundled profile applies again. */
+        assertTrue(controller.load(bundledRelease).hasProfile)
+        assertFalse(controller.importedProfileExists())
+    }
+
+    @Test
+    fun `a copy without the measured stride is rejected`() = runBlocking {
+        /* The chain needs W1 and the spray is sized by the stride; the
+         * run-time overlay no longer supplies one, so an import without it is
+         * refused with the field path named. */
+        val parsed = HoconSupport.parseValue(document(bundledRelease, routeWaitMs = 4242))
+            .asValueMap()!!
+        (parsed["kernel"].asValueMap()!!["heap"].asValueMap()!!)["stride"] = null
+        val uri = external.add(
+            "content://profiles/no-stride.conf",
+            HoconSupport.render(parsed),
+        )
+
+        val result = controller.selectExternalProfile(uri, bundledRelease)
+        assertTrue(
+            result.toString(),
+            result is ProfileImportResult.Rejected &&
+                result.errors.any { it.startsWith("kernel.heap.stride") },
         )
         /* The rejected copy is not kept: the bundled profile applies again. */
         assertTrue(controller.load(bundledRelease).hasProfile)
@@ -361,17 +361,23 @@ class ProfileLayerPolicyTest {
     fun `an older schema is refused, not upgraded`() = runBlocking {
         val text = document(bundledRelease, routeWaitMs = 4242)
         val variants = listOf(
-            text.replace("schema_version = 3", "schema_version = 2"),
-            text.replace("schema_version = 3", "schema_version = 1"),
-            text.replace(Regex("(?m)^schema_version = 3\n"), ""),
+            text.replace("schema_version = 3", "schema_version = 2") to
+                ProfileResolver.schemaErrorMessage(2),
+            text.replace("schema_version = 3", "schema_version = 1") to
+                ProfileResolver.schemaErrorMessage(1),
+            text.replace(Regex("(?m)^schema_version = 3\n"), "") to
+                ProfileResolver.schemaErrorMessage(null),
+            /* A list-form document must be gated exactly like a single object. */
+            "[ { ${text.replace("schema_version = 3", "schema_version = 2")} } ]" to
+                ProfileResolver.schemaErrorMessage(2),
         )
-        for (old in variants) {
+        for ((old, expected) in variants) {
             val uri = external.add("content://profiles/old-schema.conf", old)
             val result = controller.selectExternalProfile(uri, bundledRelease)
+            assertTrue(result.toString(), result is ProfileImportResult.Rejected)
             assertTrue(
                 result.toString(),
-                result is ProfileImportResult.Rejected &&
-                    result.errors.any { it.contains("schema") },
+                (result as ProfileImportResult.Rejected).errors.any { it == expected },
             )
             assertFalse(controller.importedProfileExists())
         }
@@ -396,8 +402,11 @@ class ProfileLayerPolicyTest {
         return if (replaced != relabelled) {
             replaced
         } else {
-            relabelled +
-                "\nexecution {\n  race {\n    route_wait_ms = $routeWaitMs\n  }\n}\n"
+            /* The cleaned document nests the tuning under the engine. */
+            relabelled.replace(
+                "  execution = null",
+                "  execution {\n    race {\n      route_wait_ms = $routeWaitMs\n    }\n  }",
+            )
         }
     }
 
@@ -422,7 +431,7 @@ class ProfileLayerPolicyTest {
     fun `a compat multicast switch without its geometry is refused`() = runBlocking {
         val release = "6.1.138-android14-11-g44bda9e8f6e9-ab13792638"
         val text = compatMulticastDocument(release)
-            .replace("compat_waiter_off = 72\n", "")
+            .replace(Regex("(?m)^\\s*waiter_off = 72\\n"), "")
         val uri = external.add("content://profiles/compat-truncated.conf", text)
 
         val result = controller.selectExternalProfile(uri, release)
@@ -430,7 +439,7 @@ class ProfileLayerPolicyTest {
             result.toString(),
             result is ProfileImportResult.Rejected &&
                 result.errors.any {
-                    it.startsWith("route.multicast_waiter.compat_waiter_off")
+                    it.startsWith("ghostlock.syscalls.multicast_waiter.compat.waiter_off")
                 },
         )
     }
@@ -440,81 +449,35 @@ class ProfileLayerPolicyTest {
      * absent, the compat geometry present, the 6.x cred template (no 5.x
      * reference slots) and the measured slab stride.
      */
-    private fun compatMulticastDocument(release: String): String = """
-        include "credential-6_1.conf"
-        include "kernelsnitch-6x.conf"
-        release = "$release"
-        schema_version = 3
-        kernel_major = 6
-        kernel_phys_load = 2684354560
-        kernel_phys_offset = 2147483648
-        pipeline = [ "ghostlock" ]
-        route {
-          multicast_waiter {
-            waiter_off = null
-            buffer_size = null
-            task_offset = 48
-            lock_offset = 56
-            compact_waiter = 1
-            compat_carrier = 1
-            compat_futex_abi = 1
-            compat_waiter_off = 72
-            compat_buffer_size = 260
-            lock_anchor_image = 35802320
-            lock_anchor_bytes = 4096
-            lock_anchor_stride = 32
-          }
-        }
-        fallback {
-          to = "none"
-        }
-        selinux {
-          enforcing = 0
-          initialized = 2
-        }
-        w1_scratch {
-          image = 35459072
-        }
-        kernelsnitch {
-          mm_struct_sz = 1024
-        }
-        task_struct {
-          prio = 132
-          normal_prio = 140
-          sched_task_group = 840
-          pi_lock = 2340
-          pi_waiters = 2360
-          pi_top_task = 2376
-          pi_blocked_on = 2384
-          pid = 1584
-          tgid = 1588
-          atomic_flags = 1520
-          real_cred = 2096
-          cred = 2104
-          comm = 2120
-          tasks = 1360
-          seccomp = 2304
-        }
-        waiter_layout {
-          compact = 1
-          pi_tree = 24
-          task = 48
-          lock = 56
-          wake_state = 64
-        }
-        offset {
-          init_task = 33486336
-          init_cred = 33561192
-          empty_zero_page = 35454976
-          root_task_group = 35485056
-          selinux_enforcing = 35820496
-          selinux_blob_sizes = 22768872
-          security_hook_heads = 22767064
-          slide_nfulnl_logger = 33434056
-          slide_loggers_0_1 = 33433880
-          slide_boot_id = 35955800
-        }
-    """.trimIndent()
+    private fun compatMulticastDocument(release: String): String {
+        val document = CleanedProfileFixture.document(
+            release = release,
+            route = "multicast_waiter",
+            anchor = valueMapOf(
+                "image" to "0x2224cd0",
+                "bytes" to 4096L,
+                "stride" to 32L,
+                "scratch" to "0x21d1000",
+            ),
+            carrier = "compat",
+        )
+        document["devices"] = valueMapOf(
+            "diting" to valueMapOf(
+                "phys" to valueMapOf("load" to "0xa0000000", "offset" to "0x80000000"),
+            ),
+        )
+        val kernel = document["kernel"] as ValueMap
+        (kernel["heap"] as ValueMap)["stride"] = 1024L
+        val branch = ((document["ghostlock"] as ValueMap)["syscalls"] as ValueMap)
+            .get("multicast_waiter") as ValueMap
+        branch["native"] = null
+        branch["compat"] = valueMapOf(
+            "waiter_off" to 72L,
+            "buffer_size" to 260L,
+            "futex_abi" to "time64",
+        )
+        return HoconSupport.render(document)
+    }
 
     private companion object {
         const val TestBuild = "test-build"

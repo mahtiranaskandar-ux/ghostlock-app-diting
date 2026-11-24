@@ -17,7 +17,7 @@ else
   NDK_CXX := $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/aarch64-linux-android$(API)-clang++
 endif
 
-C_SRCS :=
+C_SRCS := core/profile/json.c
 
 CXX_SRCS := \
   core/main.cpp \
@@ -39,7 +39,7 @@ CXX_SRCS := \
   core/memory/payload_builder.cpp \
   core/session/runtime_config.cpp \
   core/session/cpu_select.cpp \
-  core/profile/binary.cpp \
+  core/profile/json_profile.cpp \
   core/support/util.cpp \
   core/session/exploit_session.cpp \
   core/session/root_child_frontend.cpp \
@@ -119,8 +119,8 @@ DFPROBE_SRC := core/probe/dfprobe.c
 # evidence build; the tool uses raw syscalls and needs no newer surface.
 TIMER_API ?= 24
 TIMER_CC := $(NDK_ROOT)/toolchains/llvm/prebuilt/$(PREBUILT)/bin/aarch64-linux-android$(TIMER_API)-clang
-TIMER_SRC := timer/timer.c timer/profile_json.c
-TIMER_HDR := timer/profile_json.h timer/kbuilds.h $(wildcard timer/kbuilds/*.h)
+TIMER_SRC := timer/timer.c timer/profile_fields.c core/profile/json.c
+TIMER_HDR := timer/profile_fields.h timer/kbuilds.h $(wildcard timer/kbuilds/*.h) core/profile/json.h
 TIMER_BIN := $(NATIVE_BUILD_DIR)/timer
 
 .PHONY: all ghostlock dfprobe timer clean product
@@ -134,8 +134,8 @@ timer: $(TIMER_BIN)
 $(TIMER_BIN): $(TIMER_SRC) $(TIMER_HDR) Makefile
 	@echo "Using timer compiler: $(TIMER_CC)"
 	@mkdir -p $(dir $@)
-	$(TIMER_CC) -O2 -g -Wall -Wextra -Wno-unused-parameter -static -Itimer \
-	  -o $@ $(TIMER_SRC) -lz -pthread
+	$(TIMER_CC) -O2 -g -Wall -Wextra -Wno-unused-parameter -static \
+	  -Itimer -Icore -o $@ $(TIMER_SRC) -lz -pthread
 
 dfprobe: $(DFPROBE_BIN)
 
@@ -188,7 +188,7 @@ NATIVE_HOST_TESTS := \
   kernelsnitch_scan_bounds_test route_controller_test pi_race_test \
   tcp_zerocopy_route_test select_stack_route_test sigreturn_route_test \
   target_constants_test native_resource_test \
-  profile_binary_test futex_hash_test scan_grid_test stride_verify_test slab_order_test \
+  json_test timer_profile_test futex_hash_test scan_grid_test stride_verify_test slab_order_test \
   number_parse_test runtime_paths_test runtime_config_test handoff_probe_test victim_context_test \
   victim_spin_test \
   run_state_test address_space_test cpp_link_probe_test compat_bitmap_test dirtyfrag_verdict_test \
@@ -317,8 +317,16 @@ $(HOST_BUILD_DIR)/profile_test: core/tests/profile_test.cpp core/profile/model.h
 	@mkdir -p $(HOST_BUILD_DIR)
 	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore $< -o $@
 
-$(HOST_BUILD_DIR)/profile_binary_test: core/tests/profile_binary_test.cpp core/profile/binary.cpp core/profile/binary.h core/profile/model.h core/profile/pipeline_check.h
-	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/profile_binary_test.cpp core/profile/binary.cpp -o $@
+$(HOST_BUILD_DIR)/json_test: core/tests/json_test.cpp core/profile/json_profile.cpp core/profile/json_profile.h core/profile/json.c core/profile/json.h core/profile/model.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Icore -c core/profile/json.c -o $(HOST_BUILD_DIR)/json_test_json.o
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore core/tests/json_test.cpp core/profile/json_profile.cpp $(HOST_BUILD_DIR)/json_test_json.o -o $@
+
+$(HOST_BUILD_DIR)/timer_profile_test: core/tests/timer_profile_test.cpp timer/profile_fields.c timer/profile_fields.h timer/kbuilds.h core/profile/json.c core/profile/json.h
+	@mkdir -p $(HOST_BUILD_DIR)
+	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Icore -c core/profile/json.c -o $(HOST_BUILD_DIR)/timer_test_json.o
+	$(HOST_CC) -std=c11 -O2 -Wall -Wextra -Icore -c timer/profile_fields.c -o $(HOST_BUILD_DIR)/timer_test_fields.o
+	$(HOST_CXX) $(HOST_CXXFLAGS) -Icore -Itimer core/tests/timer_profile_test.cpp $(HOST_BUILD_DIR)/timer_test_fields.o $(HOST_BUILD_DIR)/timer_test_json.o -o $@
 
 $(HOST_BUILD_DIR)/payload_builder_test: core/tests/payload_builder_test.cpp core/memory/payload_builder.cpp core/memory/payload_builder.h
 	@mkdir -p $(HOST_BUILD_DIR)

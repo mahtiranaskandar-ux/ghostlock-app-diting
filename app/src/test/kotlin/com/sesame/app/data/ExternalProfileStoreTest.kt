@@ -49,15 +49,16 @@ class ExternalProfileStoreTest {
 
         val entries = ProfileDocumentParser.entries(text) { target ->
             if (target == "included.conf") {
-                "kernel_major = 5\nroute { select_stack { waiter_shift = -2 } }"
+                "kernel { heap { stride = 960 } }\ndevices = null\nghostlock = null\ntimer = null"
             } else {
                 null
             }
         }
 
         val entry = entries?.single()
-        assertEquals(5L, (entry?.get("kernel_major") as Number?)?.toLong())
-        assertNotNull(entry?.get("route"))
+        assertNotNull(entry?.get("kernel"))
+        val stride = (((entry?.get("kernel") as Map<*, *>)["heap"] as Map<*, *>)["stride"] as Number)
+        assertEquals(960L, stride.toLong())
     }
 
     @Test

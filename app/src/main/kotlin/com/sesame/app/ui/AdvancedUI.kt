@@ -181,7 +181,7 @@ internal fun AdvancedScreen(
                     )
                 }
             }
-            /* The profile's `pipeline` is the only selector; there is no UI
+            /* The document's ladder is the only selector; there is no UI
              * override and no debug intent that changes the order. */
             item(key = "rootManager") {
                 Card {
@@ -312,6 +312,19 @@ internal fun ParameterScreen(
                                 fontSize = 14.sp,
                                 color = MiuixTheme.colorScheme.onSurface.copy(alpha = 0.68f),
                                 modifier = Modifier.padding(top = 2.dp),
+                            )
+                        }
+                        /* A stored copy that no longer resolves cannot be a
+                         * user path (the release is a different package; the
+                         * import validator rejects anything this build cannot
+                         * read), so this line stays neutral: no schema talk,
+                         * just the way out. */
+                        if (state.support.layers?.externalError != null) {
+                            Text(
+                                text = stringResource(R.string.profile_external_unusable),
+                                fontSize = 13.sp,
+                                color = OverrideHighlight,
+                                modifier = Modifier.padding(top = 8.dp),
                             )
                         }
                     }
@@ -534,7 +547,14 @@ internal fun BuiltinProfileScreen(
                 }
                 items(builtin.releases, key = { "kernel:$it" }) { release ->
                     BuiltinProfileRow(
-                        title = release,
+                        /* A foreign release can be inspected but cannot run
+                         * here; the label says so before it is picked, and the
+                         * Home names the override if one is active. */
+                        title = if (release == state.device.kernelRelease) {
+                            release
+                        } else {
+                            release + " · " + stringResource(R.string.builtin_not_applicable)
+                        },
                         selected = !state.support.importedProfilePresent &&
                                 state.support.activeBuiltinProfile == release,
                         onClick = { actions.onSelectBuiltinProfile(release) },
@@ -607,6 +627,18 @@ internal fun MeasurementsScreen(
                     text = stringResource(R.string.measurements_readonly),
                     modifier = Modifier.preferencePageItem(),
                 )
+            }
+            /* The merge preview was orphaned when the god state went away; it
+             * is the only way to apply a measured fact to a profile, so it
+             * lives on the page that shows the facts. */
+            item(key = "merge") {
+                Card(modifier = Modifier.preferencePageItem()) {
+                    ArrowPreference(
+                        title = stringResource(R.string.merge_review),
+                        summary = stringResource(R.string.measurements_merge_summary),
+                        onClick = actions::openMerge,
+                    )
+                }
             }
             if (state.measurements.measuredKernels.isEmpty()) {
                 item(key = "empty") {

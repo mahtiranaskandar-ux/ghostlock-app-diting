@@ -23,12 +23,11 @@ class BundledModuleTest {
         val document = HoconSupport.parseValue(
             AssetConfigLoader(context).load("kernel_profiles/$release.conf"),
         ).asValueMap() ?: error("$release: unreadable profile")
-        val block = document["module"].asValueMap()
+        val block = (document["ghostlock"] as? Map<*, *>)?.get("module").asValueMap()
             ?: error("$release: module block missing")
         return ModuleConfig(
-            version = 1,
             asset = block["asset"] as String,
-            assetSha256 = block["asset_sha256"] as String,
+            assetSha256 = block["sha256"] as String,
             vendorFiles = emptyList(),
         )
     }

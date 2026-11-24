@@ -5,9 +5,10 @@ package com.sesame.app.data.profile
  *
  * The chain is bundle-only: a bundled profile and the hand-built `.ko` it
  * names were validated together, so the profile is the only declaration of
- * that pair; there is no separate asset index. Selection stays in `pipeline`
- * and this block only makes the `module` entry viable —
- * [ProfileResolver.validateMerged] requires the two together.
+ * that pair; there is no separate asset index. The document's ladder derives
+ * `module` from this block (it and `syscalls` are mutually exclusive) —
+ * [ProfileResolver.validateMerged] refuses a block without the matching
+ * `ghostlock` shape.
  *
  * The block states identity and delivery only. The image's module ABI
  * (vermagic, `sizeof(struct module)`, the `module_layout` CRC) is not
@@ -18,7 +19,6 @@ package com.sesame.app.data.profile
  * kernel's ABI to check it against.
  */
 data class ModuleConfig(
-    val version: Int,
     val asset: String,
     val assetSha256: String,
     /** Empty = the app's built-in ordered probe list. */
@@ -32,10 +32,12 @@ data class ModuleConfig(
  */
 object ModuleBlock {
     const val BLOCK_KEY = "module"
+    /** The block's path inside the document. */
+    const val BLOCK_PATH = "ghostlock.module"
 
     /** The stub's `stub_ko_target` field: 64 bytes including the NUL. */
     private const val KO_TARGET_MAX = 64
-    private val BlockKeys = setOf("version", "asset", "asset_sha256", "vendor_files")
+    private val BlockKeys = setOf("asset", "sha256", "vendor_files")
     private val Sha256 = Regex("^[0-9a-fA-F]{64}$")
 
     /** A numeric field: a JSON number or a `"0x..."` / decimal string. */
@@ -77,22 +79,15 @@ object ModuleBlock {
         if (value == null) return null to errors
         val block = value as? Map<*, *>
         if (block == null) {
-            errors += ConfigError(BLOCK_KEY, "not an object")
+            errors += ConfigError(BLOCK_PATH, "not an object")
             return null to errors
         }
         for (key in block.keys) {
             val name = key.toString()
-            if (name !in BlockKeys) errors += ConfigError("$BLOCK_KEY.$name", "unknown key")
+            if (name !in BlockKeys) errors += ConfigError("$BLOCK_PATH.$name", "unknown key")
         }
         fun err(field: String, message: String) {
-            errors += ConfigError("$BLOCK_KEY.$field", message)
-        }
-
-        val version = asLong(block["version"])
-        when {
-            block["version"] == null -> err("version", "missing")
-            version == null -> err("version", "not an integer")
-            version != 1L -> err("version", "must be 1")
+            errors += ConfigError("$BLOCK_PATH.$field", message)
         }
 
         val asset = (block["asset"] as? String)?.trim()
@@ -102,11 +97,11 @@ object ModuleBlock {
             !validAsset(asset) -> err("asset", "must be a relative modules/<name>.ko path")
         }
 
-        val sha = (block["asset_sha256"] as? String)?.trim()
+        val sha = (block["sha256"] as? String)?.trim()
         when {
-            block["asset_sha256"] == null -> err("asset_sha256", "missing")
-            sha == null -> err("asset_sha256", "not a string")
-            !Sha256.matches(sha) -> err("asset_sha256", "must be 64 hex characters")
+            block["sha256"] == null -> err("sha256", "missing")
+            sha == null -> err("sha256", "not a string")
+            !Sha256.matches(sha) -> err("sha256", "must be 64 hex characters")
         }
 
         val files = mutableListOf<String>()
@@ -136,7 +131,6 @@ object ModuleBlock {
 
         if (errors.isNotEmpty()) return null to errors
         return ModuleConfig(
-            version = version!!.toInt(),
             asset = asset!!,
             assetSha256 = sha!!.lowercase(),
             vendorFiles = files,

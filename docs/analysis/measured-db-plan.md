@@ -140,9 +140,13 @@ Per kernel `uname -r`, a fact is `key -> value, source, evidence, measured_at`.
   failure is logged, not fatal. The resolver reuses a matching pass (same kernel, protocol and
   ROM hash) or any protocol-matching primitive fail; a different ROM re-probes. Schema v1 is
   unchanged (multiple keys per kernel; the value field is already `Long`).
-- **Unprivileged probe candidates never enter the DB.** `--probe-stride` output is evidence for
-  the generator UI, not a fact. The DirtyFrag probe is not a voting probe: it is a deterministic
-  controlled test whose clear result is a fact (above).
+- **The generation probe is weaker evidence (2026-11-24).** The generation flow's accepted
+  `--probe-stride` value is written **into the exported document** (`kernel.heap.stride`), so a
+  generated profile no longer depends on this device's DB. It is also recorded in the DB
+  (`source=generation-probe`) for the measurements screen only: `profileFacts()` excludes that
+  source, so the run-time overlay never applies it and the merge never exports it, and a
+  `root-slabinfo` fact is never replaced by it. The DirtyFrag probe is a different thing: a
+  deterministic controlled test whose clear result is a fact and a ladder input (above).
 - Store: `filesDir/measured_profiles.conf`, HOCON, `schema_version = 1` (below). Read-only UI.
 
 ### 3. Merge
@@ -155,8 +159,9 @@ untouched. After a successful export the app offers to select the exported file 
 run (an explicit selection, never automatic).
 
 **Only profile-addressable facts are merge candidates (2026-11-14).** The DB holds the DirtyFrag
-probe trio (`dirtyfrag.probe`, `_rom`, `_protocol`) next to the root-measured stride; the merge
-reads the `MeasuredKernel.profileFacts()` projection, which excludes them. Without the filter a
+probe trio (`dirtyfrag.probe`, `_rom`, `_protocol`) next to the root-measured and generation
+probe strides; the merge reads the `MeasuredKernel.profileFacts()` projection, which excludes the
+DirtyFrag trio and every non-root stride source. Without the filter a
 probe fact became an unknown top-level `dirtyfrag` key: the preview showed a bogus `—` row and
 `renderMerged` failed its validation, so the export died with `export_failed` (and the home merge
 banner never cleared). The probe facts stay visible in the measurements screen — they are runtime

@@ -6,8 +6,6 @@ import com.sesame.app.domain.model.ImportedEvidence
 import com.sesame.app.domain.model.KernelSnapshot
 import com.sesame.app.domain.model.MeasuredKernelInfo
 import com.sesame.app.domain.model.MeasurementMergeRow
-import com.sesame.app.domain.model.OffsetCandidate
-import com.sesame.app.domain.model.OffsetImportResult
 import com.sesame.app.domain.model.ParseResult
 import com.sesame.app.domain.model.PreflightResult
 import com.sesame.app.domain.model.ProfileConfig
@@ -16,7 +14,7 @@ import com.sesame.app.domain.model.ProfileDiffRow
 import com.sesame.app.domain.model.RunLogEntry
 import com.sesame.app.domain.model.RootManagerCandidate
 import com.sesame.app.domain.model.ShizukuStatus
-import com.sesame.app.domain.model.StrideProbe
+import com.sesame.app.domain.model.StrideProbeOutcome
 import com.sesame.app.domain.model.VrKoMode
 
 interface GhostlockRepository {
@@ -57,13 +55,12 @@ interface GhostlockRepository {
         input: String,
         xblPath: String? = null,
         uefiPath: String? = null,
-        /** vendor_boot.img (MediaTek only); derives kernel_phys_load from
-         * its header and kernel_phys_offset from its embedded DTB /memory. */
+        /** vendor_boot.img (MediaTek only); derives the physical load from
+         * its header and the DRAM base from its embedded DTB /memory. */
         vendorBootPath: String? = null,
         /** dtbo.img (MediaTek only): the DTB fallback when vendor_boot carries
          * no usable /memory (`dtb_size = 0` or no root memory node). */
         dtboPath: String? = null,
-        overwrite: Boolean = false,
         /** Selects one route explicitly; null lets the extractor decide and
          * returns [ParseResult.Ambiguous] when more than one is Feasible. */
         route: String? = null,
@@ -72,24 +69,24 @@ interface GhostlockRepository {
 
     /**
      * Run the unprivileged mm_struct leak probe for an in-memory generated
-     * document and return its stride evidence table, or null when the probe
-     * cannot run. Only meaningful when [release] is the running kernel.
+     * document. Called only when [release] is the running kernel, so the result
+     * is either the evidence table or a failure — never "skipped"; the caller
+     * must not fall through to the save step on a failure.
      */
     suspend fun probeStride(
         release: String,
         documentText: String,
         onLog: (String) -> Unit = {},
-    ): StrideProbe?
+    ): StrideProbeOutcome
 
     /**
-     * Applies (or clears, with null) `kernelsnitch.mm_struct_sz` to the entry of
-     * [release] in an in-memory document and returns the rendered text.
+     * Records a generation probe's stride as the measured `kernel.heap.stride`
+     * fact. The root phase's `/proc/slabinfo` measurement is ground truth and
+     * is never replaced by a probe. The document is not touched: the run's
+     * measured overlay applies the fact. Returns false when nothing was
+     * written (a root measurement exists, or the size is implausible).
      */
-    fun applyStrideToDocument(
-        documentText: String,
-        release: String,
-        stride: Int?,
-    ): String?
+    suspend fun recordGenerationStride(release: String, value: Int, evidence: String): Boolean
 
     /**
      * Applies the user's lock-source choice to an in-memory generated document:
@@ -100,6 +97,22 @@ interface GhostlockRepository {
         documentText: String,
         keepAnchor: Boolean,
     ): String?
+
+    /**
+     * Writes the generation flow's chosen slab stride into an in-memory
+     * generated document (`kernel.heap.stride`) so the exported profile
+     * carries it. The measured database keeps the probe as weaker evidence; a
+     * root `/proc/slabinfo` measurement still overrides the document at run
+     * time. Null when the document cannot be rewritten.
+     */
+    fun materializeStride(documentText: String, value: Int): String?
+
+    /**
+     * True when the document's ladder needs W1 (GhostLock or DirtyFrag), so
+     * its spray is sized by the stride and a null stride is not importable.
+     * Module-only and timer-only documents do not spray.
+     */
+    fun documentRequiresStride(documentText: String): Boolean
 
     /* ---- profile sources (import-copy storage model) ---- */
 
@@ -160,7 +173,7 @@ interface GhostlockRepository {
 
     /**
      * The canonical backend document for the timer tool (CVE-2026-98260), or
-     * null when the resolved profile carries no `timer_98260` block. That null
+     * null when the resolved profile carries no `timer` block. That null
      * is the timer entry's applicability fact.
      */
     fun timerProfileDocument(): String?
@@ -204,6 +217,9 @@ interface GhostlockRepository {
 
     /** Runs retained on the device, newest first, an unfinished one ahead of the rest. */
     suspend fun listRunLogs(): List<RunLogEntry>
+
+    /** The stored log text of one retained run; null when it cannot be read. */
+    suspend fun readRunLog(stamp: String): String?
 
     /** Streams one retained run into a document the user picked; false if it failed. */
     suspend fun exportRunLog(stamp: String, documentUri: String): Boolean

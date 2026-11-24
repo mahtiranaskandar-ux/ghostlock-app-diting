@@ -18,30 +18,23 @@ use ghostlock_extract::kallsyms;
 use ghostlock_extract::kallsyms_finder;
 use ghostlock_extract::structs;
 
-/// One `key = value` line from a profile's `offset` block.
-fn profile_offset(text: &str, key: &str) -> Option<u64> {
-    text.lines().find_map(|line| {
-        let line = line.split('#').next()?.trim();
-        let (name, value) = line.split_once('=')?;
-        if name.trim() != key {
-            return None;
-        }
-        value.trim().parse().ok()
-    })
-}
-
-/// The expected `offset` value: the superset's common profile when present,
-/// else the legacy `profile.conf` (excluded/codegen directories keep theirs).
+/// The expected `offset` value from the superset's cleaned document
+/// (`kernel.symbols`); every collected image carries one.
 fn expected_offset(dir: &Path, release: &str, key: &str) -> Option<u64> {
     let superset = dir.join(format!("options-{release}.json"));
-    if let Ok(text) = std::fs::read_to_string(&superset) {
-        let value: serde_json::Value = serde_json::from_str(&text).ok()?;
-        return value["profile"]["offset"][key]
-            .as_str()
-            .and_then(|value| value.parse().ok());
-    }
-    let text = std::fs::read_to_string(dir.join("profile.conf")).ok()?;
-    profile_offset(&text, key)
+    let text = std::fs::read_to_string(&superset).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    /* The cleaned document names the derived anchor by its symbol. */
+    let symbol = match key {
+        "slide_loggers_0_1" => "loggers_0_1",
+        "slide_nfulnl_logger" => "nf_logger",
+        "selinux_enforcing" => "selinux_state",
+        other => other,
+    };
+    value["document"]["kernel"]["symbols"][symbol]
+        .as_str()
+        .and_then(|value| value.strip_prefix("0x"))
+        .and_then(|value| u64::from_str_radix(value, 16).ok())
 }
 
 fn collect_images(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -57,7 +50,20 @@ fn collect_images(dir: &Path, out: &mut Vec<PathBuf>) {
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with("Image-5.10."))
         {
-            out.push(path);
+            /* A `corpus = excluded` image has no profile target (the
+             * extractor refuses it before route derivation), so there is no
+             * anchor to compare against. */
+            let meta = path.parent().map(|parent| parent.join("meta.txt"));
+            let excluded = meta
+                .and_then(|meta| std::fs::read_to_string(meta).ok())
+                .is_some_and(|text| {
+                    text.lines().any(|line| {
+                        line.trim().starts_with("corpus") && line.contains("excluded")
+                    })
+                });
+            if !excluded {
+                out.push(path);
+            }
         }
     }
 }
@@ -151,9 +157,9 @@ fn task_struct_and_cred_anchors_match_the_series() {
         assert_eq!(logger.nf_log_type_ulog, 1, "{release}: ULOG value");
         let release_dir = image.parent().expect("image parent");
         let want_loggers = expected_offset(release_dir, &release, "slide_loggers_0_1")
-            .unwrap_or_else(|| panic!("{release}: no slide_loggers_0_1 in the superset/profile"));
+            .unwrap_or_else(|| panic!("{release}: no slide_loggers_0_1 in the superset document"));
         let want_logger = expected_offset(release_dir, &release, "slide_nfulnl_logger")
-            .unwrap_or_else(|| panic!("{release}: no slide_nfulnl_logger in the superset/profile"));
+            .unwrap_or_else(|| panic!("{release}: no slide_nfulnl_logger in the superset document"));
         assert_eq!(
             logger.loggers_0_1, want_loggers,
             "{release}: derived loggers anchor disagrees with the profile"
